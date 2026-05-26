@@ -1,0 +1,16 @@
+stores:
+  - store_key: peanut
+    store_name: Peanut
+    survey_id: "22512014"
+    output_xlsx_path: ./output/peanut_invoice.xlsx
+    initial_last_processed_id: 307
+    attachment_question_id: q-6-VwdW
+    enabled: true
+
+  - store_key: fuzzy
+    store_name: Fuzzy
+    survey_id: "22512015"
+    output_xlsx_path: ./output/fuzzy_invoice.xlsx
+    initial_last_processed_id: 418
+    enabled: true
+

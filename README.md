@@ -94,6 +94,14 @@ docker run -d \
 
 如果门店间 `question_id` 不一致，就把它补到对应门店的 `attachment_question_id`。
 
+当前代码已经按下面这条导出链路实现：
+
+1. `POST /api/answer_exports/generate` 创建导出任务
+2. 读取返回里的 `data.id`
+3. 轮询 `GET /api/files/export_check?job_id=<id>`
+4. 使用返回的 `data.result.cos_download_url` 下载 `.csv.zip`
+5. 自动解压其中的 `.csv`
+
 ## 税号规则
 
 - CSV 里的税号只要是字母数字组合，直接写入

@@ -52,6 +52,13 @@ def render_template(template: str, context: dict[str, Any]) -> str:
     return template.format_map(SafeDict(context))
 
 
+def render_token_template(template: str, context: dict[str, Any]) -> str:
+    rendered = template
+    for key, value in context.items():
+        rendered = rendered.replace(f"{{{{{key}}}}}", str(value))
+    return rendered
+
+
 def ensure_parent_dir(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -151,6 +158,14 @@ def next_daily_run(now: datetime, hour: int, minute: int) -> datetime:
     return candidate
 
 
+def default_export_range(now: Optional[datetime] = None) -> tuple[str, str]:
+    current = now or datetime.now()
+    from_point = current - timedelta(days=365)
+    from_datetime = from_point.strftime("%Y-%m-%d 00:00:00")
+    to_datetime = current.strftime("%Y-%m-%d 23:59:59")
+    return from_datetime, to_datetime
+
+
 def clone_row_style(sheet: Any, template_row: int, target_row: int, max_column: int) -> None:
     for column in range(1, max_column + 1):
         source = sheet.cell(template_row, column)
@@ -175,4 +190,3 @@ def clone_row_style(sheet: Any, template_row: int, target_row: int, max_column: 
 class BackupResult:
     backup_path: Optional[Path]
     output_path: Path
-
