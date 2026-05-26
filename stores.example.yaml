@@ -1,0 +1,16 @@
+stores:
+  - store_key: xiamen_store_a
+    store_name: 厦门门店A
+    survey_id: "22512014"
+    output_xlsx_path: ./output/xiamen_store_a.xlsx
+    initial_last_processed_id: 307
+    attachment_question_id: q-6-VwdW
+    enabled: true
+
+  - store_key: quanzhou_store_b
+    store_name: 泉州门店B
+    survey_id: "22512015"
+    output_xlsx_path: ./output/quanzhou_store_b.xlsx
+    initial_last_processed_id: 418
+    enabled: true
+
