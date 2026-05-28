@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
-from app.models import AmountExtraction, AppConfig, BatchRunSummary, StoreConfig
+from app.models import AmountExtraction, AppConfig, BatchRunSummary, StoreConfig, TaxLookupResult
 from app.service import BatchProcessor, Services
 from app.state import StateStore
 from app.utils import BackupResult
@@ -50,12 +50,25 @@ class FakeVisionClient:
 
 
 class FakeTaxLookupClient:
-    def lookup(self, company_name: str) -> str | None:
+    def lookup(self, company_name: str) -> TaxLookupResult:
         if "失败" in company_name:
             raise RuntimeError("lookup failed")
         if "公司" in company_name:
-            return "AB12345678"
-        return None
+            return TaxLookupResult(
+                provider="fake",
+                status="success",
+                tax_id="AB12345678",
+                matched_name=company_name,
+                candidate_count=1,
+                message="ok",
+            )
+        return TaxLookupResult(
+            provider="fake",
+            status="no_result",
+            tax_id=None,
+            matched_name=None,
+            message="missing",
+        )
 
 
 class FakeExcelWriter:

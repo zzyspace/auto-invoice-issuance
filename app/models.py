@@ -59,9 +59,13 @@ class AppConfig:
     survey_ca_bundle_path: Optional[Path] = None
     tax_lookup_ssl_verify: bool = True
     tax_lookup_ca_bundle_path: Optional[Path] = None
+    tax_lookup_provider: str = "disabled"
+    tax_lookup_alapi_token: Optional[str] = None
     tax_lookup_url_template: Optional[str] = None
     tax_lookup_extra_headers: dict[str, str] = field(default_factory=dict)
     tax_lookup_value_path: Optional[str] = None
+    tax_lookup_timeout_seconds: int = 60
+    tax_lookup_cache_negative_ttl_hours: int = 24
 
 
 @dataclass(frozen=True)
@@ -140,3 +144,28 @@ class BatchRunSummary:
     @property
     def warning_results(self) -> list[StoreRunResult]:
         return [result for result in self.results if result.warnings]
+
+
+@dataclass(frozen=True)
+class TaxLookupResult:
+    provider: str
+    status: str
+    tax_id: Optional[str]
+    matched_name: Optional[str]
+    candidate_count: int = 0
+    from_cache: bool = False
+    raw_response_json: str = ""
+    message: str = ""
+
+
+@dataclass(frozen=True)
+class TaxLookupCacheEntry:
+    provider: str
+    normalized_company_name: str
+    cache_status: str
+    lookup_status: str
+    tax_id: Optional[str]
+    matched_name: Optional[str]
+    candidate_count: int
+    raw_response_json: str
+    updated_at: datetime

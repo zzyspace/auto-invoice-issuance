@@ -63,6 +63,17 @@ def _parse_scalar(value: str) -> Any:
     return stripped
 
 
+def _resolve_tax_lookup_provider() -> str:
+    explicit = (os.environ.get("TAX_LOOKUP_PROVIDER") or "").strip().lower()
+    if explicit:
+        return explicit
+    if (os.environ.get("TAX_LOOKUP_ALAPI_TOKEN") or "").strip():
+        return "alapi"
+    if (os.environ.get("TAX_LOOKUP_URL_TEMPLATE") or "").strip():
+        return "legacy_template"
+    return "disabled"
+
+
 def load_store_configs(path: Path) -> list[StoreConfig]:
     content = path.read_text(encoding="utf-8")
     stores = _parse_stores_yaml(content)
@@ -147,6 +158,8 @@ def load_app_config(env_path: Optional[Path] = None) -> AppConfig:
             return None
         return resolve_path(raw)
 
+    survey_timeout_seconds = int(os.environ.get("SURVEY_TIMEOUT_SECONDS", "60"))
+    tax_lookup_provider = _resolve_tax_lookup_provider()
     config = AppConfig(
         timezone=os.environ.get("TZ", "Asia/Shanghai"),
         survey_cookie=_require_env("TENCENT_SURVEY_COOKIE"),
@@ -177,17 +190,25 @@ def load_app_config(env_path: Optional[Path] = None) -> AppConfig:
         run_hour=int(os.environ.get("RUN_HOUR", "22")),
         run_minute=int(os.environ.get("RUN_MINUTE", "30")),
         openai_timeout_seconds=int(os.environ.get("OPENAI_TIMEOUT_SECONDS", "60")),
-        survey_timeout_seconds=int(os.environ.get("SURVEY_TIMEOUT_SECONDS", "60")),
+        survey_timeout_seconds=survey_timeout_seconds,
         openai_ssl_verify=_parse_bool(os.environ.get("OPENAI_SSL_VERIFY", "true")),
         openai_ca_bundle_path=resolve_optional_path("OPENAI_CA_BUNDLE_PATH"),
         survey_ssl_verify=_parse_bool(os.environ.get("SURVEY_SSL_VERIFY", "true")),
         survey_ca_bundle_path=resolve_optional_path("SURVEY_CA_BUNDLE_PATH"),
         tax_lookup_ssl_verify=_parse_bool(os.environ.get("TAX_LOOKUP_SSL_VERIFY", "true")),
         tax_lookup_ca_bundle_path=resolve_optional_path("TAX_LOOKUP_CA_BUNDLE_PATH"),
+        tax_lookup_provider=tax_lookup_provider,
+        tax_lookup_alapi_token=os.environ.get("TAX_LOOKUP_ALAPI_TOKEN") or None,
         tax_lookup_url_template=os.environ.get("TAX_LOOKUP_URL_TEMPLATE") or None,
         tax_lookup_extra_headers=parse_json_object(
             os.environ.get("TAX_LOOKUP_EXTRA_HEADERS_JSON", "{}"), default={}
         ),
         tax_lookup_value_path=os.environ.get("TAX_LOOKUP_VALUE_PATH") or None,
+        tax_lookup_timeout_seconds=int(
+            os.environ.get("TAX_LOOKUP_TIMEOUT_SECONDS", str(survey_timeout_seconds))
+        ),
+        tax_lookup_cache_negative_ttl_hours=int(
+            os.environ.get("TAX_LOOKUP_CACHE_NEGATIVE_TTL_HOURS", "24")
+        ),
     )
     return config

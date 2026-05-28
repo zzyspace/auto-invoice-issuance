@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from datetime import datetime
@@ -20,14 +21,16 @@ from app.vision_client import OpenAICompatibleVisionClient
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Tencent survey invoice automation")
-    parser.add_argument("command", choices=("run-once", "schedule", "smoke-test"))
+    parser.add_argument("command", choices=("run-once", "schedule", "smoke-test", "tax-lookup-test"))
     parser.add_argument("--env-file", default=".env", help="Path to .env file")
+    parser.add_argument("--company-name", help="Company name used by tax-lookup-test")
     return parser
 
 
 def build_processor(env_file: Path) -> tuple[BatchProcessor, object, list[object]]:
     config = load_app_config(env_file)
     stores = load_store_configs(config.stores_config_path)
+    state_store = StateStore(config.state_db_path)
     services = Services(
         survey_client=TencentSurveyClient(config),
         vision_client=OpenAICompatibleVisionClient(
@@ -38,9 +41,9 @@ def build_processor(env_file: Path) -> tuple[BatchProcessor, object, list[object
             ssl_verify=config.openai_ssl_verify,
             ca_bundle_path=config.openai_ca_bundle_path,
         ),
-        tax_lookup_client=TaxLookupClient(config),
+        tax_lookup_client=TaxLookupClient(config, state_store),
         excel_writer=InvoiceExcelWriter(config.template_xlsx_path, config.backups_root),
-        state_store=StateStore(config.state_db_path),
+        state_store=state_store,
         mailer=SummaryMailer(
             config.smtp_host,
             config.smtp_port,
@@ -76,6 +79,30 @@ def command_smoke_test(env_file: Path) -> int:
     return 0
 
 
+def command_tax_lookup_test(env_file: Path, company_name: str | None) -> int:
+    if not company_name or not company_name.strip():
+        raise ValueError("--company-name is required for tax-lookup-test")
+    config = load_app_config(env_file)
+    state_store = StateStore(config.state_db_path)
+    client = TaxLookupClient(config, state_store)
+    result = client.lookup(company_name.strip())
+    print(
+        json.dumps(
+            {
+                "provider": result.provider,
+                "status": result.status,
+                "tax_id": result.tax_id,
+                "matched_name": result.matched_name,
+                "candidate_count": result.candidate_count,
+                "from_cache": result.from_cache,
+                "message": result.message,
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -84,7 +111,9 @@ def main(argv: list[str] | None = None) -> int:
         return command_run_once(env_file)
     if args.command == "schedule":
         return command_schedule(env_file)
-    return command_smoke_test(env_file)
+    if args.command == "smoke-test":
+        return command_smoke_test(env_file)
+    return command_tax_lookup_test(env_file, args.company_name)
 
 
 if __name__ == "__main__":

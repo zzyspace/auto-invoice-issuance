@@ -38,6 +38,17 @@ cp stores.example.yaml stores.yaml
 - `TEMPLATE_XLSX_PATH`: Excel 模板路径
 - `STATE_DB_PATH`: 状态数据库路径
 - `STORES_CONFIG_PATH`: 门店配置路径
+- `TAX_LOOKUP_PROVIDER`: 税号查询 provider，支持 `disabled`、`alapi`、`legacy_template`
+- `TAX_LOOKUP_ALAPI_TOKEN`: `ALAPI` token，`TAX_LOOKUP_PROVIDER=alapi` 时使用
+- `TAX_LOOKUP_TIMEOUT_SECONDS`: 税号查询超时
+- `TAX_LOOKUP_CACHE_NEGATIVE_TTL_HOURS`: 本地负缓存时长，默认 `24`
+
+如果你想直接使用默认推荐的免费链路，补上这几项：
+
+```env
+TAX_LOOKUP_PROVIDER=alapi
+TAX_LOOKUP_ALAPI_TOKEN=your_alapi_token_here
+```
 
 如果你的模型网关或本地代理用了自签名证书：
 
@@ -60,19 +71,25 @@ cp stores.example.yaml stores.yaml
 手动跑一次：
 
 ```bash
-python -m app.main run-once --env-file .env
+python3 -m app.main run-once --env-file .env
 ```
 
 启动定时服务：
 
 ```bash
-python -m app.main schedule --env-file .env
+python3 -m app.main schedule --env-file .env
 ```
 
 单独做视觉模型烟雾测试：
 
 ```bash
-python -m app.main smoke-test --env-file .env
+python3 -m app.main smoke-test --env-file .env
+```
+
+单独验证税号查询 provider：
+
+```bash
+python3 -m app.main tax-lookup-test --env-file .env --company-name "深圳易思商务咨询有限公司厦门分公司"
 ```
 
 ## Docker
@@ -118,7 +135,10 @@ docker run -d \
 - CSV 里的税号只要是字母数字组合，直接写入
 - 中文说明文字，例如 `无税号 个人抬头`，会被视为空
 - 企业抬头税号为空时，才尝试调外部查询接口
-- 如果没配置 `TAX_LOOKUP_URL_TEMPLATE`，则跳过税号查询
+- `ALAPI` provider 会先按公司名搜索，再只接受“标准化后精确相等”的候选企业名
+- 正向命中会写入 SQLite 本地缓存，未命中结果也会按 `TAX_LOOKUP_CACHE_NEGATIVE_TTL_HOURS` 做负缓存
+- 如果没配置 provider，则跳过税号查询
+- `legacy_template` 会继续兼容旧的 `TAX_LOOKUP_URL_TEMPLATE` / `TAX_LOOKUP_VALUE_PATH` 配置
 
 ## 注意
 

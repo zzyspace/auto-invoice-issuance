@@ -86,6 +86,19 @@ def normalize_tax_id(value: str) -> Optional[str]:
     return None
 
 
+def normalize_company_name(value: str) -> str:
+    cleaned = re.sub(r"\s+", "", value or "")
+    if not cleaned:
+        return ""
+    normalized = (
+        cleaned.replace("（", "(")
+        .replace("）", ")")
+        .replace("【", "[")
+        .replace("】", "]")
+    )
+    return normalized.lower()
+
+
 def extract_attachment_download_url(raw_value: str) -> Optional[str]:
     raw = (raw_value or "").strip()
     if not raw:

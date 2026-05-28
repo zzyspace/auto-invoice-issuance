@@ -6,7 +6,7 @@ from typing import Optional
 from app.csv_processing import parse_survey_csv, select_new_records
 from app.excel_writer import InvoiceExcelWriter
 from app.mailer import SummaryMailer
-from app.models import BatchRunSummary, NormalizedInvoice, StoreConfig, StoreRunResult
+from app.models import BatchRunSummary, NormalizedInvoice, StoreConfig, StoreRunResult, TaxLookupResult
 from app.state import StateStore
 from app.survey_client import TencentSurveyClient
 from app.tax_lookup import TaxLookupClient
@@ -96,16 +96,16 @@ class BatchProcessor:
                 try:
                     looked_up = self.services.tax_lookup_client.lookup(record.invoice_title)
                 except Exception as exc:  # noqa: BLE001
-                    looked_up = None
                     warnings.append(
-                        f"编号 {record.submission_id} 税号查询失败: {exc}"
+                        f"编号 {record.submission_id} [tax_lookup:provider_error] 税号查询失败: {exc}"
                     )
-                if looked_up:
-                    tax_id = looked_up
                 else:
-                    warnings.append(
-                        f"编号 {record.submission_id} 企业抬头未查询到税号: {record.invoice_title}"
-                    )
+                    if looked_up.tax_id:
+                        tax_id = looked_up.tax_id
+                    else:
+                        warning = self._build_tax_lookup_warning(record.submission_id, record.invoice_title, looked_up)
+                        if warning:
+                            warnings.append(warning)
 
             amount_text: Optional[str] = None
             if record.attachment_name:
@@ -140,3 +140,26 @@ class BatchProcessor:
             invoices.append(invoice)
             result.warnings.extend(warnings)
         return invoices
+
+    @staticmethod
+    def _build_tax_lookup_warning(
+        submission_id: int,
+        invoice_title: str,
+        looked_up: TaxLookupResult,
+    ) -> Optional[str]:
+        if looked_up.status == "disabled":
+            return None
+        if looked_up.from_cache:
+            return (
+                f"编号 {submission_id} [tax_lookup:cache_hit_miss] 企业抬头缓存未命中税号: "
+                f"{invoice_title}"
+            )
+        if looked_up.status == "no_exact_match":
+            suffix = f"候选 {looked_up.candidate_count} 条" if looked_up.candidate_count else "无精确候选"
+            return (
+                f"编号 {submission_id} [tax_lookup:no_exact_match] 企业抬头未命中精确公司名: "
+                f"{invoice_title} ({suffix})"
+            )
+        if looked_up.status == "no_result":
+            return f"编号 {submission_id} [tax_lookup:no_result] 企业抬头未查询到税号: {invoice_title}"
+        return f"编号 {submission_id} [tax_lookup:{looked_up.status}] 企业抬头未查询到税号: {invoice_title}"
