@@ -120,6 +120,77 @@ docker run -d \
 - 推荐流程：本地改代码 -> 本地测试 -> `git commit` -> 推送远端 -> 服务器拉取指定提交/分支 -> 重建并重启服务。
 - 服务器上可以单独维护 `.env`、运行数据和日志，但不要直接修改仓库内业务代码来“临时修复”。
 
+## 服务器部署
+
+当前生产服务器是 `root@139.196.140.215`，已按独立 systemd 服务方式部署：
+
+- 服务：`auto-invoice-issuance.service`
+- 运行用户：`invoicebot`
+- 代码目录：`/opt/auto-invoice-issuance/current`
+- Python 虚拟环境：`/opt/auto-invoice-issuance/venv`
+- 环境变量：`/etc/auto-invoice-issuance.env`
+- 门店配置：`/etc/auto-invoice-issuance/stores.yaml`
+- 运行数据：`/var/lib/auto-invoice-issuance/data`
+- 输出目录：`/var/lib/auto-invoice-issuance/output`
+- 备份目录：`/var/lib/auto-invoice-issuance/backups`
+
+部署时特意与 `wechat-claw` 隔离：
+
+- 不复用 `wechat-claw.service`
+- 不改 `/opt/wechat-claw/current`
+- 不改 `/etc/wechat-claw.env`
+- Python 依赖只安装到 `auto-invoice-issuance` 自己的 venv
+
+首次部署已经完成，并验证过：
+
+- `tax-lookup-test` 可正常查询 `ALAPI`
+- `run-once` 可成功执行
+- `wechat-claw.service` 保持 `active (running)`
+
+### 后续更新
+
+后续代码更新走标准 git 发布，不在线改代码。
+
+仓库内已提供简短发布脚本：
+
+```bash
+bash deploy/release-auto-invoice-issuance.sh
+```
+
+默认会发布到 `root@139.196.140.215`。如果后续目标机变化，也可以显式传入：
+
+```bash
+bash deploy/release-auto-invoice-issuance.sh root@139.196.140.215
+```
+
+这个脚本会在服务器上执行：
+
+1. 用现有 GitHub SSH key 对 `origin/main` 做 `git pull --ff-only`
+2. 在 `/opt/auto-invoice-issuance/venv` 中执行 `pip install -r requirements.txt`
+3. 重启 `auto-invoice-issuance.service`
+4. 输出最新的 `systemctl status`
+
+如果你只想手动执行远端更新，也可以直接运行：
+
+```bash
+ssh root@139.196.140.215 \
+  "export GIT_SSH_COMMAND='ssh -i /home/wechatclaw/.ssh/id_ed25519_github_wechat_claw -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/home/wechatclaw/.ssh/known_hosts -o ConnectTimeout=10' && \
+   git -C /opt/auto-invoice-issuance/current pull --ff-only origin main && \
+   /opt/auto-invoice-issuance/venv/bin/pip install -r /opt/auto-invoice-issuance/current/requirements.txt && \
+   systemctl restart auto-invoice-issuance.service && \
+   systemctl status --no-pager --lines=20 auto-invoice-issuance.service"
+```
+
+### 运行检查
+
+常用检查命令：
+
+```bash
+ssh root@139.196.140.215 "systemctl status --no-pager --lines=20 auto-invoice-issuance.service"
+ssh root@139.196.140.215 "journalctl -u auto-invoice-issuance.service -n 100 --no-pager"
+ssh root@139.196.140.215 "sqlite3 /var/lib/auto-invoice-issuance/data/state.db 'select id, store_key, status, processed_count, started_at, finished_at from run_history order by id desc limit 10;'"
+```
+
 ## 联调建议
 
 每个新门店至少抓一次：
