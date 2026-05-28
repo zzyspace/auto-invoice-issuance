@@ -27,7 +27,7 @@ class SummaryMailer:
 
     def send_summary(self, summary: BatchRunSummary) -> None:
         message = EmailMessage()
-        message["Subject"] = "腾讯问卷开票批处理汇总"
+        message["Subject"] = "【发票】开票信息批处理汇总"
         message["From"] = self.sender
         message["To"] = ", ".join(self.recipients)
         message.set_content(self._build_body(summary))
