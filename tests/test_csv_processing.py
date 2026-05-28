@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from app.csv_processing import parse_survey_csv, select_new_records
-from app.utils import looks_like_natural_person, normalize_tax_id
+from app.utils import extract_attachment_download_url, looks_like_natural_person, normalize_tax_id
 
 
 CSV_TEXT = """编号,开始答题时间,结束答题时间,答题时长,1.发票抬头,2.税号,3.邮箱,4.上传结账单或付款截图,5.手机号,6.备注
@@ -27,3 +27,9 @@ class CsvProcessingTests(unittest.TestCase):
         self.assertTrue(looks_like_natural_person("吴翔"))
         self.assertFalse(looks_like_natural_person("深圳易思商务咨询有限公司厦门分公司"))
 
+    def test_extract_attachment_download_url_from_excel_formula(self) -> None:
+        formula = '=Hyperlink("https://wj.qq.com/api/files/download?survey_id=22512014&question_id=q-6-VwdW&file_name=abc.png&download=1"，"IMG_9057.png")'
+        self.assertEqual(
+            "https://wj.qq.com/api/files/download?survey_id=22512014&question_id=q-6-VwdW&file_name=abc.png&download=1",
+            extract_attachment_download_url(formula),
+        )

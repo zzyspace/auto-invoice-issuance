@@ -13,6 +13,7 @@ from app.models import AppConfig, StoreConfig
 from app.utils import (
     build_ssl_context,
     default_export_range,
+    extract_attachment_download_url,
     find_first_string_by_keys,
     get_value_by_path,
     render_template,
@@ -81,11 +82,15 @@ class TencentSurveyClient:
         return self._decode_csv_bytes(csv_bytes)
 
     def download_attachment(self, store: StoreConfig, file_name: str) -> bytes:
-        question_id = store.effective_attachment_question_id(self.config.default_attachment_question_id)
-        url = (
-            "https://wj.qq.com/api/files/download"
-            f"?survey_id={store.survey_id}&question_id={question_id}&file_name={file_name}"
-        )
+        download_url = extract_attachment_download_url(file_name)
+        if download_url:
+            url = download_url
+        else:
+            question_id = store.effective_attachment_question_id(self.config.default_attachment_question_id)
+            url = (
+                "https://wj.qq.com/api/files/download"
+                f"?survey_id={store.survey_id}&question_id={question_id}&file_name={file_name}"
+            )
         response_bytes, _ = self._request(url, "GET", self.base_headers, None)
         return response_bytes
 

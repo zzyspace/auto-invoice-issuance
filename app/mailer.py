@@ -34,8 +34,13 @@ class SummaryMailer:
         for result in summary.succeeded:
             if result.output_path and result.output_path.exists():
                 self._attach_file(message, result.output_path)
-        with smtplib.SMTP(self.host, self.port) as smtp:
-            smtp.starttls()
+        if self.port == 465:
+            smtp_client = smtplib.SMTP_SSL(self.host, self.port)
+        else:
+            smtp_client = smtplib.SMTP(self.host, self.port)
+        with smtp_client as smtp:
+            if self.port != 465:
+                smtp.starttls()
             smtp.login(self.username, self.password)
             smtp.send_message(message)
 
@@ -91,4 +96,3 @@ class SummaryMailer:
         else:
             lines.append("- 无")
         return "\n".join(lines)
-

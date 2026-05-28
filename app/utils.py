@@ -86,6 +86,18 @@ def normalize_tax_id(value: str) -> Optional[str]:
     return None
 
 
+def extract_attachment_download_url(raw_value: str) -> Optional[str]:
+    raw = (raw_value or "").strip()
+    if not raw:
+        return None
+    match = re.match(r'=Hyperlink\("([^"]+)"[，,]\s*"[^"]*"\)', raw, flags=re.IGNORECASE)
+    if match:
+        return match.group(1)
+    if raw.startswith("http://") or raw.startswith("https://"):
+        return raw
+    return None
+
+
 def looks_like_natural_person(title: str) -> bool:
     cleaned = re.sub(r"\s+", "", title or "")
     if not cleaned:

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import json
+import struct
+import zlib
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Optional
@@ -10,9 +13,24 @@ from urllib.request import Request, urlopen
 from app.models import AmountExtraction
 from app.utils import build_ssl_context, extract_json_block, parse_decimal
 
-SMOKE_TEST_PNG_BASE64 = (
-    "iVBORw0KGgoAAAANSUhEUgAAAAwAAAAMCAQAAAD8fJRsAAAAEElEQVR42mNkYGD4z0AEYBxVSFUAAN0AARt1ik0AAAAASUVORK5CYII="
-)
+
+def _png_chunk(tag: bytes, data: bytes) -> bytes:
+    return (
+        struct.pack("!I", len(data))
+        + tag
+        + data
+        + struct.pack("!I", binascii.crc32(tag + data) & 0xFFFFFFFF)
+    )
+
+
+def _build_smoke_test_png_base64(width: int = 12, height: int = 12) -> str:
+    signature = b"\x89PNG\r\n\x1a\n"
+    ihdr = _png_chunk(b"IHDR", struct.pack("!IIBBBBB", width, height, 8, 6, 0, 0, 0))
+    row = bytes((255, 255, 255, 255)) * width
+    raw = b"".join(b"\x00" + row for _ in range(height))
+    idat = _png_chunk(b"IDAT", zlib.compress(raw))
+    iend = _png_chunk(b"IEND", b"")
+    return base64.b64encode(signature + ihdr + idat + iend).decode("ascii")
 
 
 class OpenAICompatibleVisionClient:
@@ -32,7 +50,7 @@ class OpenAICompatibleVisionClient:
         self.ssl_context = build_ssl_context(ssl_verify, ca_bundle_path)
 
     def smoke_test(self) -> None:
-        self._chat_completion(SMOKE_TEST_PNG_BASE64, "test.png", "请返回JSON: {\"ok\": true}")
+        self._chat_completion(_build_smoke_test_png_base64(), "test.png", "请返回JSON: {\"ok\": true}")
 
     def extract_total_amount(self, image_bytes: bytes, file_name: str) -> AmountExtraction:
         image_base64 = base64.b64encode(image_bytes).decode("ascii")
