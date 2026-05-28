@@ -12,6 +12,10 @@ CSV_TEXT = """编号,开始答题时间,结束答题时间,答题时长,1.发票
 307,2026/5/26 10:00,2026/5/26 10:01,32,吴翔,91350203MAK37WG54F,c@example.com,c.png,,
 """
 
+CSV_TEXT_REORDERED = """编号,开始答题时间,结束答题时间,答题时长,1.发票抬头,2.税号,3.上传结账单或付款截图,4.邮箱,5.手机号,6.备注
+309,2026/5/26 12:00,2026/5/26 12:01,30,深圳易思商务咨询有限公司厦门分公司,,a.png,a@example.com,13800000000,
+"""
+
 
 class CsvProcessingTests(unittest.TestCase):
     def test_select_new_records_sorts_incremental_records(self) -> None:
@@ -33,3 +37,9 @@ class CsvProcessingTests(unittest.TestCase):
             "https://wj.qq.com/api/files/download?survey_id=22512014&question_id=q-6-VwdW&file_name=abc.png&download=1",
             extract_attachment_download_url(formula),
         )
+
+    def test_parse_survey_csv_with_reordered_attachment_and_email_columns(self) -> None:
+        records = parse_survey_csv(CSV_TEXT_REORDERED)
+        self.assertEqual(1, len(records))
+        self.assertEqual("a.png", records[0].attachment_name)
+        self.assertEqual("a@example.com", records[0].email)
