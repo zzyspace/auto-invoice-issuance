@@ -11,6 +11,7 @@ from urllib.request import Request, urlopen
 
 from app.models import AppConfig, StoreConfig
 from app.utils import (
+    build_ssl_context,
     default_export_range,
     find_first_string_by_keys,
     get_value_by_path,
@@ -26,6 +27,7 @@ EXPORT_POLL_MAX_ATTEMPTS = 30
 class TencentSurveyClient:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
+        self.ssl_context = build_ssl_context(config.survey_ssl_verify, config.survey_ca_bundle_path)
         self.base_headers = {
             "Cookie": config.survey_cookie,
             "User-Agent": "Mozilla/5.0",
@@ -162,5 +164,5 @@ class TencentSurveyClient:
         payload: Optional[bytes],
     ) -> tuple[bytes, dict[str, str]]:
         request = Request(url=url, method=method, headers=headers, data=payload)
-        with urlopen(request, timeout=self.config.survey_timeout_seconds) as response:
+        with urlopen(request, timeout=self.config.survey_timeout_seconds, context=self.ssl_context) as response:
             return response.read(), dict(response.headers)

@@ -52,6 +52,12 @@ def build_config() -> AppConfig:
         state_db_path=Path("/tmp/state.db"),
         stores_config_path=Path("/tmp/stores.yaml"),
         backups_root=Path("/tmp/backups"),
+        openai_ssl_verify=True,
+        openai_ca_bundle_path=None,
+        survey_ssl_verify=True,
+        survey_ca_bundle_path=None,
+        tax_lookup_ssl_verify=True,
+        tax_lookup_ca_bundle_path=None,
     )
 
 
@@ -110,4 +116,3 @@ class SurveyClientTests(unittest.TestCase):
         self.assertIn('"survey_id":"22512014"', generate_payload.decode("utf-8"))
         self.assertIn("/api/files/export_check", client.calls[1][0])
         self.assertEqual("https://download.example.com/export.csv.zip", client.calls[2][0])
-

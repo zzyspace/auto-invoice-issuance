@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Optional
@@ -53,6 +53,12 @@ class AppConfig:
     run_minute: int = 30
     openai_timeout_seconds: int = 60
     survey_timeout_seconds: int = 60
+    openai_ssl_verify: bool = True
+    openai_ca_bundle_path: Optional[Path] = None
+    survey_ssl_verify: bool = True
+    survey_ca_bundle_path: Optional[Path] = None
+    tax_lookup_ssl_verify: bool = True
+    tax_lookup_ca_bundle_path: Optional[Path] = None
     tax_lookup_url_template: Optional[str] = None
     tax_lookup_extra_headers: dict[str, str] = field(default_factory=dict)
     tax_lookup_value_path: Optional[str] = None
@@ -107,11 +113,11 @@ class StoreRunResult:
     backup_path: Optional[Path] = None
     warnings: list[str] = field(default_factory=list)
     error: Optional[str] = None
-    started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     finished_at: Optional[datetime] = None
 
     def finalize(self) -> "StoreRunResult":
-        self.finished_at = datetime.now(UTC)
+        self.finished_at = datetime.now(timezone.utc)
         return self
 
 

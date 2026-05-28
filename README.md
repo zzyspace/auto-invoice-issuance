@@ -33,10 +33,21 @@ cp stores.example.yaml stores.yaml
 
 - `TENCENT_SURVEY_*`: 腾讯问卷 Cookie、导出接口和图片下载默认参数
 - `OPENAI_*`: 金额识别模型配置
+- `OPENAI_SSL_VERIFY` / `OPENAI_CA_BUNDLE_PATH`: 模型网关证书配置
 - `SMTP_*`: 邮件发送配置
 - `TEMPLATE_XLSX_PATH`: Excel 模板路径
 - `STATE_DB_PATH`: 状态数据库路径
 - `STORES_CONFIG_PATH`: 门店配置路径
+
+如果你的模型网关或本地代理用了自签名证书：
+
+- 推荐：把根证书路径写到 `OPENAI_CA_BUNDLE_PATH`
+- 临时联调：设置 `OPENAI_SSL_VERIFY=false`
+
+腾讯问卷和税号接口也支持同样的配置：
+
+- `SURVEY_SSL_VERIFY` / `SURVEY_CA_BUNDLE_PATH`
+- `TAX_LOOKUP_SSL_VERIFY` / `TAX_LOOKUP_CA_BUNDLE_PATH`
 
 3. 编辑 `stores.yaml`：
 

@@ -3,26 +3,36 @@ from __future__ import annotations
 import base64
 import json
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Optional
 from urllib.request import Request, urlopen
 
 from app.models import AmountExtraction
-from app.utils import extract_json_block, parse_decimal
+from app.utils import build_ssl_context, extract_json_block, parse_decimal
 
-ONE_PIXEL_PNG_BASE64 = (
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y2+2a8AAAAASUVORK5CYII="
+SMOKE_TEST_PNG_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAwAAAAMCAQAAAD8fJRsAAAAEElEQVR42mNkYGD4z0AEYBxVSFUAAN0AARt1ik0AAAAASUVORK5CYII="
 )
 
 
 class OpenAICompatibleVisionClient:
-    def __init__(self, base_url: str, api_key: str, model: str, timeout_seconds: int = 60) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        timeout_seconds: int = 60,
+        ssl_verify: bool = True,
+        ca_bundle_path: Optional[Path] = None,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
         self.timeout_seconds = timeout_seconds
+        self.ssl_context = build_ssl_context(ssl_verify, ca_bundle_path)
 
     def smoke_test(self) -> None:
-        self._chat_completion(ONE_PIXEL_PNG_BASE64, "test.png", "请返回JSON: {\"ok\": true}")
+        self._chat_completion(SMOKE_TEST_PNG_BASE64, "test.png", "请返回JSON: {\"ok\": true}")
 
     def extract_total_amount(self, image_bytes: bytes, file_name: str) -> AmountExtraction:
         image_base64 = base64.b64encode(image_bytes).decode("ascii")
@@ -76,7 +86,7 @@ class OpenAICompatibleVisionClient:
                 "Content-Type": "application/json",
             },
         )
-        with urlopen(request, timeout=self.timeout_seconds) as response:
+        with urlopen(request, timeout=self.timeout_seconds, context=self.ssl_context) as response:
             body = json.loads(response.read().decode("utf-8"))
         choices = body.get("choices") or []
         if not choices:
@@ -93,4 +103,3 @@ class OpenAICompatibleVisionClient:
             if texts:
                 return "\n".join(texts)
         raise ValueError(f"Unsupported vision response payload: {body}")
-

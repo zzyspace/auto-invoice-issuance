@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import ssl
 from copy import copy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -61,6 +62,14 @@ def render_token_template(template: str, context: dict[str, Any]) -> str:
 
 def ensure_parent_dir(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def build_ssl_context(verify: bool = True, ca_bundle_path: Optional[Path] = None) -> ssl.SSLContext:
+    if not verify:
+        return ssl._create_unverified_context()
+    if ca_bundle_path:
+        return ssl.create_default_context(cafile=str(ca_bundle_path))
+    return ssl.create_default_context()
 
 
 def is_ascii_alphanumeric(value: str) -> bool:

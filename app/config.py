@@ -141,6 +141,12 @@ def load_app_config(env_path: Optional[Path] = None) -> AppConfig:
             path = (base_dir / path).resolve()
         return path
 
+    def resolve_optional_path(name: str) -> Optional[Path]:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            return None
+        return resolve_path(raw)
+
     config = AppConfig(
         timezone=os.environ.get("TZ", "Asia/Shanghai"),
         survey_cookie=_require_env("TENCENT_SURVEY_COOKIE"),
@@ -172,6 +178,12 @@ def load_app_config(env_path: Optional[Path] = None) -> AppConfig:
         run_minute=int(os.environ.get("RUN_MINUTE", "30")),
         openai_timeout_seconds=int(os.environ.get("OPENAI_TIMEOUT_SECONDS", "60")),
         survey_timeout_seconds=int(os.environ.get("SURVEY_TIMEOUT_SECONDS", "60")),
+        openai_ssl_verify=_parse_bool(os.environ.get("OPENAI_SSL_VERIFY", "true")),
+        openai_ca_bundle_path=resolve_optional_path("OPENAI_CA_BUNDLE_PATH"),
+        survey_ssl_verify=_parse_bool(os.environ.get("SURVEY_SSL_VERIFY", "true")),
+        survey_ca_bundle_path=resolve_optional_path("SURVEY_CA_BUNDLE_PATH"),
+        tax_lookup_ssl_verify=_parse_bool(os.environ.get("TAX_LOOKUP_SSL_VERIFY", "true")),
+        tax_lookup_ca_bundle_path=resolve_optional_path("TAX_LOOKUP_CA_BUNDLE_PATH"),
         tax_lookup_url_template=os.environ.get("TAX_LOOKUP_URL_TEMPLATE") or None,
         tax_lookup_extra_headers=parse_json_object(
             os.environ.get("TAX_LOOKUP_EXTRA_HEADERS_JSON", "{}"), default={}

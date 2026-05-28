@@ -35,6 +35,8 @@ def build_processor(env_file: Path) -> tuple[BatchProcessor, object, list[object
             config.openai_api_key,
             config.openai_model,
             timeout_seconds=config.openai_timeout_seconds,
+            ssl_verify=config.openai_ssl_verify,
+            ca_bundle_path=config.openai_ca_bundle_path,
         ),
         tax_lookup_client=TaxLookupClient(config),
         excel_writer=InvoiceExcelWriter(config.template_xlsx_path, config.backups_root),
