@@ -154,14 +154,22 @@ docker run -d \
 仓库内已提供简短发布脚本：
 
 ```bash
-bash deploy/release-auto-invoice-issuance.sh
+bash deploy/deploy-auto-invoice-issuance.sh
 ```
 
 默认会发布到 `root@139.196.140.215`。如果后续目标机变化，也可以显式传入：
 
 ```bash
-bash deploy/release-auto-invoice-issuance.sh root@139.196.140.215
+bash deploy/deploy-auto-invoice-issuance.sh root@139.196.140.215
 ```
+
+如果你已经登录到了服务器内部，也可以直接执行：
+
+```bash
+sudo bash deploy/deploy-auto-invoice-issuance.sh
+```
+
+脚本会自动识别当前机器已经是部署目标机，此时不再二次 `ssh` 自己。
 
 这个脚本会在服务器上执行：
 
