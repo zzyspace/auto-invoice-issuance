@@ -6,6 +6,10 @@ stores:
     initial_last_processed_id: 307
     attachment_question_id: q-6-VwdW
     enabled: true
+    portal_enabled: true
+    portal_company_switch_name: 厦门市思明区门店A（个体工商户）（待确认）
+    portal_company_verify_name: 厦门市思明区门店A（个体工商户）
+    portal_company_role: legal_representative
 
   - store_key: quanzhou_store_b
     store_name: 泉州门店B
@@ -13,4 +17,7 @@ stores:
     output_xlsx_path: ./output/quanzhou_store_b.xlsx
     initial_last_processed_id: 418
     enabled: true
-
+    portal_enabled: true
+    portal_company_switch_name: 泉州市门店B有限公司
+    portal_company_verify_name: 泉州市门店B有限公司
+    portal_company_role: legal_representative

@@ -96,6 +96,14 @@ def load_store_configs(path: Path) -> list[StoreConfig]:
                 attachment_question_id=str(item["attachment_question_id"])
                 if item.get("attachment_question_id")
                 else None,
+                portal_enabled=_parse_bool(item.get("portal_enabled", False), default=False),
+                portal_company_switch_name=str(item["portal_company_switch_name"])
+                if item.get("portal_company_switch_name")
+                else None,
+                portal_company_verify_name=str(item["portal_company_verify_name"])
+                if item.get("portal_company_verify_name")
+                else None,
+                portal_company_role=str(item.get("portal_company_role", "legal_representative")),
             )
         )
     if not configs:
@@ -209,6 +217,52 @@ def load_app_config(env_path: Optional[Path] = None) -> AppConfig:
         ),
         tax_lookup_cache_negative_ttl_hours=int(
             os.environ.get("TAX_LOOKUP_CACHE_NEGATIVE_TTL_HOURS", "24")
+        ),
+        portal_home_url=os.environ.get(
+            "TAX_PORTAL_HOME_URL",
+            "https://etax.xiamen.chinatax.gov.cn:8443/loginb/",
+        ),
+        portal_identity_switch_url=os.environ.get(
+            "TAX_PORTAL_IDENTITY_SWITCH_URL",
+            "https://tpass.xiamen.chinatax.gov.cn:8443/#/identitySwitch/enterprise"
+            "?client_id=y56b7aay5brf48f8aa7bf24dd54d775r",
+        ),
+        portal_batch_issue_url=os.environ.get(
+            "TAX_PORTAL_BATCH_ISSUE_URL",
+            "https://dppt.xiamen.chinatax.gov.cn:8443/blue-invoice-makeout/invoice-batch",
+        ),
+        portal_user_data_dir=resolve_optional_path("TAX_PORTAL_USER_DATA_DIR"),
+        portal_artifacts_dir=(
+            resolve_optional_path("TAX_PORTAL_ARTIFACTS_DIR")
+            or base_dir.joinpath("data", "tax-portal-artifacts").resolve()
+        ),
+        portal_browser_channel=os.environ.get("TAX_PORTAL_BROWSER_CHANNEL", "chrome"),
+        portal_headless=_parse_bool(os.environ.get("TAX_PORTAL_HEADLESS", "false"), default=False),
+        portal_slow_mo_ms=int(os.environ.get("TAX_PORTAL_SLOW_MO_MS", "0")),
+        portal_action_timeout_ms=int(os.environ.get("TAX_PORTAL_ACTION_TIMEOUT_MS", "15000")),
+        portal_login_timeout_minutes=int(os.environ.get("TAX_PORTAL_LOGIN_TIMEOUT_MINUTES", "30")),
+        portal_block_on_empty_amount=_parse_bool(
+            os.environ.get("TAX_PORTAL_BLOCK_ON_EMPTY_AMOUNT", "true"),
+            default=True,
+        ),
+        portal_sync_from_server=_parse_bool(
+            os.environ.get("TAX_PORTAL_SYNC_FROM_SERVER", "false"),
+            default=False,
+        ),
+        portal_sync_remote_host=os.environ.get("TAX_PORTAL_REMOTE_HOST") or None,
+        portal_sync_remote_output_dir=os.environ.get("TAX_PORTAL_REMOTE_OUTPUT_DIR") or None,
+        portal_sync_ssh_key_path=resolve_optional_path("TAX_PORTAL_SSH_KEY_PATH"),
+        portal_sync_ssh_port=int(os.environ.get("TAX_PORTAL_SSH_PORT", "22")),
+        portal_sync_connect_timeout_seconds=int(
+            os.environ.get("TAX_PORTAL_SYNC_CONNECT_TIMEOUT_SECONDS", "10")
+        ),
+        portal_sync_strict_host_key_checking=_parse_bool(
+            os.environ.get("TAX_PORTAL_STRICT_HOST_KEY_CHECKING", "false"),
+            default=False,
+        ),
+        portal_sync_batch_mode=_parse_bool(
+            os.environ.get("TAX_PORTAL_SSH_BATCH_MODE", "true"),
+            default=True,
         ),
     )
     return config

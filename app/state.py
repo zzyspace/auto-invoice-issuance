@@ -6,7 +6,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-from app.models import StoreConfig, StoreRunResult, TaxLookupCacheEntry, TaxLookupResult
+from app.models import (
+    PortalIssueResult,
+    StoreConfig,
+    StoreRunResult,
+    TaxLookupCacheEntry,
+    TaxLookupResult,
+)
 from app.utils import ensure_parent_dir
 
 
@@ -63,6 +69,37 @@ class StateStore:
                     raw_response_json TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (provider, normalized_company_name)
+                );
+
+                CREATE TABLE IF NOT EXISTS portal_issue_state (
+                    store_key TEXT PRIMARY KEY,
+                    last_history_id INTEGER,
+                    last_status TEXT NOT NULL,
+                    current_step TEXT NOT NULL,
+                    workbook_sha256 TEXT,
+                    error TEXT,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS portal_issue_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    store_key TEXT NOT NULL,
+                    store_name TEXT NOT NULL,
+                    company_verify_name TEXT NOT NULL,
+                    workbook_path TEXT NOT NULL,
+                    workbook_sha256 TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT NOT NULL,
+                    expected_count INTEGER NOT NULL,
+                    submitted_count INTEGER NOT NULL,
+                    success_count INTEGER NOT NULL,
+                    failure_count INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    step TEXT NOT NULL,
+                    details_json TEXT NOT NULL,
+                    artifacts_dir TEXT,
+                    error TEXT
                 );
                 """
             )
@@ -247,6 +284,139 @@ class StateStore:
                     now,
                 ),
             )
+
+    def update_portal_issue_state(
+        self,
+        store_key: str,
+        *,
+        current_step: str,
+        last_status: str,
+        workbook_sha256: str | None = None,
+        error: str | None = None,
+        last_history_id: int | None = None,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO portal_issue_state (
+                    store_key,
+                    last_history_id,
+                    last_status,
+                    current_step,
+                    workbook_sha256,
+                    error,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(store_key) DO UPDATE SET
+                    last_history_id = COALESCE(excluded.last_history_id, portal_issue_state.last_history_id),
+                    last_status = excluded.last_status,
+                    current_step = excluded.current_step,
+                    workbook_sha256 = excluded.workbook_sha256,
+                    error = excluded.error,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    store_key,
+                    last_history_id,
+                    last_status,
+                    current_step,
+                    workbook_sha256,
+                    error,
+                    now,
+                ),
+            )
+
+    def record_portal_issue_result(self, result: PortalIssueResult) -> int:
+        if result.finished_at is None:
+            raise ValueError("Portal issue result must be finalized before recording.")
+        details_json = json.dumps(
+            [
+                {
+                    "invoice_serial": detail.invoice_serial,
+                    "digital_invoice_number": detail.digital_invoice_number,
+                    "buyer_email": detail.buyer_email,
+                    "status": detail.status,
+                    "failure_reason": detail.failure_reason,
+                }
+                for detail in result.details
+            ],
+            ensure_ascii=False,
+        )
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO portal_issue_history (
+                    store_key,
+                    store_name,
+                    company_verify_name,
+                    workbook_path,
+                    workbook_sha256,
+                    mode,
+                    started_at,
+                    finished_at,
+                    expected_count,
+                    submitted_count,
+                    success_count,
+                    failure_count,
+                    status,
+                    step,
+                    details_json,
+                    artifacts_dir,
+                    error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    result.store_key,
+                    result.store_name,
+                    result.company_verify_name,
+                    str(result.workbook_path),
+                    result.workbook_sha256,
+                    result.mode,
+                    result.started_at.isoformat(),
+                    result.finished_at.isoformat(),
+                    result.expected_count,
+                    result.submitted_count,
+                    result.success_count,
+                    result.failure_count,
+                    result.status,
+                    result.step,
+                    details_json,
+                    str(result.artifacts_dir) if result.artifacts_dir else None,
+                    result.error,
+                ),
+            )
+            history_id = int(cursor.lastrowid)
+            connection.execute(
+                """
+                INSERT INTO portal_issue_state (
+                    store_key,
+                    last_history_id,
+                    last_status,
+                    current_step,
+                    workbook_sha256,
+                    error,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(store_key) DO UPDATE SET
+                    last_history_id = excluded.last_history_id,
+                    last_status = excluded.last_status,
+                    current_step = excluded.current_step,
+                    workbook_sha256 = excluded.workbook_sha256,
+                    error = excluded.error,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    result.store_key,
+                    history_id,
+                    result.status,
+                    result.step,
+                    result.workbook_sha256,
+                    result.error,
+                    result.finished_at.isoformat(),
+                ),
+            )
+        return history_id
 
     @staticmethod
     def _store_state_exists(connection: sqlite3.Connection, store_key: str) -> bool:

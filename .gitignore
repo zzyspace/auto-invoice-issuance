@@ -7,3 +7,5 @@ output/
 backups/
 ~$*.xlsx
 poc/
+data/tax-portal-profile/
+data/tax-portal-artifacts/

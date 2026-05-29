@@ -16,6 +16,10 @@ class StoreConfig:
     initial_last_processed_id: int
     enabled: bool = True
     attachment_question_id: Optional[str] = None
+    portal_enabled: bool = False
+    portal_company_switch_name: Optional[str] = None
+    portal_company_verify_name: Optional[str] = None
+    portal_company_role: str = "legal_representative"
 
     def effective_attachment_question_id(self, default_question_id: Optional[str]) -> str:
         question_id = self.attachment_question_id or default_question_id
@@ -24,6 +28,18 @@ class StoreConfig:
                 f"Store '{self.store_key}' is missing attachment_question_id and no global default is configured."
             )
         return question_id
+
+    def effective_portal_company_switch_name(self) -> str:
+        value = (self.portal_company_switch_name or "").strip()
+        if not value:
+            raise ValueError(f"Store '{self.store_key}' is missing portal_company_switch_name.")
+        return value
+
+    def effective_portal_company_verify_name(self) -> str:
+        value = (self.portal_company_verify_name or "").strip()
+        if not value:
+            raise ValueError(f"Store '{self.store_key}' is missing portal_company_verify_name.")
+        return value
 
 
 @dataclass(frozen=True)
@@ -66,6 +82,28 @@ class AppConfig:
     tax_lookup_value_path: Optional[str] = None
     tax_lookup_timeout_seconds: int = 60
     tax_lookup_cache_negative_ttl_hours: int = 24
+    portal_home_url: str = "https://etax.xiamen.chinatax.gov.cn:8443/loginb/"
+    portal_identity_switch_url: str = (
+        "https://tpass.xiamen.chinatax.gov.cn:8443/#/identitySwitch/enterprise"
+        "?client_id=y56b7aay5brf48f8aa7bf24dd54d775r"
+    )
+    portal_batch_issue_url: str = "https://dppt.xiamen.chinatax.gov.cn:8443/blue-invoice-makeout/invoice-batch"
+    portal_user_data_dir: Optional[Path] = None
+    portal_artifacts_dir: Optional[Path] = None
+    portal_browser_channel: str = "chrome"
+    portal_headless: bool = False
+    portal_slow_mo_ms: int = 0
+    portal_action_timeout_ms: int = 15000
+    portal_login_timeout_minutes: int = 30
+    portal_block_on_empty_amount: bool = True
+    portal_sync_from_server: bool = False
+    portal_sync_remote_host: Optional[str] = None
+    portal_sync_remote_output_dir: Optional[str] = None
+    portal_sync_ssh_key_path: Optional[Path] = None
+    portal_sync_ssh_port: int = 22
+    portal_sync_connect_timeout_seconds: int = 10
+    portal_sync_strict_host_key_checking: bool = False
+    portal_sync_batch_mode: bool = True
 
 
 @dataclass(frozen=True)
@@ -169,3 +207,49 @@ class TaxLookupCacheEntry:
     candidate_count: int
     raw_response_json: str
     updated_at: datetime
+
+
+@dataclass(frozen=True)
+class PortalIssueRow:
+    invoice_serial: str
+    buyer_name: str
+    buyer_tax_id: Optional[str]
+    buyer_email: Optional[str]
+    amount_excluding_tax: Decimal
+    tax_rate: Decimal
+    tax_amount: Decimal
+    amount_including_tax: Decimal
+
+
+@dataclass(frozen=True)
+class PortalIssueDetail:
+    invoice_serial: str
+    digital_invoice_number: Optional[str]
+    buyer_email: Optional[str]
+    status: str
+    failure_reason: Optional[str]
+
+
+@dataclass
+class PortalIssueResult:
+    store_key: str
+    store_name: str
+    company_verify_name: str
+    workbook_path: Path
+    workbook_sha256: str
+    mode: str
+    expected_count: int
+    submitted_count: int
+    success_count: int
+    failure_count: int
+    status: str
+    step: str
+    details: tuple[PortalIssueDetail, ...] = ()
+    artifacts_dir: Optional[Path] = None
+    error: Optional[str] = None
+    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    finished_at: Optional[datetime] = None
+
+    def finalize(self) -> "PortalIssueResult":
+        self.finished_at = datetime.now(timezone.utc)
+        return self

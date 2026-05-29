@@ -65,6 +65,11 @@ TAX_LOOKUP_ALAPI_TOKEN=your_alapi_token_here
 - 每个门店一条配置
 - `survey_id`、`output_xlsx_path`、`initial_last_processed_id` 必填
 - `attachment_question_id` 可选，不填时使用 `.env` 中的默认值
+- 税务局 runner 额外字段：
+  - `portal_enabled`: 是否允许该门店进入税务局开票 runner
+  - `portal_company_switch_name`: 身份切换列表里的目标公司名
+  - `portal_company_verify_name`: 切换完成后首页/业务页里用于校验的公司名
+  - `portal_company_role`: 身份类型，支持 `legal_representative`、`tax_operator`
 
 ## 运行
 
@@ -91,6 +96,47 @@ python3 -m app.main smoke-test --env-file .env
 ```bash
 python3 -m app.main tax-lookup-test --env-file .env --company-name "深圳易思商务咨询有限公司厦门分公司"
 ```
+
+只同步服务器上的最新模板到本地 `output/`：
+
+```bash
+python3 -m app.main portal-sync --env-file .env --store-key fuzzy
+```
+
+税务局 runner 只做导入校验，不真实提交：
+
+```bash
+python3 -m app.main portal-issue-dry-run --env-file .env --store-key fuzzy
+```
+
+税务局 runner 真实提交：
+
+```bash
+python3 -m app.main portal-issue-run --env-file .env --store-key fuzzy
+```
+
+如果你先从服务器拉了一份模板到本地 `output/`，并且手工改过这份本地文件，希望本次开票直接使用本地修正版而不是重新从服务器覆盖，增加 `--skip-sync`：
+
+```bash
+python3 -m app.main portal-issue-dry-run --env-file .env --store-key fuzzy --skip-sync
+python3 -m app.main portal-issue-run --env-file .env --store-key fuzzy --skip-sync
+```
+
+税务局 runner 相关环境变量：
+
+- `TAX_PORTAL_USER_DATA_DIR`: 本机浏览器持久化 profile 目录，建议使用独立目录
+- `TAX_PORTAL_ARTIFACTS_DIR`: runner 截图和调试产物目录
+- `TAX_PORTAL_HOME_URL`: 税务局首页
+- `TAX_PORTAL_IDENTITY_SWITCH_URL`: 企业办税身份切换页
+- `TAX_PORTAL_BATCH_ISSUE_URL`: 批量开票页
+- `TAX_PORTAL_LOGIN_TIMEOUT_MINUTES`: 登录等待超时
+- `TAX_PORTAL_BLOCK_ON_EMPTY_AMOUNT`: 为 `true` 时，模板里金额为空将直接阻断提交
+- `TAX_PORTAL_SYNC_FROM_SERVER`: 为 `true` 时，runner 开票前先从服务器同步最新 `output/*.xlsx`
+- `TAX_PORTAL_REMOTE_HOST`: 服务器地址，如 `root@139.196.140.215`
+- `TAX_PORTAL_REMOTE_OUTPUT_DIR`: 服务器上的 output 目录，当前生产为 `/var/lib/auto-invoice-issuance/output`
+- `TAX_PORTAL_SSH_KEY_PATH`: 可选，专门给 runner 用的 SSH 私钥路径
+- `TAX_PORTAL_SSH_PORT`: SSH 端口
+- `TAX_PORTAL_SYNC_CONNECT_TIMEOUT_SECONDS`: 同步模板时的 SSH 连接超时
 
 ## Docker
 
