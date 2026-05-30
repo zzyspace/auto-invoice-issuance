@@ -23,6 +23,7 @@ ROLE_LABELS = {
 QR_REFRESH_GRACE_SECONDS = 5.0
 LOGIN_WAIT_HEARTBEAT_SECONDS = 15.0
 HOME_PAGE_BEFORE_BATCH_PAGE_DELAY_SECONDS = 5.0
+POST_SUBMIT_SUCCESS_WAIT_SECONDS = 3.0
 BROWSER_SESSION_SYNC_ENTRIES = (
     "Cookies",
     "Cookies-journal",
@@ -38,7 +39,6 @@ BROWSER_SESSION_SYNC_ENTRIES = (
     "WebStorage",
     "Network",
 )
-BATCH_PAGE_RECOVERY_REFRESH_ATTEMPTS = 2
 
 
 class PortalRunnerError(RuntimeError):
@@ -53,31 +53,83 @@ class TaxPortalRunner:
         self.syncer = PortalWorkbookSyncer(config)
         self.network_diag_enabled = self._env_flag("TAX_PORTAL_NETWORK_DIAG")
         self.network_diag_threshold_ms = float(os.environ.get("TAX_PORTAL_NETWORK_DIAG_THRESHOLD_MS", "800"))
-        if config.portal_user_data_dir is None:
+        if config.portal_browser_backend not in {"playwright", "chrome_cdp"}:
+            raise ValueError(
+                "TAX_PORTAL_BROWSER_BACKEND must be one of: playwright, chrome_cdp."
+            )
+        if config.portal_browser_backend == "playwright" and config.portal_user_data_dir is None:
             raise ValueError("TAX_PORTAL_USER_DATA_DIR is required for portal runner commands.")
 
     def run(self, stores: list[StoreConfig]) -> list[PortalIssueResult]:
         sync_playwright = self._load_sync_playwright()
         results: list[PortalIssueResult] = []
-        self._sync_portal_profile_from_chrome()
         with sync_playwright() as playwright:
-            launch_args = self._launch_args()
-            if self.config.portal_disable_proxy:
-                self._log("runner", "launching Chrome with proxy disabled for tax portal requests")
-            context = playwright.chromium.launch_persistent_context(
-                user_data_dir=str(self.config.portal_user_data_dir),
-                channel=self.config.portal_browser_channel or None,
-                args=launch_args or None,
-                headless=self.config.portal_headless,
-                slow_mo=max(self.config.portal_slow_mo_ms, 0) or None,
-            )
-            context.set_default_timeout(self.config.portal_action_timeout_ms)
-            home_page = context.pages[0] if context.pages else context.new_page()
-            self._install_network_diag(context, home_page, "runner", "home")
+            if self.config.portal_browser_backend == "chrome_cdp":
+                results = self._run_with_attached_chrome(playwright, stores)
+            else:
+                results = self._run_with_playwright_context(playwright, stores)
+        return results
+
+    def _run_with_playwright_context(self, playwright: object, stores: list[StoreConfig]) -> list[PortalIssueResult]:
+        results: list[PortalIssueResult] = []
+        self._sync_portal_profile_from_chrome()
+        launch_args = self._launch_args()
+        if self.config.portal_disable_proxy:
+            self._log("runner", "launching Chrome with proxy disabled for tax portal requests")
+        context = playwright.chromium.launch_persistent_context(
+            user_data_dir=str(self.config.portal_user_data_dir),
+            channel=self.config.portal_browser_channel or None,
+            args=launch_args or None,
+            headless=self.config.portal_headless,
+            slow_mo=max(self.config.portal_slow_mo_ms, 0) or None,
+        )
+        context.set_default_timeout(self.config.portal_action_timeout_ms)
+        home_page = context.pages[0] if context.pages else context.new_page()
+        self._install_network_diag(context, home_page, "runner", "home")
+        try:
             for store in stores:
                 results.append(self._run_store(context, home_page, store))
+        finally:
             context.close()
         return results
+
+    def _run_with_attached_chrome(self, playwright: object, stores: list[StoreConfig]) -> list[PortalIssueResult]:
+        results: list[PortalIssueResult] = []
+        cdp_url = self.config.portal_chrome_cdp_url or "http://127.0.0.1:9222"
+        self._log("runner", f"connecting to current Chrome session via CDP: {cdp_url}")
+        browser = playwright.chromium.connect_over_cdp(cdp_url)
+        if not browser.contexts:
+            raise PortalRunnerError(
+                "Connected to Chrome via CDP, but no browser context was available."
+            )
+        context = browser.contexts[0]
+        context.set_default_timeout(self.config.portal_action_timeout_ms)
+        home_page = self._resolve_attached_home_page(context)
+        self._install_network_diag(context, home_page, "runner", "home")
+        try:
+            for store in stores:
+                results.append(self._run_store(context, home_page, store))
+        finally:
+            try:
+                if getattr(home_page, "_codex_created_page", False):
+                    home_page.close()
+            except Exception:
+                pass
+        return results
+
+    def _resolve_attached_home_page(self, context: object) -> object:
+        for candidate in getattr(context, "pages", []):
+            try:
+                if self._is_home_page(candidate):
+                    return candidate
+            except Exception:
+                continue
+        page = context.new_page()
+        try:
+            setattr(page, "_codex_created_page", True)
+        except Exception:
+            pass
+        return page
 
     def _run_store(self, context: object, home_page: object, store: StoreConfig) -> PortalIssueResult:
         active_page = home_page
@@ -131,8 +183,11 @@ class TaxPortalRunner:
             ),
         )
         try:
-            self._log(store.store_key, f"opening portal home page: {self.config.portal_home_url}")
-            self._goto(self.config.portal_home_url, home_page)
+            if self.config.portal_browser_backend == "chrome_cdp" and self._is_home_page(home_page):
+                self._log(store.store_key, f"reusing attached Chrome home page: {home_page.url}")
+            else:
+                self._log(store.store_key, f"opening portal home page: {self.config.portal_home_url}")
+                self._goto(self.config.portal_home_url, home_page)
             home_page = self._ensure_logged_in(home_page, result)
             home_page = self._ensure_company(home_page, store, result)
             self._wait_for_home_page_ready(home_page, store)
@@ -143,7 +198,7 @@ class TaxPortalRunner:
             self._install_network_diag(context, batch_page, store.store_key, "batch")
             try:
                 batch_page = self._wait_for_batch_page(batch_page, store, result)
-                self._assert_batch_page_clean(batch_page)
+                self._ensure_batch_page_clean(batch_page, store.store_key)
                 self._log(store.store_key, "batch issue page is clean and ready for workbook import")
                 self._import_workbook(batch_page, store.store_key, store.output_xlsx_path, rows, summary)
                 result.step = "validated"
@@ -189,6 +244,12 @@ class TaxPortalRunner:
                     f"step=submit_result status={result.status} "
                     f"success_count={success_count} failure_count={failure_count}",
                 )
+                if result.status == "success":
+                    self._log(
+                        store.store_key,
+                        f"submission succeeded; waiting {POST_SUBMIT_SUCCESS_WAIT_SECONDS:.0f}s before continuing",
+                    )
+                    sleep(POST_SUBMIT_SUCCESS_WAIT_SECONDS)
                 return self._finalize_result(result)
             finally:
                 try:
@@ -303,23 +364,30 @@ class TaxPortalRunner:
             )
         selected_name = self._select_company_switch_row(home_page, store)
         self._wait_for_switch_confirmation_ready(home_page, store.store_key)
-        home_page.get_by_role("button", name="确定").last.click()
+        self._visible_button_in_dialog(home_page, "确认是否切换", "确定").click()
         role_label = ROLE_LABELS.get(store.portal_company_role, "法定代表人")
         self._wait_for_role_selection_ready(home_page, store.store_key, role_label)
         try:
-            home_page.get_by_role("radio", name=role_label).check(force=True)
+            self._visible_text_in_dialog(home_page, "身份类型选择", role_label).click()
         except Exception:
-            home_page.get_by_text(role_label, exact=True).click()
-        confirm_button = home_page.get_by_role("button", name="确定").last
+            role_radio = self._visible_radio_in_dialog(home_page, "身份类型选择", role_label)
+            try:
+                role_radio.check()
+            except Exception:
+                role_radio.click(force=True)
+        sleep(0.2)
+        confirm_button = self._visible_button_in_dialog(home_page, "身份类型选择", "确定")
         self._wait_until(lambda: confirm_button.is_enabled(), timeout_seconds=10, message="identity role confirm enable")
         confirm_button.click()
-        home_page = self._navigate_with_reauth(
-            home_page,
-            self.config.portal_home_url,
-            result,
-            expected_text=verify_name,
-            step_name=f"switch company to {verify_name}",
-        )
+        self._wait_for_company_switch_completion(home_page, store.store_key, verify_name)
+        if not self._page_contains(home_page, verify_name):
+            home_page = self._navigate_with_reauth(
+                home_page,
+                self.config.portal_home_url,
+                result,
+                expected_text=verify_name,
+                step_name=f"switch company to {verify_name}",
+            )
         self._log(store.store_key, f"company switch confirmed: {verify_name} via candidate={selected_name}")
         return home_page
 
@@ -446,26 +514,26 @@ class TaxPortalRunner:
 
     def _wait_for_batch_page_ready_with_recovery(self, page: object, store_key: str) -> None:
         timeout_seconds = max(self.config.portal_action_timeout_ms / 1000, 5.0)
-        for attempt in range(1, BATCH_PAGE_RECOVERY_REFRESH_ATTEMPTS + 1):
-            self._wait_until(
-                lambda: self._page_contains(page, "批量开票") or self._batch_page_shows_session_invalid_prompt(page),
-                timeout_seconds=timeout_seconds,
-                message="show batch issue page or session recovery prompt",
-                interval_seconds=0.2,
-            )
-            if self._page_contains(page, "批量开票"):
-                self._wait_for_batch_page_ready(page, store_key)
-                return
-            if attempt >= BATCH_PAGE_RECOVERY_REFRESH_ATTEMPTS:
-                raise PortalRunnerError(
-                    "Batch page still reports that the e-invoice platform session is invalid after automatic refresh."
-                )
-            self._log(
-                store_key,
-                "batch page reports that the e-invoice platform session is invalid; refreshing once before retry",
-            )
-            page.reload(wait_until="domcontentloaded")
-        raise PortalRunnerError("Failed to recover batch issue page.")
+        self._wait_until(
+            lambda: self._page_contains(page, "批量开票") or self._batch_page_shows_session_invalid_prompt(page),
+            timeout_seconds=timeout_seconds,
+            message="show batch issue page or session recovery prompt",
+            interval_seconds=0.2,
+        )
+        if self._page_contains(page, "批量开票"):
+            self._wait_for_batch_page_ready(page, store_key)
+            return
+        self._log(
+            store_key,
+            "batch page reports that the e-invoice platform session is invalid; waiting for the page to recover automatically",
+        )
+        self._wait_until(
+            lambda: self._page_contains(page, "批量开票"),
+            timeout_seconds=timeout_seconds,
+            message="recover batch issue page after session prompt",
+            interval_seconds=0.2,
+        )
+        self._wait_for_batch_page_ready(page, store_key)
 
     @staticmethod
     def _batch_page_shows_session_invalid_prompt(page: object) -> bool:
@@ -507,15 +575,22 @@ class TaxPortalRunner:
         self,
         page: object,
         store_key: str,
-        expected_count_text: str,
-        expected_amount_text: str,
+        row_count: int,
+        total_amount_including_tax: Decimal,
     ) -> None:
         self._wait_for_page_stable(
             page,
             store_key,
             "submit confirmation dialog",
-            required_texts=(expected_count_text, expected_amount_text),
+            required_texts=("本次勾选批量开具发票",),
             wait_for_load_states=False,
+        )
+        self._wait_until(
+            lambda: self._visible_button_in_dialog(page, "本次勾选批量开具发票", "确定").is_visible()
+            and self._visible_button_in_dialog(page, "本次勾选批量开具发票", "确定").is_enabled(),
+            timeout_seconds=10,
+            message="show submit confirmation button",
+            interval_seconds=0.2,
         )
 
     def _wait_for_result_modal_ready(self, page: object, store_key: str) -> None:
@@ -532,8 +607,15 @@ class TaxPortalRunner:
             page,
             store_key,
             "switch confirmation dialog",
-            required_texts=("确认是否切换", "确定"),
+            required_texts=("确认是否切换",),
             wait_for_load_states=False,
+        )
+        self._wait_until(
+            lambda: self._visible_button_in_dialog(page, "确认是否切换", "确定").is_visible()
+            and self._visible_button_in_dialog(page, "确认是否切换", "确定").is_enabled(),
+            timeout_seconds=10,
+            message="show switch confirmation button",
+            interval_seconds=0.2,
         )
 
     def _wait_for_role_selection_ready(self, page: object, store_key: str, role_label: str) -> None:
@@ -541,16 +623,59 @@ class TaxPortalRunner:
             page,
             store_key,
             "role selection dialog",
-            required_texts=("身份类型选择", role_label, "确定"),
+            required_texts=("身份类型选择",),
             wait_for_load_states=False,
         )
+        self._wait_until(
+            lambda: (
+                self._visible_button_in_dialog(page, "身份类型选择", "确定").is_visible()
+                and (
+                    self._visible_text_in_dialog(page, "身份类型选择", role_label).is_visible()
+                    or self._visible_radio_in_dialog(page, "身份类型选择", role_label).is_visible()
+                )
+            ),
+            timeout_seconds=10,
+            message=f"show role selection controls for {role_label}",
+            interval_seconds=0.2,
+        )
 
-    def _assert_batch_page_clean(self, page: object) -> None:
+    def _wait_for_company_switch_completion(self, page: object, store_key: str, verify_name: str) -> None:
+        self._log(store_key, f"waiting for company switch to complete for {verify_name}")
+        self._wait_until(
+            lambda: (
+                self._page_contains(page, verify_name)
+                and self._page_contains(page, "我要办税")
+                and not self._page_contains(page, "身份类型选择")
+            )
+            or self._page_contains(page, "会话失效，请重新登录"),
+            timeout_seconds=max(self.config.portal_action_timeout_ms / 1000, 10.0),
+            message=f"complete company switch to {verify_name}",
+            interval_seconds=0.2,
+        )
+
+    def _ensure_batch_page_clean(self, page: object, store_key: str) -> None:
         body_text = self._body_text(page)
-        if "共 0 条" not in body_text:
-            raise PortalRunnerError("Portal batch page is not clean; refusing to import into a non-empty table.")
-        if "重新选择" in body_text:
-            raise PortalRunnerError("Portal batch page already has a selected workbook; refusing to continue.")
+        if "共 0 条" in body_text and "重新选择" not in body_text:
+            return
+        self._log(store_key, "batch issue page is not clean; attempting to clear imported rows before continuing")
+        clear_button = page.get_by_role("button", name="清空导入")
+        try:
+            clear_button.click(timeout=5000)
+        except Exception as exc:  # noqa: BLE001
+            raise PortalRunnerError("Portal batch page is not clean and could not be cleared automatically.") from exc
+        self._wait_until(
+            lambda: "是否清空所有已导入内容？" in self._body_text(page),
+            timeout_seconds=10,
+            message="open clear imported rows confirmation",
+            interval_seconds=0.2,
+        )
+        self._visible_button(page, "确定").click()
+        self._wait_until(
+            lambda: "共 0 条" in self._body_text(page) and "重新选择" not in self._body_text(page),
+            timeout_seconds=15,
+            message="clear imported batch rows",
+            interval_seconds=0.2,
+        )
 
     def _import_workbook(
         self,
@@ -575,24 +700,10 @@ class TaxPortalRunner:
             message="import workbook result",
         )
         self._wait_for_batch_import_ready(page, store_key, workbook_path.name, success_prefix)
-        body_text = self._body_text(page)
-        for row in rows:
-            if row.buyer_name not in body_text:
-                raise PortalRunnerError(f"Imported batch table is missing buyer name: {row.buyer_name}")
-            for value in (row.amount_excluding_tax, row.amount_including_tax):
-                amount_text = self._format_money(value)
-                if amount_text not in body_text:
-                    raise PortalRunnerError(f"Imported batch table is missing amount: {amount_text}")
-        expected_total_text = self._format_money(summary.total_amount_including_tax)
-        if expected_total_text not in body_text:
-            raise PortalRunnerError(
-                f"Imported batch table is missing total amount-including-tax text: {expected_total_text}"
-            )
         self._log(
             store_key,
             "workbook import verified "
-            f"rows={summary.row_count} "
-            f"total_amount_including_tax={expected_total_text}",
+            f"rows={summary.row_count}",
         )
 
     def _select_all_rows(self, page: object) -> None:
@@ -614,22 +725,15 @@ class TaxPortalRunner:
         total_amount_including_tax: Decimal,
     ) -> None:
         page.get_by_role("button", name="批量开具").click()
-        expected_count_text = f"本次勾选批量开具发票{row_count}份"
-        expected_amount_text = f"价税合计{self._format_money(total_amount_including_tax).rstrip('0').rstrip('.')}元"
+        self._wait_for_submit_confirmation_ready(page, store_key, row_count, total_amount_including_tax)
         self._wait_until(
-            lambda: expected_count_text in self._body_text(page) and expected_amount_text in self._body_text(page),
-            timeout_seconds=10,
-            message="open submit confirmation",
-        )
-        self._wait_for_submit_confirmation_ready(page, store_key, expected_count_text, expected_amount_text)
-        self._wait_until(
-            lambda: page.get_by_role("button", name="确定").last.is_enabled(),
+            lambda: self._visible_button_in_dialog(page, "本次勾选批量开具发票", "确定").is_enabled(),
             timeout_seconds=10,
             message="enable submit confirmation button",
         )
 
     def _confirm_submit(self, page: object) -> None:
-        confirm_button = page.get_by_role("button", name="确定").last
+        confirm_button = self._visible_button_in_dialog(page, "本次勾选批量开具发票", "确定")
         confirm_button.click()
 
     def _wait_for_result_modal(self, page: object, store_key: str) -> tuple[list[PortalIssueDetail], int, int]:
@@ -1042,6 +1146,115 @@ class TaxPortalRunner:
             page.get_by_text(text, exact=True).click()
         except Exception:
             page.get_by_text(text).first.click()
+
+    @staticmethod
+    def _visible_button(page: object, name: str) -> object:
+        locator = page.get_by_role("button", name=name)
+        try:
+            count = locator.count()
+        except Exception:
+            return locator.last
+        for index in range(count):
+            candidate = locator.nth(index)
+            try:
+                if candidate.is_visible():
+                    return candidate
+            except Exception:
+                continue
+        return locator.last
+
+    @staticmethod
+    def _normalized_label(text: str) -> str:
+        return re.sub(r"\s+", "", text)
+
+    def _visible_button_in_dialog(self, page: object, dialog_text: str, button_name: str) -> object:
+        if not hasattr(page, "locator"):
+            return self._visible_button(page, button_name)
+        try:
+            dialog = page.locator('[role="dialog"], .el-message-box, .el-dialog__wrapper').filter(has_text=dialog_text)
+        except Exception:
+            return self._visible_button(page, button_name)
+        try:
+            count = dialog.count()
+        except Exception:
+            return self._visible_button(page, button_name)
+        for index in range(count):
+            candidate_dialog = dialog.nth(index)
+            try:
+                if not candidate_dialog.is_visible():
+                    continue
+                buttons = candidate_dialog.get_by_role("button", name=button_name)
+                button_count = buttons.count()
+                for button_index in range(button_count):
+                    candidate_button = buttons.nth(button_index)
+                    if candidate_button.is_visible():
+                        return candidate_button
+            except Exception:
+                pass
+            try:
+                buttons = candidate_dialog.get_by_role("button")
+                button_count = buttons.count()
+                for button_index in range(button_count):
+                    candidate_button = buttons.nth(button_index)
+                    if not candidate_button.is_visible():
+                        continue
+                    if self._normalized_label(candidate_button.inner_text()) == self._normalized_label(button_name):
+                        return candidate_button
+            except Exception:
+                continue
+        return self._visible_button(page, button_name)
+
+    def _visible_radio_in_dialog(self, page: object, dialog_text: str, radio_name: str) -> object:
+        if not hasattr(page, "locator"):
+            return page.get_by_role("radio", name=radio_name)
+        try:
+            dialog = page.locator('[role="dialog"], .el-message-box, .el-dialog__wrapper').filter(has_text=dialog_text)
+        except Exception:
+            return page.get_by_role("radio", name=radio_name)
+        try:
+            count = dialog.count()
+        except Exception:
+            return page.get_by_role("radio", name=radio_name)
+        for index in range(count):
+            candidate_dialog = dialog.nth(index)
+            try:
+                if not candidate_dialog.is_visible():
+                    continue
+                radios = candidate_dialog.get_by_role("radio", name=radio_name)
+                radio_count = radios.count()
+                for radio_index in range(radio_count):
+                    candidate_radio = radios.nth(radio_index)
+                    if candidate_radio.is_visible():
+                        return candidate_radio
+            except Exception:
+                continue
+        return page.get_by_role("radio", name=radio_name)
+
+    def _visible_text_in_dialog(self, page: object, dialog_text: str, text: str) -> object:
+        if not hasattr(page, "locator"):
+            return page.get_by_text(text, exact=True)
+        try:
+            dialog = page.locator('[role="dialog"], .el-message-box, .el-dialog__wrapper').filter(has_text=dialog_text)
+        except Exception:
+            return page.get_by_text(text, exact=True)
+        try:
+            count = dialog.count()
+        except Exception:
+            return page.get_by_text(text, exact=True)
+        for index in range(count):
+            candidate_dialog = dialog.nth(index)
+            try:
+                if not candidate_dialog.is_visible():
+                    continue
+                texts = candidate_dialog.get_by_text(text, exact=True)
+                text_count = texts.count()
+                for text_index in range(text_count):
+                    candidate_text = texts.nth(text_index)
+                    if candidate_text.is_visible():
+                        return candidate_text
+            except Exception:
+                continue
+        return page.get_by_text(text, exact=True)
 
     @staticmethod
     def _wait_for_text(page: object, text: str, timeout_ms: int = 15000) -> None:

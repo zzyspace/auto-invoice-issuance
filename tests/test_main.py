@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from app.config import load_app_config
-from app.main import _resolve_portal_issue_config, _select_portal_stores, build_parser, command_portal_sync
+from app.main import (
+    _resolve_portal_issue_config,
+    _select_portal_stores,
+    build_parser,
+    command_portal_open_chrome_cdp,
+    command_portal_sync,
+)
 
 
 class MainCommandTests(unittest.TestCase):
@@ -26,6 +33,12 @@ class MainCommandTests(unittest.TestCase):
 
         self.assertEqual("portal-sync", args.command)
         self.assertEqual(["fuzzy"], args.store_keys)
+
+    def test_parser_accepts_portal_open_chrome_cdp_command(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["portal-open-chrome-cdp", "--env-file", ".env"])
+
+        self.assertEqual("portal-open-chrome-cdp", args.command)
 
     def test_resolve_portal_issue_config_disables_sync_only_for_current_invocation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -114,6 +127,51 @@ stores:
 
             self.assertEqual(0, exit_code)
             mocked_sync.assert_called_once()
+
+    def test_command_portal_open_chrome_cdp_launches_dedicated_browser(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            env_path = tmp_path / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "TZ=Asia/Shanghai",
+                        "TENCENT_SURVEY_COOKIE=cookie=value",
+                        "TENCENT_SURVEY_EXPORT_URL=https://wj.qq.com/api/answer_exports/generate",
+                        "TENCENT_SURVEY_EXPORT_METHOD=POST",
+                        "OPENAI_BASE_URL=https://example.com/v1",
+                        "OPENAI_API_KEY=key",
+                        "SMTP_HOST=smtp.example.com",
+                        "SMTP_USERNAME=user",
+                        "SMTP_PASSWORD=pass",
+                        "SMTP_FROM=from@example.com",
+                        "SMTP_TO=to@example.com",
+                        "TEMPLATE_XLSX_PATH=./template.xlsx",
+                        "STATE_DB_PATH=./state.db",
+                        "STORES_CONFIG_PATH=./stores.yaml",
+                        "TAX_PORTAL_CHROME_CDP_URL=http://127.0.0.1:9555",
+                        f"TAX_PORTAL_CHROME_CDP_USER_DATA_DIR={tmp_path / 'cdp-profile'}",
+                        f"TAX_PORTAL_CHROME_EXECUTABLE_PATH={tmp_path / 'Chrome'}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (tmp_path / "Chrome").write_text("", encoding="utf-8")
+
+            fake_process = MagicMock(pid=12345)
+            with patch("app.main._portal_chrome_cdp_ready", return_value=False):
+                with patch("app.main._wait_for_portal_chrome_cdp", return_value=True):
+                    with patch("subprocess.Popen", return_value=fake_process) as mocked_popen:
+                        with patch("builtins.print") as mocked_print:
+                            exit_code = command_portal_open_chrome_cdp(env_path)
+
+            self.assertEqual(0, exit_code)
+            mocked_popen.assert_called_once()
+            printed = mocked_print.call_args.args[0]
+            payload = json.loads(printed)
+            self.assertEqual("ready", payload["status"])
+            self.assertEqual("http://127.0.0.1:9555", payload["cdp_url"])
+            self.assertTrue(payload["launched"])
 
     def test_select_portal_stores_orders_by_priority(self) -> None:
         class FakeStore:

@@ -237,6 +237,13 @@ def load_app_config(env_path: Optional[Path] = None) -> AppConfig:
             resolve_optional_path("TAX_PORTAL_ARTIFACTS_DIR")
             or base_dir.joinpath("data", "tax-portal-artifacts").resolve()
         ),
+        portal_browser_backend=os.environ.get("TAX_PORTAL_BROWSER_BACKEND", "playwright").strip().lower(),
+        portal_chrome_cdp_url=os.environ.get("TAX_PORTAL_CHROME_CDP_URL") or None,
+        portal_chrome_cdp_user_data_dir=(
+            resolve_optional_path("TAX_PORTAL_CHROME_CDP_USER_DATA_DIR")
+            or base_dir.joinpath("data", "tax-portal-chrome-cdp").resolve()
+        ),
+        portal_chrome_executable_path=resolve_optional_path("TAX_PORTAL_CHROME_EXECUTABLE_PATH"),
         portal_browser_channel=os.environ.get("TAX_PORTAL_BROWSER_CHANNEL", "chrome"),
         portal_disable_proxy=_parse_bool(
             os.environ.get("TAX_PORTAL_DISABLE_PROXY", "false"),

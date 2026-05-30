@@ -91,6 +91,10 @@ class AppConfig:
     portal_batch_issue_url: str = "https://dppt.xiamen.chinatax.gov.cn:8443/blue-invoice-makeout/invoice-batch"
     portal_user_data_dir: Optional[Path] = None
     portal_artifacts_dir: Optional[Path] = None
+    portal_browser_backend: str = "playwright"
+    portal_chrome_cdp_url: Optional[str] = None
+    portal_chrome_cdp_user_data_dir: Optional[Path] = None
+    portal_chrome_executable_path: Optional[Path] = None
     portal_browser_channel: str = "chrome"
     portal_disable_proxy: bool = False
     portal_headless: bool = False

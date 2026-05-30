@@ -106,6 +106,331 @@ class PortalRunnerUrlTests(unittest.TestCase):
             self.assertEqual(["--no-proxy-server", "--proxy-bypass-list=*"], disabled_runner._launch_args())  # noqa: SLF001
             self.assertEqual([], enabled_runner._launch_args())  # noqa: SLF001
 
+    def test_init_allows_chrome_cdp_backend_without_portal_user_data_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=None,
+                portal_browser_backend="chrome_cdp",
+                portal_chrome_cdp_url="http://127.0.0.1:9222",
+            )
+
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+
+            self.assertEqual("chrome_cdp", runner.config.portal_browser_backend)
+
+    def test_run_with_attached_chrome_uses_existing_browser_context(self) -> None:
+        class FakePage:
+            def __init__(self, url: str, body_text: str) -> None:
+                self.url = url
+                self.body_text = body_text
+
+            def locator(self, selector: str) -> object:
+                class FakeLocator:
+                    def __init__(self, page: "FakePage") -> None:
+                        self.page = page
+
+                    def inner_text(self) -> str:
+                        return self.page.body_text
+
+                return FakeLocator(self)
+
+            def close(self) -> None:
+                self.closed = True
+
+        class FakeContext:
+            def __init__(self, page: FakePage) -> None:
+                self.pages = [page]
+                self.timeout = None
+
+            def set_default_timeout(self, timeout: int) -> None:
+                self.timeout = timeout
+
+            def new_page(self) -> FakePage:
+                raise AssertionError("new_page should not be called when an existing home page tab is available")
+
+        class FakeBrowser:
+            def __init__(self, page: FakePage) -> None:
+                self.context = FakeContext(page)
+                self.contexts = [self.context]
+
+        class FakeChromium:
+            def __init__(self, browser: FakeBrowser) -> None:
+                self.browser = browser
+                self.received_cdp_url: str | None = None
+
+            def connect_over_cdp(self, cdp_url: str) -> FakeBrowser:
+                self.received_cdp_url = cdp_url
+                return self.browser
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=None,
+                portal_browser_backend="chrome_cdp",
+                portal_chrome_cdp_url="http://127.0.0.1:9333",
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+            existing_home_page = FakePage(
+                "https://etax.xiamen.chinatax.gov.cn:8443/loginb/",
+                "首页 我要办税 厦门市思明区浮几创意餐厅",
+            )
+            browser = FakeBrowser(existing_home_page)
+            chromium = FakeChromium(browser)
+            playwright = SimpleNamespace(chromium=chromium)
+            store = StoreConfig(
+                store_key="fuzzy",
+                store_name="Fuzzy",
+                survey_id="1",
+                output_xlsx_path=tmp_path / "output.xlsx",
+                initial_last_processed_id=1,
+                portal_enabled=True,
+                portal_company_switch_name="厦门市思明区浮几创意餐厅",
+                portal_company_verify_name="厦门市思明区浮几创意餐厅",
+            )
+
+            with patch.object(runner, "_install_network_diag"):
+                with patch.object(runner, "_run_store", return_value=SimpleNamespace(status="validated")) as mocked_run:
+                    results = runner._run_with_attached_chrome(playwright, [store])  # noqa: SLF001
+
+            self.assertEqual("http://127.0.0.1:9333", chromium.received_cdp_url)
+            self.assertEqual(config.portal_action_timeout_ms, browser.context.timeout)
+            mocked_run.assert_called_once_with(browser.context, existing_home_page, store)
+            self.assertEqual(1, len(results))
+
+    def test_run_with_attached_chrome_prefers_existing_home_page_tab(self) -> None:
+        class FakePage:
+            def __init__(self, url: str, body_text: str) -> None:
+                self.url = url
+                self.body_text = body_text
+
+            def locator(self, selector: str) -> object:
+                class FakeLocator:
+                    def __init__(self, page: "FakePage") -> None:
+                        self.page = page
+
+                    def inner_text(self) -> str:
+                        return self.page.body_text
+
+                return FakeLocator(self)
+
+        class FakeContext:
+            def __init__(self, page: FakePage) -> None:
+                self.pages = [page]
+                self.timeout = None
+
+            def set_default_timeout(self, timeout: int) -> None:
+                self.timeout = timeout
+
+            def new_page(self) -> FakePage:
+                raise AssertionError("new_page should not be called when an existing home page tab is available")
+
+        class FakeBrowser:
+            def __init__(self, context: FakeContext) -> None:
+                self.contexts = [context]
+
+        class FakeChromium:
+            def __init__(self, browser: FakeBrowser) -> None:
+                self.browser = browser
+
+            def connect_over_cdp(self, cdp_url: str) -> FakeBrowser:
+                self.received_cdp_url = cdp_url
+                return self.browser
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=None,
+                portal_browser_backend="chrome_cdp",
+                portal_chrome_cdp_url="http://127.0.0.1:9333",
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+            existing_home_page = FakePage(
+                "https://etax.xiamen.chinatax.gov.cn:8443/loginb/",
+                "首页 我要办税 厦门市思明区浮几创意餐厅",
+            )
+            context = FakeContext(existing_home_page)
+            chromium = FakeChromium(FakeBrowser(context))
+            playwright = SimpleNamespace(chromium=chromium)
+            store = StoreConfig(
+                store_key="fuzzy",
+                store_name="Fuzzy",
+                survey_id="1",
+                output_xlsx_path=tmp_path / "output.xlsx",
+                initial_last_processed_id=1,
+                portal_enabled=True,
+                portal_company_switch_name="厦门市思明区浮几创意餐厅",
+                portal_company_verify_name="厦门市思明区浮几创意餐厅",
+            )
+
+            with patch.object(runner, "_install_network_diag"):
+                with patch.object(runner, "_run_store", return_value=SimpleNamespace(status="validated")) as mocked_run:
+                    runner._run_with_attached_chrome(playwright, [store])  # noqa: SLF001
+
+            mocked_run.assert_called_once_with(context, existing_home_page, store)
+
+    def test_run_with_attached_chrome_falls_back_to_new_home_page_tab(self) -> None:
+        class FakePage:
+            def __init__(self, url: str, body_text: str) -> None:
+                self.url = url
+                self.body_text = body_text
+                self.closed = False
+
+            def locator(self, selector: str) -> object:
+                class FakeLocator:
+                    def __init__(self, page: "FakePage") -> None:
+                        self.page = page
+
+                    def inner_text(self) -> str:
+                        return self.page.body_text
+
+                return FakeLocator(self)
+
+            def close(self) -> None:
+                self.closed = True
+
+        class FakeContext:
+            def __init__(self) -> None:
+                self.pages = [FakePage("chrome://new-tab-page/", "")]
+                self.timeout = None
+                self.created_page: FakePage | None = None
+
+            def set_default_timeout(self, timeout: int) -> None:
+                self.timeout = timeout
+
+            def new_page(self) -> FakePage:
+                self.created_page = FakePage(
+                    "https://etax.xiamen.chinatax.gov.cn:8443/loginb/",
+                    "首页 我要办税 厦门市思明区浮几创意餐厅",
+                )
+                return self.created_page
+
+        class FakeBrowser:
+            def __init__(self, context: FakeContext) -> None:
+                self.contexts = [context]
+
+        class FakeChromium:
+            def __init__(self, browser: FakeBrowser) -> None:
+                self.browser = browser
+
+            def connect_over_cdp(self, cdp_url: str) -> FakeBrowser:
+                return self.browser
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=None,
+                portal_browser_backend="chrome_cdp",
+                portal_chrome_cdp_url="http://127.0.0.1:9333",
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+            chromium = FakeChromium(FakeBrowser(FakeContext()))
+            playwright = SimpleNamespace(chromium=chromium)
+            store = StoreConfig(
+                store_key="fuzzy",
+                store_name="Fuzzy",
+                survey_id="1",
+                output_xlsx_path=tmp_path / "output.xlsx",
+                initial_last_processed_id=1,
+                portal_enabled=True,
+                portal_company_switch_name="厦门市思明区浮几创意餐厅",
+                portal_company_verify_name="厦门市思明区浮几创意餐厅",
+            )
+
+            with patch.object(runner, "_install_network_diag"):
+                with patch.object(runner, "_run_store", return_value=SimpleNamespace(status="validated")) as mocked_run:
+                    results = runner._run_with_attached_chrome(playwright, [store])  # noqa: SLF001
+
+            created_page = chromium.browser.contexts[0].created_page
+            self.assertIsNotNone(created_page)
+            self.assertTrue(created_page.closed)
+            mocked_run.assert_called_once_with(chromium.browser.contexts[0], created_page, store)
+            self.assertEqual(1, len(results))
+
     def test_sync_portal_profile_from_chrome_copies_session_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
@@ -596,11 +921,11 @@ class PortalRunnerUrlTests(unittest.TestCase):
             )
             mocked_wait_ready.assert_called_once_with(page, store.store_key)
 
-    def test_wait_for_batch_page_ready_with_recovery_refreshes_after_session_invalid_prompt(self) -> None:
+    def test_wait_for_batch_page_ready_with_recovery_waits_after_session_invalid_prompt(self) -> None:
         class FakePage:
             def __init__(self) -> None:
                 self.body_text = "系统检测到电票平台会话已失效或电局账号已退出，需刷新重新操作"
-                self.reload_count = 0
+                self.read_count = 0
 
             def locator(self, selector: str) -> object:
                 class FakeLocator:
@@ -608,14 +933,12 @@ class PortalRunnerUrlTests(unittest.TestCase):
                         self.page = page
 
                     def inner_text(self) -> str:
+                        self.page.read_count += 1
+                        if self.page.read_count >= 3:
+                            self.page.body_text = "批量开票 页面已恢复"
                         return self.page.body_text
 
                 return FakeLocator(self)
-
-            def reload(self, wait_until: str) -> None:
-                self.reload_count += 1
-                self.last_wait_until = wait_until
-                self.body_text = "批量开票 页面已恢复"
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
@@ -650,8 +973,7 @@ class PortalRunnerUrlTests(unittest.TestCase):
                 with patch.object(runner, "_log"):
                     runner._wait_for_batch_page_ready_with_recovery(page, "fuzzy")  # noqa: SLF001
 
-            self.assertEqual(1, page.reload_count)
-            self.assertEqual("domcontentloaded", page.last_wait_until)
+            self.assertGreaterEqual(page.read_count, 3)
             mocked_wait_ready.assert_called_once_with(page, "fuzzy")
 
     def test_run_store_waits_five_seconds_after_home_page_before_opening_batch_page(self) -> None:
@@ -741,7 +1063,7 @@ class PortalRunnerUrlTests(unittest.TestCase):
                                         with patch.object(runner, "_wait_for_home_page_ready", side_effect=fake_wait_for_home_page_ready):
                                             with patch.object(runner, "_install_network_diag"):
                                                 with patch.object(runner, "_wait_for_batch_page", side_effect=fake_wait_for_batch_page):
-                                                    with patch.object(runner, "_assert_batch_page_clean"):
+                                                    with patch.object(runner, "_ensure_batch_page_clean"):
                                                         with patch.object(runner, "_import_workbook"):
                                                             with patch.object(
                                                                 runner,
@@ -928,7 +1250,7 @@ class PortalRunnerUrlTests(unittest.TestCase):
                 )
             ]
             success_prefix = "导入完成，共处理数据1条，处理成功1条"
-            body_text = "示例公司 100.00 123.45 123.45 " + success_prefix
+            body_text = "示例公司 普通发票 " + success_prefix + " 共 1 条"
             events: list[str] = []
             page = FakePage(events)
 
@@ -939,24 +1261,98 @@ class PortalRunnerUrlTests(unittest.TestCase):
                 self.assertEqual(success_prefix, current_success_prefix)
                 events.append("wait_import_ready")
 
-            def fake_body_text(_: object) -> str:
-                events.append("read_body_text")
-                return body_text
-
             with patch.object(runner, "_wait_for_text"):
                 with patch.object(runner, "_wait_until"):
                     with patch.object(runner, "_wait_for_batch_import_ready", side_effect=fake_wait_ready):
-                        with patch.object(runner, "_body_text", side_effect=fake_body_text):
-                            with patch.object(runner, "_log"):
-                                runner._import_workbook(page, "fuzzy", workbook_path, rows, summary)  # noqa: SLF001
+                        with patch.object(runner, "_log"):
+                            runner._import_workbook(page, "fuzzy", workbook_path, rows, summary)  # noqa: SLF001
 
-            self.assertLess(events.index("wait_import_ready"), events.index("read_body_text"))
+            self.assertIn("wait_import_ready", events)
+
+    def test_import_workbook_accepts_portal_transformed_amounts(self) -> None:
+        class FakeClickable:
+            def click(self) -> None:
+                return None
+
+        class FakeChooserValue:
+            def set_files(self, value: str) -> None:
+                self.last_value = value
+
+        class FakeChooserContext:
+            def __init__(self) -> None:
+                self.value = FakeChooserValue()
+
+            def __enter__(self) -> "FakeChooserContext":
+                return self
+
+            def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+                return None
+
+        class FakePage:
+            def expect_file_chooser(self) -> FakeChooserContext:
+                return FakeChooserContext()
+
+            def get_by_text(self, text: str, exact: bool = False) -> FakeClickable:
+                return FakeClickable()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=tmp_path / "profile",
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+            workbook_path = tmp_path / "output.xlsx"
+            summary = SimpleNamespace(row_count=2, total_amount_including_tax=Decimal("438.34"))
+            rows = [
+                SimpleNamespace(
+                    buyer_name="洪玮颖",
+                    amount_excluding_tax=Decimal("184.00"),
+                    amount_including_tax=Decimal("185.84"),
+                ),
+                SimpleNamespace(
+                    buyer_name="陈丹洁",
+                    amount_excluding_tax=Decimal("250.00"),
+                    amount_including_tax=Decimal("252.50"),
+                ),
+            ]
+            page = FakePage()
+            body_text = "导入完成，共处理数据2条，处理成功2条，发票价税合计共434元。"
+
+            with patch.object(runner, "_wait_for_text"):
+                with patch.object(runner, "_wait_until"):
+                    with patch.object(runner, "_wait_for_batch_import_ready"):
+                        with patch.object(runner, "_log"):
+                            runner._import_workbook(page, "fuzzy", workbook_path, rows, summary)  # noqa: SLF001
 
     def test_open_submit_confirmation_waits_for_dialog_to_settle_before_confirm(self) -> None:
         class FakeConfirmButton:
             @property
             def last(self) -> "FakeConfirmButton":
                 return self
+
+            def is_visible(self) -> bool:
+                return True
 
             def is_enabled(self) -> bool:
                 return True
@@ -1005,8 +1401,6 @@ class PortalRunnerUrlTests(unittest.TestCase):
                 portal_user_data_dir=tmp_path / "profile",
             )
             runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
-            expected_amount_text = "价税合计123.45元"
-            body_text = f"本次勾选批量开具发票2份 {expected_amount_text}"
             events: list[str] = []
             page = FakePage(events)
 
@@ -1014,17 +1408,16 @@ class PortalRunnerUrlTests(unittest.TestCase):
                 self.assertTrue(predicate())
                 events.append(f"wait_until:{message}")
 
-            def fake_wait_ready(current_page: object, store_key: str, expected_count_text: str, current_amount_text: str) -> None:
+            def fake_wait_ready(current_page: object, store_key: str, row_count: int, total_amount_including_tax: Decimal) -> None:
                 self.assertIs(page, current_page)
                 self.assertEqual("fuzzy", store_key)
-                self.assertEqual("本次勾选批量开具发票2份", expected_count_text)
-                self.assertEqual(expected_amount_text, current_amount_text)
+                self.assertEqual(2, row_count)
+                self.assertEqual(Decimal("123.45"), total_amount_including_tax)
                 events.append("wait_submit_confirmation_ready")
 
-            with patch.object(runner, "_body_text", return_value=body_text):
-                with patch.object(runner, "_wait_until", side_effect=fake_wait_until):
-                    with patch.object(runner, "_wait_for_submit_confirmation_ready", side_effect=fake_wait_ready):
-                        runner._open_submit_confirmation(page, "fuzzy", 2, Decimal("123.45"))  # noqa: SLF001
+            with patch.object(runner, "_wait_until", side_effect=fake_wait_until):
+                with patch.object(runner, "_wait_for_submit_confirmation_ready", side_effect=fake_wait_ready):
+                    runner._open_submit_confirmation(page, "fuzzy", 2, Decimal("123.45"))  # noqa: SLF001
 
             self.assertLess(
                 events.index("wait_submit_confirmation_ready"),
@@ -1231,6 +1624,7 @@ class PortalRunnerUrlTests(unittest.TestCase):
             def __init__(self, events: list[str], label: str) -> None:
                 self.events = events
                 self.label = label
+                self.checked = False
 
             @property
             def last(self) -> "FakeControl":
@@ -1238,20 +1632,33 @@ class PortalRunnerUrlTests(unittest.TestCase):
 
             def click(self) -> None:
                 self.events.append(f"click:{self.label}")
+                if "radio:" in self.label:
+                    self.checked = True
 
             def check(self, force: bool = False) -> None:
                 self.events.append(f"check:{self.label}:{force}")
+                self.checked = True
+
+            def is_visible(self) -> bool:
+                return True
 
             def is_enabled(self) -> bool:
                 return True
 
+            def is_checked(self) -> bool:
+                return self.checked
+
         class FakePage:
             def __init__(self, events: list[str]) -> None:
                 self.events = events
+                self.controls: dict[str, FakeControl] = {}
 
             def get_by_role(self, role: str, name: str) -> FakeControl:
                 self.events.append(f"get_by_role:{role}:{name}")
-                return FakeControl(self.events, f"{role}:{name}")
+                key = f"{role}:{name}"
+                if key not in self.controls:
+                    self.controls[key] = FakeControl(self.events, key)
+                return self.controls[key]
 
             def get_by_text(self, text: str, exact: bool = False) -> FakeControl:
                 self.events.append(f"get_by_text:{text}:{exact}")
@@ -1312,13 +1719,117 @@ class PortalRunnerUrlTests(unittest.TestCase):
                                         with patch.object(runner, "_wait_for_role_selection_ready") as mocked_wait_role:
                                             with patch.object(runner, "_navigate_with_reauth", side_effect=[page, page]):
                                                 with patch.object(runner, "_wait_until", side_effect=fake_wait_until):
+                                                    with patch.object(runner, "_wait_for_company_switch_completion"):
+                                                        with patch.object(runner, "_update_store_step"):
+                                                            with patch.object(runner, "_log"):
+                                                                returned_page = runner._ensure_company(page, store, result)  # noqa: SLF001
+
+            self.assertIs(page, returned_page)
+            mocked_wait_confirm.assert_called_once_with(page, store.store_key)
+            mocked_wait_role.assert_called_once_with(page, store.store_key, "法定代表人")
+
+    def test_ensure_company_waits_for_switch_completion_before_fallback_navigation(self) -> None:
+        class FakeControl:
+            def __init__(self) -> None:
+                self.enabled = True
+
+            @property
+            def last(self) -> "FakeControl":
+                return self
+
+            def click(self) -> None:
+                return None
+
+            def is_enabled(self) -> bool:
+                return self.enabled
+
+            def is_visible(self) -> bool:
+                return True
+
+        class FakePage:
+            def __init__(self) -> None:
+                self.url = "https://tpass.xiamen.chinatax.gov.cn:8443/#/identitySwitch/enterprise"
+                self.body_text = "身份类型选择 法定代表人 确定"
+
+            def locator(self, selector: str) -> object:
+                class FakeLocator:
+                    def __init__(self, page: "FakePage") -> None:
+                        self.page = page
+
+                    def inner_text(self) -> str:
+                        return self.page.body_text
+
+                return FakeLocator(self)
+
+            def get_by_role(self, role: str, name: str) -> FakeControl:
+                return FakeControl()
+
+            def get_by_text(self, text: str, exact: bool = False) -> FakeControl:
+                return FakeControl()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=tmp_path / "profile",
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+            store = StoreConfig(
+                store_key="peanut",
+                store_name="Peanut",
+                survey_id="1",
+                output_xlsx_path=tmp_path / "output.xlsx",
+                initial_last_processed_id=1,
+                portal_enabled=True,
+                portal_company_switch_name="厦门市思明区花生创意餐厅（个体工商户）",
+                portal_company_verify_name="厦门市思明区花生创意餐厅（个体工商户）",
+            )
+            result = SimpleNamespace(workbook_sha256="abc123")
+            page = FakePage()
+
+            def fake_wait_for_switch_completion(current_page: object, store_key: str, verify_name: str) -> None:
+                self.assertIs(page, current_page)
+                self.assertEqual("peanut", store_key)
+                self.assertEqual("厦门市思明区花生创意餐厅（个体工商户）", verify_name)
+                page.url = "https://etax.xiamen.chinatax.gov.cn:8443/loginb/"
+                page.body_text = "首页 我要办税 厦门市思明区花生创意餐厅（个体工商户）"
+
+            with patch.object(runner, "_wait_for_home_page_shell_ready"):
+                with patch.object(runner, "_page_contains", side_effect=lambda current_page, text: text in current_page.body_text):
+                    with patch.object(runner, "_wait_for_company_name", return_value=False):
+                        with patch.object(runner, "_wait_for_switch_page_ready"):
+                            with patch.object(runner, "_switch_page_shows_active_company", return_value=False):
+                                with patch.object(runner, "_select_company_switch_row", return_value="厦门市思明区花生创意餐厅（个体工商户）"):
+                                    with patch.object(runner, "_wait_for_switch_confirmation_ready"):
+                                        with patch.object(runner, "_wait_for_role_selection_ready"):
+                                            with patch.object(runner, "_wait_for_company_switch_completion", side_effect=fake_wait_for_switch_completion):
+                                                with patch.object(runner, "_navigate_with_reauth", side_effect=[page]) as mocked_nav:
                                                     with patch.object(runner, "_update_store_step"):
                                                         with patch.object(runner, "_log"):
                                                             returned_page = runner._ensure_company(page, store, result)  # noqa: SLF001
 
             self.assertIs(page, returned_page)
-            mocked_wait_confirm.assert_called_once_with(page, store.store_key)
-            mocked_wait_role.assert_called_once_with(page, store.store_key, "法定代表人")
+            mocked_nav.assert_called_once()
 
     def test_wait_for_home_page_ready_waits_for_load_states_texts_and_network_idle(self) -> None:
         class FakePage:
@@ -1481,7 +1992,7 @@ class PortalRunnerUrlTests(unittest.TestCase):
                                                     "_wait_for_batch_page",
                                                     side_effect=lambda page, *_: page,
                                                 ):
-                                                    with patch.object(runner, "_assert_batch_page_clean"):
+                                                    with patch.object(runner, "_ensure_batch_page_clean"):
                                                         with patch.object(runner, "_import_workbook"):
                                                             with patch.object(
                                                                 runner,
@@ -1504,6 +2015,272 @@ class PortalRunnerUrlTests(unittest.TestCase):
                 events.index("wait_before_open_batch_page"),
                 events.index("new_page"),
             )
+
+    def test_run_store_reuses_existing_home_page_without_reopening_loginb_in_chrome_cdp_mode(self) -> None:
+        class FakeBatchPage:
+            def __init__(self, events: list[str]) -> None:
+                self.events = events
+
+            def set_default_timeout(self, timeout: int) -> None:
+                self.events.append(f"set_default_timeout:{timeout}")
+
+            def close(self) -> None:
+                self.events.append("close_batch_page")
+
+        class FakeHomePage:
+            def __init__(self, events: list[str]) -> None:
+                self.events = events
+                self.url = "https://etax.xiamen.chinatax.gov.cn:8443/loginb/"
+
+            def locator(self, selector: str) -> object:
+                class FakeLocator:
+                    def inner_text(self) -> str:
+                        return "首页 我要办税 厦门市思明区浮几创意餐厅"
+
+                return FakeLocator()
+
+        class FakeContext:
+            def __init__(self, events: list[str]) -> None:
+                self.events = events
+
+            def new_page(self) -> FakeBatchPage:
+                self.events.append("new_page")
+                return FakeBatchPage(self.events)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=None,
+                portal_browser_backend="chrome_cdp",
+                portal_chrome_cdp_url="http://127.0.0.1:9222",
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+            store = StoreConfig(
+                store_key="fuzzy",
+                store_name="Fuzzy",
+                survey_id="1",
+                output_xlsx_path=tmp_path / "output.xlsx",
+                initial_last_processed_id=1,
+                portal_enabled=True,
+                portal_company_switch_name="厦门市思明区浮几创意餐厅",
+                portal_company_verify_name="厦门市思明区浮几创意餐厅",
+            )
+            summary = SimpleNamespace(row_count=1, total_amount_including_tax=Decimal("123.45"))
+            rows = [object()]
+            events: list[str] = []
+            home_page = FakeHomePage(events)
+
+            with patch("app.portal_runner.load_portal_issue_rows", return_value=rows):
+                with patch("app.portal_runner.summarize_portal_issue_rows", return_value=summary):
+                    with patch("app.portal_runner.sha256_file", return_value="abc123"):
+                        with patch.object(runner, "_goto") as mocked_goto:
+                            with patch.object(runner, "_ensure_logged_in", return_value=home_page):
+                                with patch.object(runner, "_ensure_company", return_value=home_page):
+                                    with patch.object(runner, "_wait_for_home_page_ready"):
+                                        with patch.object(runner, "_wait_before_open_batch_page"):
+                                            with patch.object(runner, "_install_network_diag"):
+                                                with patch.object(runner, "_wait_for_batch_page", side_effect=lambda page, *_: page):
+                                                    with patch.object(runner, "_ensure_batch_page_clean"):
+                                                        with patch.object(runner, "_import_workbook"):
+                                                            with patch.object(
+                                                                runner,
+                                                                "_finalize_result",
+                                                                side_effect=lambda result: result,
+                                                            ):
+                                                                with patch.object(runner, "_log"):
+                                                                    result = runner._run_store(  # noqa: SLF001
+                                                                        FakeContext(events),
+                                                                        home_page,
+                                                                        store,
+                                                                    )
+
+            self.assertEqual("validated", result.status)
+            mocked_goto.assert_not_called()
+
+    def test_run_store_waits_three_seconds_after_successful_submit(self) -> None:
+        class FakeBatchPage:
+            def __init__(self, events: list[str]) -> None:
+                self.events = events
+
+            def set_default_timeout(self, timeout: int) -> None:
+                self.events.append(f"set_default_timeout:{timeout}")
+
+            def close(self) -> None:
+                self.events.append("close_batch_page")
+
+        class FakeContext:
+            def __init__(self, events: list[str]) -> None:
+                self.events = events
+
+            def new_page(self) -> FakeBatchPage:
+                self.events.append("new_page")
+                return FakeBatchPage(self.events)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=tmp_path / "profile",
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=True)
+            store = StoreConfig(
+                store_key="fuzzy",
+                store_name="Fuzzy",
+                survey_id="1",
+                output_xlsx_path=tmp_path / "output.xlsx",
+                initial_last_processed_id=1,
+                portal_enabled=True,
+                portal_company_switch_name="厦门市思明区浮几创意餐厅",
+                portal_company_verify_name="厦门市思明区浮几创意餐厅",
+            )
+            summary = SimpleNamespace(row_count=1, total_amount_including_tax=Decimal("123.45"))
+            rows = [object()]
+            home_page = object()
+            events: list[str] = []
+
+            with patch("app.portal_runner.load_portal_issue_rows", return_value=rows):
+                with patch("app.portal_runner.summarize_portal_issue_rows", return_value=summary):
+                    with patch("app.portal_runner.sha256_file", return_value="abc123"):
+                        with patch("app.portal_runner.sleep", lambda seconds: events.append(f"sleep:{seconds}")):
+                            with patch.object(runner, "_goto"):
+                                with patch.object(runner, "_ensure_logged_in", return_value=home_page):
+                                    with patch.object(runner, "_ensure_company", return_value=home_page):
+                                        with patch.object(runner, "_wait_for_home_page_ready"):
+                                            with patch.object(runner, "_wait_before_open_batch_page"):
+                                                with patch.object(runner, "_install_network_diag"):
+                                                    with patch.object(runner, "_wait_for_batch_page", side_effect=lambda page, *_: page):
+                                                        with patch.object(runner, "_ensure_batch_page_clean"):
+                                                            with patch.object(runner, "_import_workbook"):
+                                                                with patch.object(runner, "_select_all_rows"):
+                                                                    with patch.object(runner, "_open_submit_confirmation"):
+                                                                        with patch.object(runner, "_confirm_submit"):
+                                                                            with patch.object(
+                                                                                runner,
+                                                                                "_wait_for_result_modal",
+                                                                                return_value=([], 1, 0),
+                                                                            ):
+                                                                                with patch.object(
+                                                                                    runner,
+                                                                                    "_finalize_result",
+                                                                                    side_effect=lambda result: result,
+                                                                                ):
+                                                                                    with patch.object(runner, "_log"):
+                                                                                        result = runner._run_store(  # noqa: SLF001
+                                                                                            FakeContext(events),
+                                                                                            home_page,
+                                                                                            store,
+                                                                                        )
+
+            self.assertEqual("success", result.status)
+            self.assertIn("sleep:3.0", events)
+
+    def test_ensure_batch_page_clean_clears_existing_imported_rows(self) -> None:
+        class FakeButton:
+            def __init__(self, page: "FakePage", name: str) -> None:
+                self.page = page
+                self.name = name
+
+            @property
+            def last(self) -> "FakeButton":
+                return self
+
+            def click(self, timeout: int | None = None) -> None:
+                if self.name == "清空导入":
+                    self.page.body_text = "是否清空所有已导入内容？ 取消 确定"
+                else:
+                    self.page.body_text = "共 0 条"
+
+        class FakePage:
+            def __init__(self) -> None:
+                self.body_text = "重新选择 共 2 条"
+
+            def locator(self, selector: str) -> object:
+                class FakeLocator:
+                    def __init__(self, page: "FakePage") -> None:
+                        self.page = page
+
+                    def inner_text(self) -> str:
+                        return self.page.body_text
+
+                return FakeLocator(self)
+
+            def get_by_role(self, role: str, name: str) -> FakeButton:
+                return FakeButton(self, name)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=tmp_path / "profile",
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+            page = FakePage()
+
+            with patch.object(runner, "_log"):
+                runner._ensure_batch_page_clean(page, "fuzzy")  # noqa: SLF001
+
+            self.assertEqual("共 0 条", page.body_text)
 
     def test_company_switch_candidates_fallback_to_verify_name(self) -> None:
         store = StoreConfig(

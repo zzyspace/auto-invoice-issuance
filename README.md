@@ -114,6 +114,55 @@ env -u http_proxy -u https_proxy PLAYWRIGHT_BROWSERS_PATH=./data/ms-playwright .
 .venv/bin/python -m app.main portal-issue-run --store-key fuzzy
 ```
 
+当前推荐的税务局浏览器模式是 `chrome_cdp`：
+
+- 不再依赖独立 Playwright profile 里的税务局会话
+- 先启动一个专用 Chrome 实例
+- 在这个专用实例里手动登录一次税务局
+- 后续 runner 直接接管这份活跃会话
+
+推荐流程：
+
+1. 启动专用税务局 Chrome CDP 实例：
+
+```bash
+.venv/bin/python -m app.main portal-open-chrome-cdp --env-file .env
+```
+
+2. 在新打开的 Chrome 窗口里手动登录税务局，进入目标企业首页。
+
+   建议：
+
+   - 保持这个专用 Chrome 窗口不要关闭
+   - 最好保留“已登录的税务局首页”这个 tab，runner 会优先复用它
+   - 如果这个首页 tab 不在了，runner 会退化成自己新开一个“干净首页”再继续
+
+3. 跑导入校验：
+
+```bash
+env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+TAX_PORTAL_BROWSER_BACKEND=chrome_cdp \
+TAX_PORTAL_CHROME_CDP_URL=http://127.0.0.1:9222 \
+TAX_PORTAL_SYNC_FROM_CHROME_PROFILE=false \
+.venv/bin/python -m app.main portal-issue-dry-run --env-file .env --store-key fuzzy --skip-sync
+```
+
+4. 跑真实提交：
+
+```bash
+env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+TAX_PORTAL_BROWSER_BACKEND=chrome_cdp \
+TAX_PORTAL_CHROME_CDP_URL=http://127.0.0.1:9222 \
+TAX_PORTAL_SYNC_FROM_CHROME_PROFILE=false \
+.venv/bin/python -m app.main portal-issue-run --env-file .env --store-key fuzzy --skip-sync
+```
+
+说明：
+
+- 上面的 `env -u ...` 是为了避免本机代理环境影响 `connect_over_cdp`
+- `--skip-sync` 表示直接使用本地 `output/*.xlsx`
+- 如果要先同步服务器模板，再跑开票，先执行 `portal-sync`
+
 只同步服务器上的最新模板到本地 `output/`：
 
 ```bash
@@ -143,6 +192,10 @@ python3 -m app.main portal-issue-run --env-file .env --store-key fuzzy --skip-sy
 
 - `TAX_PORTAL_USER_DATA_DIR`: 本机浏览器持久化 profile 目录，建议使用独立目录
 - `TAX_PORTAL_ARTIFACTS_DIR`: runner 截图和调试产物目录
+- `TAX_PORTAL_BROWSER_BACKEND`: 税务局浏览器后端，支持 `playwright` 和 `chrome_cdp`
+- `TAX_PORTAL_CHROME_CDP_URL`: 当 `TAX_PORTAL_BROWSER_BACKEND=chrome_cdp` 时，连接当前 Chrome 的 CDP 地址，默认 `http://127.0.0.1:9222`
+- `TAX_PORTAL_CHROME_CDP_USER_DATA_DIR`: `portal-open-chrome-cdp` 启动专用 Chrome 实例时使用的独立 user data dir，默认 `./data/tax-portal-chrome-cdp`
+- `TAX_PORTAL_CHROME_EXECUTABLE_PATH`: 可选，显式指定 Chrome 可执行文件路径
 - `TAX_PORTAL_SYNC_FROM_CHROME_PROFILE`: 为 `true` 时，runner 启动前先把当前 Chrome profile 的税务局会话相关数据同步到 `TAX_PORTAL_USER_DATA_DIR/Default`
 - `TAX_PORTAL_CHROME_PROFILE_DIR`: 可选，显式指定要同步的 Chrome profile 目录；不填时默认读取本机 Chrome `Local State` 的最近使用 profile
 - `TAX_PORTAL_HOME_URL`: 税务局首页
@@ -158,6 +211,19 @@ python3 -m app.main portal-issue-run --env-file .env --store-key fuzzy --skip-sy
 - `TAX_PORTAL_SSH_KEY_PATH`: 可选，专门给 runner 用的 SSH 私钥路径
 - `TAX_PORTAL_SSH_PORT`: SSH 端口
 - `TAX_PORTAL_SYNC_CONNECT_TIMEOUT_SECONDS`: 同步模板时的 SSH 连接超时
+
+`portal-open-chrome-cdp` 默认会自动拉起一个带 CDP 的专用 Chrome 实例。等价的手工启动命令示例：
+
+```bash
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  --remote-debugging-port=9222 \
+  --user-data-dir="$(pwd)/data/tax-portal-chrome-cdp" \
+  --no-first-run \
+  --new-window \
+  "https://etax.xiamen.chinatax.gov.cn:8443/loginb/"
+```
+
+然后把 `TAX_PORTAL_CHROME_CDP_URL` 设为 `http://127.0.0.1:9222`，并在这个专用实例里手动登录税务局。
 
 ## Docker
 

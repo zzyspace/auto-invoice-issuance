@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 import time
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
+from urllib.error import URLError
+from urllib.request import urlopen
 from zoneinfo import ZoneInfo
 
 from app.config import load_app_config, load_store_configs
@@ -30,6 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
             "smoke-test",
             "tax-lookup-test",
             "portal-sync",
+            "portal-open-chrome-cdp",
             "portal-issue-dry-run",
             "portal-issue-run",
         ),
@@ -172,6 +176,106 @@ def command_portal_sync(env_file: Path, store_keys: list[str] | None) -> int:
     return 0
 
 
+def _portal_chrome_cdp_ready(cdp_url: str, timeout_seconds: float = 2.0) -> bool:
+    version_url = cdp_url.rstrip("/") + "/json/version"
+    try:
+        with urlopen(version_url, timeout=timeout_seconds) as response:
+            return response.status == 200
+    except (URLError, OSError):
+        return False
+
+
+def _wait_for_portal_chrome_cdp(cdp_url: str, timeout_seconds: float = 30.0) -> bool:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if _portal_chrome_cdp_ready(cdp_url):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def _resolve_chrome_cdp_port(cdp_url: str) -> int:
+    raw = cdp_url.rsplit(":", 1)[-1].strip().rstrip("/")
+    if not raw.isdigit():
+        raise ValueError(f"Unsupported TAX_PORTAL_CHROME_CDP_URL for Chrome launch: {cdp_url}")
+    return int(raw)
+
+
+def _resolve_portal_chrome_executable(config: object) -> str:
+    if config.portal_chrome_executable_path is not None:
+        return str(config.portal_chrome_executable_path)
+    candidates = (
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+    )
+    for candidate in candidates:
+        if Path(candidate).exists():
+            return candidate
+    raise ValueError(
+        "Could not locate a Chrome executable. Set TAX_PORTAL_CHROME_EXECUTABLE_PATH explicitly."
+    )
+
+
+def command_portal_open_chrome_cdp(env_file: Path) -> int:
+    config = load_app_config(env_file)
+    cdp_url = config.portal_chrome_cdp_url or "http://127.0.0.1:9222"
+    if _portal_chrome_cdp_ready(cdp_url):
+        print(
+            json.dumps(
+                {
+                    "status": "ready",
+                    "cdp_url": cdp_url,
+                    "user_data_dir": str(config.portal_chrome_cdp_user_data_dir),
+                    "launched": False,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    chrome_executable = _resolve_portal_chrome_executable(config)
+    cdp_port = _resolve_chrome_cdp_port(cdp_url)
+    user_data_dir = config.portal_chrome_cdp_user_data_dir
+    if user_data_dir is None:
+        raise ValueError("TAX_PORTAL_CHROME_CDP_USER_DATA_DIR is required to launch a dedicated Chrome instance.")
+    user_data_dir.mkdir(parents=True, exist_ok=True)
+    log_path = user_data_dir / "chrome-cdp.log"
+    with log_path.open("ab") as log_file:
+        process = subprocess.Popen(
+            [
+                chrome_executable,
+                f"--remote-debugging-port={cdp_port}",
+                f"--user-data-dir={user_data_dir}",
+                "--no-first-run",
+                "--new-window",
+                config.portal_home_url,
+            ],
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    if not _wait_for_portal_chrome_cdp(cdp_url, timeout_seconds=30.0):
+        raise RuntimeError(
+            f"Chrome launched but CDP did not become ready at {cdp_url}. Check {log_path}."
+        )
+    print(
+        json.dumps(
+            {
+                "status": "ready",
+                "cdp_url": cdp_url,
+                "user_data_dir": str(user_data_dir),
+                "chrome_executable": chrome_executable,
+                "pid": process.pid,
+                "log_path": str(log_path),
+                "launched": True,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
 def command_portal_issue(
     env_file: Path,
     store_keys: list[str] | None,
@@ -225,6 +329,8 @@ def main(argv: list[str] | None = None) -> int:
         return command_smoke_test(env_file)
     if args.command == "portal-sync":
         return command_portal_sync(env_file, args.store_keys)
+    if args.command == "portal-open-chrome-cdp":
+        return command_portal_open_chrome_cdp(env_file)
     if args.command == "portal-issue-dry-run":
         return command_portal_issue(env_file, args.store_keys, submit=False, skip_sync=args.skip_sync)
     if args.command == "portal-issue-run":
