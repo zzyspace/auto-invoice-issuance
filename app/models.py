@@ -98,6 +98,8 @@ class AppConfig:
     portal_action_timeout_ms: int = 15000
     portal_login_timeout_minutes: int = 30
     portal_block_on_empty_amount: bool = True
+    portal_sync_from_chrome_profile: bool = False
+    portal_chrome_profile_dir: Optional[Path] = None
     portal_sync_from_server: bool = False
     portal_sync_remote_host: Optional[str] = None
     portal_sync_remote_output_dir: Optional[str] = None

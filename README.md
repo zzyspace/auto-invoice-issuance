@@ -143,6 +143,8 @@ python3 -m app.main portal-issue-run --env-file .env --store-key fuzzy --skip-sy
 
 - `TAX_PORTAL_USER_DATA_DIR`: 本机浏览器持久化 profile 目录，建议使用独立目录
 - `TAX_PORTAL_ARTIFACTS_DIR`: runner 截图和调试产物目录
+- `TAX_PORTAL_SYNC_FROM_CHROME_PROFILE`: 为 `true` 时，runner 启动前先把当前 Chrome profile 的税务局会话相关数据同步到 `TAX_PORTAL_USER_DATA_DIR/Default`
+- `TAX_PORTAL_CHROME_PROFILE_DIR`: 可选，显式指定要同步的 Chrome profile 目录；不填时默认读取本机 Chrome `Local State` 的最近使用 profile
 - `TAX_PORTAL_HOME_URL`: 税务局首页
 - `TAX_PORTAL_IDENTITY_SWITCH_URL`: 企业办税身份切换页
 - `TAX_PORTAL_BATCH_ISSUE_URL`: 批量开票页

@@ -250,6 +250,11 @@ def load_app_config(env_path: Optional[Path] = None) -> AppConfig:
             os.environ.get("TAX_PORTAL_BLOCK_ON_EMPTY_AMOUNT", "true"),
             default=True,
         ),
+        portal_sync_from_chrome_profile=_parse_bool(
+            os.environ.get("TAX_PORTAL_SYNC_FROM_CHROME_PROFILE", "false"),
+            default=False,
+        ),
+        portal_chrome_profile_dir=resolve_optional_path("TAX_PORTAL_CHROME_PROFILE_DIR"),
         portal_sync_from_server=_parse_bool(
             os.environ.get("TAX_PORTAL_SYNC_FROM_SERVER", "false"),
             default=False,

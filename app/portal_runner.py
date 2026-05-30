@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 import re
+import shutil
 from decimal import Decimal
 from pathlib import Path
 from time import monotonic, sleep
@@ -19,6 +21,24 @@ ROLE_LABELS = {
 }
 
 QR_REFRESH_GRACE_SECONDS = 5.0
+LOGIN_WAIT_HEARTBEAT_SECONDS = 15.0
+HOME_PAGE_BEFORE_BATCH_PAGE_DELAY_SECONDS = 5.0
+BROWSER_SESSION_SYNC_ENTRIES = (
+    "Cookies",
+    "Cookies-journal",
+    "Cookies-shm",
+    "Cookies-wal",
+    "Login Data",
+    "Login Data-journal",
+    "Login Data-shm",
+    "Login Data-wal",
+    "Local Storage",
+    "Session Storage",
+    "IndexedDB",
+    "WebStorage",
+    "Network",
+)
+BATCH_PAGE_RECOVERY_REFRESH_ATTEMPTS = 2
 
 
 class PortalRunnerError(RuntimeError):
@@ -39,6 +59,7 @@ class TaxPortalRunner:
     def run(self, stores: list[StoreConfig]) -> list[PortalIssueResult]:
         sync_playwright = self._load_sync_playwright()
         results: list[PortalIssueResult] = []
+        self._sync_portal_profile_from_chrome()
         with sync_playwright() as playwright:
             launch_args = self._launch_args()
             if self.config.portal_disable_proxy:
@@ -112,14 +133,16 @@ class TaxPortalRunner:
         try:
             self._log(store.store_key, f"opening portal home page: {self.config.portal_home_url}")
             self._goto(self.config.portal_home_url, home_page)
-            self._ensure_logged_in(home_page, result)
-            self._ensure_company(home_page, store, result)
+            home_page = self._ensure_logged_in(home_page, result)
+            home_page = self._ensure_company(home_page, store, result)
+            self._wait_for_home_page_ready(home_page, store)
+            self._wait_before_open_batch_page(store.store_key)
             batch_page = context.new_page()
             active_page = batch_page
             batch_page.set_default_timeout(self.config.portal_action_timeout_ms)
             self._install_network_diag(context, batch_page, store.store_key, "batch")
             try:
-                self._wait_for_batch_page(batch_page, store, result)
+                batch_page = self._wait_for_batch_page(batch_page, store, result)
                 self._assert_batch_page_clean(batch_page)
                 self._log(store.store_key, "batch issue page is clean and ready for workbook import")
                 self._import_workbook(batch_page, store.store_key, store.output_xlsx_path, rows, summary)
@@ -147,9 +170,14 @@ class TaxPortalRunner:
                     f"total_amount_including_tax={self._format_money(summary.total_amount_including_tax)}",
                 )
                 self._select_all_rows(batch_page)
-                self._open_submit_confirmation(batch_page, summary.row_count, summary.total_amount_including_tax)
+                self._open_submit_confirmation(
+                    batch_page,
+                    store.store_key,
+                    summary.row_count,
+                    summary.total_amount_including_tax,
+                )
                 self._confirm_submit(batch_page)
-                details, success_count, failure_count = self._wait_for_result_modal(batch_page)
+                details, success_count, failure_count = self._wait_for_result_modal(batch_page, store.store_key)
                 result.details = tuple(details)
                 result.submitted_count = summary.row_count
                 result.success_count = success_count
@@ -189,18 +217,24 @@ class TaxPortalRunner:
         )
         return result
 
-    def _ensure_logged_in(self, page: object, result: PortalIssueResult) -> None:
-        if self._is_home_page(page):
-            return
+    def _ensure_logged_in(self, page: object, result: PortalIssueResult) -> object:
+        authenticated_page = self._find_authenticated_page(page)
+        if authenticated_page is not None:
+            return authenticated_page
         deadline = monotonic() + self.config.portal_login_timeout_minutes * 60
         refreshed_qr = False
         clicked_public_login = False
         reauth_seen_at: float | None = None
+        last_heartbeat_at: float | None = None
         self._log(result.store_key, "login required; waiting for successful login...")
         while monotonic() < deadline:
-            if self._is_home_page(page):
-                self._log(result.store_key, "login confirmed")
-                return
+            authenticated_page = self._find_authenticated_page(page)
+            if authenticated_page is not None:
+                if authenticated_page is page:
+                    self._log(result.store_key, "login confirmed")
+                else:
+                    self._log(result.store_key, f"login confirmed on another page: {authenticated_page.url}")
+                return authenticated_page
             if self._is_public_landing_page(page):
                 if not clicked_public_login:
                     self._log(result.store_key, "public landing detected; clicking login entry")
@@ -220,17 +254,28 @@ class TaxPortalRunner:
                     self._log(result.store_key, "login page still pending; attempting QR refresh once")
                     self._try_refresh_login_qr(page)
                     refreshed_qr = True
+                if last_heartbeat_at is None or now - last_heartbeat_at >= LOGIN_WAIT_HEARTBEAT_SECONDS:
+                    self._log(
+                        result.store_key,
+                        "still waiting for login completion "
+                        f"current_url={getattr(page, 'url', '<unknown>')}",
+                    )
+                    last_heartbeat_at = now
             else:
                 reauth_seen_at = None
             sleep(2)
         self._capture_artifact(page, result.artifacts_dir, "login-timeout")
         raise PortalRunnerError("Timed out waiting for tax portal login.")
 
-    def _ensure_company(self, home_page: object, store: StoreConfig, result: PortalIssueResult) -> None:
+    def _ensure_company(self, home_page: object, store: StoreConfig, result: PortalIssueResult) -> object:
         verify_name = store.effective_portal_company_verify_name()
+        self._wait_for_home_page_shell_ready(home_page, store.store_key)
         if self._page_contains(home_page, verify_name):
             self._log(store.store_key, f"company already active: {verify_name}")
-            return
+            return home_page
+        if self._wait_for_company_name(home_page, verify_name, timeout_seconds=5.0):
+            self._log(store.store_key, f"company became visible after page settled: {verify_name}")
+            return home_page
         result.step = "switch_company"
         self._update_store_step(
             store.store_key,
@@ -239,18 +284,28 @@ class TaxPortalRunner:
             workbook_sha256=result.workbook_sha256,
             message=f"switching company to {verify_name}",
         )
-        self._navigate_with_reauth(
+        home_page = self._navigate_with_reauth(
             home_page,
             self.config.portal_identity_switch_url,
             result,
             expected_text="企业办税",
             step_name="switch company",
         )
+        self._wait_for_switch_page_ready(home_page, store.store_key)
+        if self._switch_page_shows_active_company(home_page, verify_name):
+            self._log(store.store_key, f"company already active on switch page: {verify_name}")
+            return self._navigate_with_reauth(
+                home_page,
+                self.config.portal_home_url,
+                result,
+                expected_text="我要办税",
+                step_name=f"return home with active company {verify_name}",
+            )
         selected_name = self._select_company_switch_row(home_page, store)
-        self._wait_for_text(home_page, "确认是否切换")
+        self._wait_for_switch_confirmation_ready(home_page, store.store_key)
         home_page.get_by_role("button", name="确定").last.click()
         role_label = ROLE_LABELS.get(store.portal_company_role, "法定代表人")
-        self._wait_for_text(home_page, "身份类型选择")
+        self._wait_for_role_selection_ready(home_page, store.store_key, role_label)
         try:
             home_page.get_by_role("radio", name=role_label).check(force=True)
         except Exception:
@@ -258,7 +313,7 @@ class TaxPortalRunner:
         confirm_button = home_page.get_by_role("button", name="确定").last
         self._wait_until(lambda: confirm_button.is_enabled(), timeout_seconds=10, message="identity role confirm enable")
         confirm_button.click()
-        self._navigate_with_reauth(
+        home_page = self._navigate_with_reauth(
             home_page,
             self.config.portal_home_url,
             result,
@@ -266,8 +321,9 @@ class TaxPortalRunner:
             step_name=f"switch company to {verify_name}",
         )
         self._log(store.store_key, f"company switch confirmed: {verify_name} via candidate={selected_name}")
+        return home_page
 
-    def _wait_for_batch_page(self, page: object, store: StoreConfig, result: PortalIssueResult) -> None:
+    def _wait_for_batch_page(self, page: object, store: StoreConfig, result: PortalIssueResult) -> object:
         result.step = "open_batch_page"
         self._update_store_step(
             store.store_key,
@@ -276,14 +332,218 @@ class TaxPortalRunner:
             workbook_sha256=result.workbook_sha256,
             message="opening batch issue page",
         )
-        self._navigate_with_reauth(
+        page = self._navigate_with_reauth(
             page,
             self.config.portal_batch_issue_url,
             result,
-            expected_text="批量开票",
+            expected_text=None,
             step_name="open batch issue page",
         )
+        self._wait_for_batch_page_ready_with_recovery(page, store.store_key)
         self._log(store.store_key, "batch issue page loaded")
+        return page
+
+    def _wait_for_page_stable(
+        self,
+        page: object,
+        store_key: str,
+        page_name: str,
+        *,
+        required_texts: tuple[str, ...] = (),
+        content_predicate: Callable[[], bool] | None = None,
+        content_message: str | None = None,
+        wait_for_load_states: bool = True,
+    ) -> None:
+        timeout_ms = self.config.portal_action_timeout_ms
+        self._log(store_key, f"waiting for {page_name} elements and requests to finish loading")
+        if wait_for_load_states:
+            for state in ("domcontentloaded", "load"):
+                try:
+                    page.wait_for_load_state(state, timeout=timeout_ms)
+                except Exception as exc:  # noqa: BLE001
+                    raise PortalRunnerError(
+                        f"Timed out waiting for {page_name} load state={state}: {exc}"
+                    ) from exc
+        for text in required_texts:
+            self._wait_for_text(page, text, timeout_ms=timeout_ms)
+        try:
+            page.wait_for_load_state("networkidle", timeout=timeout_ms)
+        except Exception as exc:  # noqa: BLE001
+            raise PortalRunnerError(
+                f"Timed out waiting for {page_name} network requests to finish: {exc}"
+            ) from exc
+        predicate = content_predicate
+        if predicate is None and required_texts:
+            predicate = lambda: all(text in self._body_text(page) for text in required_texts)
+        if predicate is not None:
+            self._wait_until(
+                predicate,
+                timeout_seconds=max(timeout_ms / 1000, 5.0),
+                message=content_message or f"render {page_name} content",
+                interval_seconds=0.2,
+            )
+
+    def _wait_for_home_page_shell_ready(self, page: object, store_key: str) -> None:
+        self._wait_for_page_stable(
+            page,
+            store_key,
+            "authenticated home page shell",
+            required_texts=("我要办税",),
+        )
+
+    def _wait_for_home_page_ready(self, page: object, store: StoreConfig) -> None:
+        verify_name = store.effective_portal_company_verify_name()
+        self._wait_for_page_stable(
+            page,
+            store.store_key,
+            "authenticated home page",
+            required_texts=("我要办税", verify_name),
+        )
+        self._log(store.store_key, "authenticated home page is stable")
+
+    def _wait_before_open_batch_page(self, store_key: str) -> None:
+        self._log(
+            store_key,
+            f"authenticated home page is stable; waiting {HOME_PAGE_BEFORE_BATCH_PAGE_DELAY_SECONDS:.0f}s before opening batch issue page",
+        )
+        sleep(HOME_PAGE_BEFORE_BATCH_PAGE_DELAY_SECONDS)
+
+    def _wait_for_switch_page_ready(self, page: object, store_key: str) -> None:
+        self._wait_for_page_stable(
+            page,
+            store_key,
+            "identity switch page",
+            required_texts=("企业办税",),
+        )
+
+    def _wait_for_company_name(self, page: object, verify_name: str, *, timeout_seconds: float) -> bool:
+        try:
+            self._wait_until(
+                lambda: self._page_contains(page, verify_name),
+                timeout_seconds=timeout_seconds,
+                message=f"show active company {verify_name}",
+                interval_seconds=0.2,
+            )
+        except PortalRunnerError:
+            return False
+        return True
+
+    def _switch_page_shows_active_company(self, page: object, verify_name: str) -> bool:
+        try:
+            body_text = re.sub(r"\s+", " ", self._body_text(page))
+        except Exception:
+            return False
+        pattern = rf"纳税人名称[:：]?\s*{re.escape(verify_name)}"
+        return re.search(pattern, body_text) is not None
+
+    def _wait_for_batch_page_ready(self, page: object, store_key: str) -> None:
+        self._wait_for_page_stable(
+            page,
+            store_key,
+            "batch issue page",
+            required_texts=("批量开票",),
+        )
+
+    def _wait_for_batch_page_ready_with_recovery(self, page: object, store_key: str) -> None:
+        timeout_seconds = max(self.config.portal_action_timeout_ms / 1000, 5.0)
+        for attempt in range(1, BATCH_PAGE_RECOVERY_REFRESH_ATTEMPTS + 1):
+            self._wait_until(
+                lambda: self._page_contains(page, "批量开票") or self._batch_page_shows_session_invalid_prompt(page),
+                timeout_seconds=timeout_seconds,
+                message="show batch issue page or session recovery prompt",
+                interval_seconds=0.2,
+            )
+            if self._page_contains(page, "批量开票"):
+                self._wait_for_batch_page_ready(page, store_key)
+                return
+            if attempt >= BATCH_PAGE_RECOVERY_REFRESH_ATTEMPTS:
+                raise PortalRunnerError(
+                    "Batch page still reports that the e-invoice platform session is invalid after automatic refresh."
+                )
+            self._log(
+                store_key,
+                "batch page reports that the e-invoice platform session is invalid; refreshing once before retry",
+            )
+            page.reload(wait_until="domcontentloaded")
+        raise PortalRunnerError("Failed to recover batch issue page.")
+
+    @staticmethod
+    def _batch_page_shows_session_invalid_prompt(page: object) -> bool:
+        try:
+            body_text = page.locator("body").inner_text()
+        except Exception:
+            return False
+        return (
+            "系统检测到电票平台会话已失效或电局账号已退出，需刷新重新操作" in body_text
+            or "功能地址检查失败" in body_text
+            or "此用户无当前页面的操作权限" in body_text
+        )
+
+    def _wait_for_switch_query_results_ready(self, page: object, store_key: str) -> None:
+        self._wait_for_page_stable(
+            page,
+            store_key,
+            "identity switch query results",
+            required_texts=("企业办税",),
+            wait_for_load_states=False,
+        )
+
+    def _wait_for_batch_import_ready(
+        self,
+        page: object,
+        store_key: str,
+        workbook_name: str,
+        success_prefix: str,
+    ) -> None:
+        self._wait_for_page_stable(
+            page,
+            store_key,
+            "batch issue import result",
+            required_texts=(workbook_name, success_prefix),
+            wait_for_load_states=False,
+        )
+
+    def _wait_for_submit_confirmation_ready(
+        self,
+        page: object,
+        store_key: str,
+        expected_count_text: str,
+        expected_amount_text: str,
+    ) -> None:
+        self._wait_for_page_stable(
+            page,
+            store_key,
+            "submit confirmation dialog",
+            required_texts=(expected_count_text, expected_amount_text),
+            wait_for_load_states=False,
+        )
+
+    def _wait_for_result_modal_ready(self, page: object, store_key: str) -> None:
+        self._wait_for_page_stable(
+            page,
+            store_key,
+            "portal issue result dialog",
+            required_texts=("批量开具结果",),
+            wait_for_load_states=False,
+        )
+
+    def _wait_for_switch_confirmation_ready(self, page: object, store_key: str) -> None:
+        self._wait_for_page_stable(
+            page,
+            store_key,
+            "switch confirmation dialog",
+            required_texts=("确认是否切换", "确定"),
+            wait_for_load_states=False,
+        )
+
+    def _wait_for_role_selection_ready(self, page: object, store_key: str, role_label: str) -> None:
+        self._wait_for_page_stable(
+            page,
+            store_key,
+            "role selection dialog",
+            required_texts=("身份类型选择", role_label, "确定"),
+            wait_for_load_states=False,
+        )
 
     def _assert_batch_page_clean(self, page: object) -> None:
         body_text = self._body_text(page)
@@ -314,6 +574,7 @@ class TaxPortalRunner:
             timeout_seconds=30,
             message="import workbook result",
         )
+        self._wait_for_batch_import_ready(page, store_key, workbook_path.name, success_prefix)
         body_text = self._body_text(page)
         for row in rows:
             if row.buyer_name not in body_text:
@@ -345,7 +606,13 @@ class TaxPortalRunner:
             message="select all rows",
         )
 
-    def _open_submit_confirmation(self, page: object, row_count: int, total_amount_including_tax: Decimal) -> None:
+    def _open_submit_confirmation(
+        self,
+        page: object,
+        store_key: str,
+        row_count: int,
+        total_amount_including_tax: Decimal,
+    ) -> None:
         page.get_by_role("button", name="批量开具").click()
         expected_count_text = f"本次勾选批量开具发票{row_count}份"
         expected_amount_text = f"价税合计{self._format_money(total_amount_including_tax).rstrip('0').rstrip('.')}元"
@@ -354,17 +621,24 @@ class TaxPortalRunner:
             timeout_seconds=10,
             message="open submit confirmation",
         )
+        self._wait_for_submit_confirmation_ready(page, store_key, expected_count_text, expected_amount_text)
+        self._wait_until(
+            lambda: page.get_by_role("button", name="确定").last.is_enabled(),
+            timeout_seconds=10,
+            message="enable submit confirmation button",
+        )
 
     def _confirm_submit(self, page: object) -> None:
         confirm_button = page.get_by_role("button", name="确定").last
         confirm_button.click()
 
-    def _wait_for_result_modal(self, page: object) -> tuple[list[PortalIssueDetail], int, int]:
+    def _wait_for_result_modal(self, page: object, store_key: str) -> tuple[list[PortalIssueDetail], int, int]:
         self._wait_until(
             lambda: "批量开具结果" in self._body_text(page),
             timeout_seconds=90,
             message="wait for portal issue result",
         )
+        self._wait_for_result_modal_ready(page, store_key)
         body_text = self._body_text(page)
         match = re.search(r"开具成功发票(\d+)份.*?开具失败发票(\d+)份", body_text)
         if not match:
@@ -408,6 +682,62 @@ class TaxPortalRunner:
     @staticmethod
     def _log(store_key: str, message: str) -> None:
         print(f"[tax-portal][{store_key}] {message}", flush=True)
+
+    def _sync_portal_profile_from_chrome(self) -> None:
+        if not self.config.portal_sync_from_chrome_profile:
+            return
+        if self.config.portal_user_data_dir is None:
+            raise PortalRunnerError("TAX_PORTAL_USER_DATA_DIR is required when syncing from a Chrome profile.")
+        source_dir = self._resolve_chrome_profile_sync_source_dir()
+        target_dir = self.config.portal_user_data_dir / "Default"
+        ensure_parent_dir(target_dir / "placeholder.txt")
+        self._log("runner", f"syncing portal browser session from Chrome profile: {source_dir}")
+        for entry in BROWSER_SESSION_SYNC_ENTRIES:
+            self._copy_profile_entry(source_dir / entry, target_dir / entry)
+        self._log("runner", f"synced portal browser session to {target_dir}")
+
+    def _resolve_chrome_profile_sync_source_dir(self) -> Path:
+        configured = self.config.portal_chrome_profile_dir
+        if configured is not None:
+            if not configured.exists():
+                raise PortalRunnerError(f"Configured Chrome profile directory does not exist: {configured}")
+            return configured
+        root = Path.home() / "Library/Application Support/Google/Chrome"
+        local_state = root / "Local State"
+        if not local_state.exists():
+            raise PortalRunnerError(
+                "TAX_PORTAL_SYNC_FROM_CHROME_PROFILE is enabled, but Chrome Local State was not found. "
+                "Set TAX_PORTAL_CHROME_PROFILE_DIR explicitly."
+            )
+        try:
+            data = json.loads(local_state.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            raise PortalRunnerError(
+                "Could not parse Chrome Local State. Set TAX_PORTAL_CHROME_PROFILE_DIR explicitly."
+            ) from exc
+        last_used = str((data.get("profile") or {}).get("last_used") or "").strip() or "Default"
+        profile_dir = root / last_used
+        if not profile_dir.exists():
+            raise PortalRunnerError(
+                f"Detected Chrome profile directory does not exist: {profile_dir}. "
+                "Set TAX_PORTAL_CHROME_PROFILE_DIR explicitly."
+            )
+        return profile_dir
+
+    @staticmethod
+    def _copy_profile_entry(source: Path, target: Path) -> None:
+        if not source.exists():
+            return
+        if target.exists():
+            if target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+        if source.is_dir():
+            shutil.copytree(source, target)
+            return
+        ensure_parent_dir(target)
+        shutil.copy2(source, target)
 
     @staticmethod
     def _env_flag(name: str) -> bool:
@@ -525,6 +855,7 @@ class TaxPortalRunner:
             try:
                 page.get_by_placeholder("请输入纳税人名称").fill(candidate)
                 page.get_by_role("button", name="查询").click()
+                self._wait_for_switch_query_results_ready(page, store.store_key)
             except Exception:
                 pass
             row = page.locator("tr").filter(has_text=candidate).first
@@ -592,10 +923,15 @@ class TaxPortalRunner:
         url = page.url
         return "tpass.xiamen.chinatax.gov.cn:8443/#/login" in url or self._page_contains(page, "打开电子税务局APP扫一扫")
 
+    def _is_loginb_pending_page(self, page: object) -> bool:
+        url = page.url
+        return "etax.xiamen.chinatax.gov.cn:8443/loginb/" in url and not self._is_home_page(page)
+
     def _page_requires_reauth(self, page: object) -> bool:
         url = page.url
         return (
             "tpass.xiamen.chinatax.gov.cn:8443/#/login" in url
+            or self._is_loginb_pending_page(page)
             or self._page_contains(page, "打开电子税务局APP扫一扫")
             or self._page_contains(page, "会话失效，请重新登录")
             or self._is_public_landing_page(page)
@@ -603,7 +939,7 @@ class TaxPortalRunner:
 
     def _is_home_page(self, page: object) -> bool:
         url = page.url
-        return "etax.xiamen.chinatax.gov.cn:8443/loginb/" in url and self._page_contains(page, "我要办税")
+        return "etax.xiamen.chinatax.gov.cn:8443" in url and self._page_contains(page, "我要办税")
 
     def _open_login_from_public_landing(self, page: object) -> None:
         try:
@@ -642,7 +978,7 @@ class TaxPortalRunner:
         expected_text: str | None,
         step_name: str,
         max_attempts: int = 3,
-    ) -> None:
+    ) -> object:
         last_error: Exception | None = None
         for _ in range(max_attempts):
             try:
@@ -652,22 +988,46 @@ class TaxPortalRunner:
                 if "interrupted by another navigation" not in str(exc):
                     raise
             if self._page_requires_reauth(page):
-                self._ensure_logged_in(page, result)
+                page = self._ensure_logged_in(page, result)
                 continue
             if expected_text is None:
-                return
+                return page
             try:
                 self._wait_for_text(page, expected_text, timeout_ms=self.config.portal_action_timeout_ms)
-                return
+                return page
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
                 if self._page_requires_reauth(page):
-                    self._ensure_logged_in(page, result)
+                    page = self._ensure_logged_in(page, result)
                     continue
                 raise
         if last_error is not None:
             raise PortalRunnerError(f"Failed to {step_name}: {last_error}") from last_error
         raise PortalRunnerError(f"Failed to {step_name}.")
+
+    def _find_authenticated_page(self, page: object) -> object | None:
+        for candidate in self._page_candidates(page):
+            try:
+                if self._is_home_page(candidate):
+                    return candidate
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _page_candidates(page: object) -> list[object]:
+        candidates = [page]
+        context = getattr(page, "context", None)
+        context_pages = getattr(context, "pages", None)
+        if context_pages is None:
+            return candidates
+        try:
+            for candidate in list(context_pages):
+                if candidate not in candidates:
+                    candidates.append(candidate)
+        except Exception:
+            return candidates
+        return candidates
 
     @staticmethod
     def _page_contains(page: object, text: str) -> bool:
