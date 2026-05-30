@@ -97,6 +97,7 @@ def load_store_configs(path: Path) -> list[StoreConfig]:
                 if item.get("attachment_question_id")
                 else None,
                 portal_enabled=_parse_bool(item.get("portal_enabled", False), default=False),
+                portal_priority=int(item.get("portal_priority", 1000)),
                 portal_company_switch_name=str(item["portal_company_switch_name"])
                 if item.get("portal_company_switch_name")
                 else None,
@@ -237,6 +238,10 @@ def load_app_config(env_path: Optional[Path] = None) -> AppConfig:
             or base_dir.joinpath("data", "tax-portal-artifacts").resolve()
         ),
         portal_browser_channel=os.environ.get("TAX_PORTAL_BROWSER_CHANNEL", "chrome"),
+        portal_disable_proxy=_parse_bool(
+            os.environ.get("TAX_PORTAL_DISABLE_PROXY", "false"),
+            default=False,
+        ),
         portal_headless=_parse_bool(os.environ.get("TAX_PORTAL_HEADLESS", "false"), default=False),
         portal_slow_mo_ms=int(os.environ.get("TAX_PORTAL_SLOW_MO_MS", "0")),
         portal_action_timeout_ms=int(os.environ.get("TAX_PORTAL_ACTION_TIMEOUT_MS", "15000")),

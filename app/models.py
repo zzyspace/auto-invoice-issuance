@@ -17,6 +17,7 @@ class StoreConfig:
     enabled: bool = True
     attachment_question_id: Optional[str] = None
     portal_enabled: bool = False
+    portal_priority: int = 1000
     portal_company_switch_name: Optional[str] = None
     portal_company_verify_name: Optional[str] = None
     portal_company_role: str = "legal_representative"
@@ -91,6 +92,7 @@ class AppConfig:
     portal_user_data_dir: Optional[Path] = None
     portal_artifacts_dir: Optional[Path] = None
     portal_browser_channel: str = "chrome"
+    portal_disable_proxy: bool = False
     portal_headless: bool = False
     portal_slow_mo_ms: int = 0
     portal_action_timeout_ms: int = 15000

@@ -128,14 +128,14 @@ def command_tax_lookup_test(env_file: Path, company_name: str | None) -> int:
 
 def _select_portal_stores(stores: list[object], requested_store_keys: list[str] | None) -> list[object]:
     requested = {item.strip() for item in (requested_store_keys or []) if item and item.strip()}
-    selected = []
-    for store in stores:
+    selected: list[tuple[int, int, object]] = []
+    for index, store in enumerate(stores):
         if requested and store.store_key not in requested:
             continue
         if store.portal_enabled:
-            selected.append(store)
+            selected.append((int(store.portal_priority), index, store))
     if requested:
-        missing = requested.difference({store.store_key for store in selected})
+        missing = requested.difference({store.store_key for _, _, store in selected})
         if missing:
             raise ValueError(
                 "Requested store_key values are not portal-enabled or not configured: "
@@ -143,7 +143,8 @@ def _select_portal_stores(stores: list[object], requested_store_keys: list[str] 
             )
     if not selected:
         raise ValueError("No portal-enabled stores selected. Set portal_enabled=true in stores.yaml.")
-    return selected
+    selected.sort(key=lambda item: (item[0], item[1]))
+    return [store for _, _, store in selected]
 
 
 def _resolve_portal_issue_config(config: object, skip_sync: bool) -> object:

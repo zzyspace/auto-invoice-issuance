@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.config import load_app_config
-from app.main import _resolve_portal_issue_config, build_parser, command_portal_sync
+from app.main import _resolve_portal_issue_config, _select_portal_stores, build_parser, command_portal_sync
 
 
 class MainCommandTests(unittest.TestCase):
@@ -101,6 +101,7 @@ stores:
     output_xlsx_path: ./output/fuzzy.xlsx
     initial_last_processed_id: 1
     portal_enabled: true
+    portal_priority: 10
     portal_company_switch_name: Fuzzy
     portal_company_verify_name: Fuzzy
     portal_company_role: legal_representative
@@ -113,3 +114,20 @@ stores:
 
             self.assertEqual(0, exit_code)
             mocked_sync.assert_called_once()
+
+    def test_select_portal_stores_orders_by_priority(self) -> None:
+        class FakeStore:
+            def __init__(self, store_key: str, portal_priority: int, portal_enabled: bool = True) -> None:
+                self.store_key = store_key
+                self.portal_priority = portal_priority
+                self.portal_enabled = portal_enabled
+
+        stores = [
+            FakeStore("peanut", 20),
+            FakeStore("fuzzy", 10),
+            FakeStore("disabled", 0, portal_enabled=False),
+        ]
+
+        selected = _select_portal_stores(stores, requested_store_keys=None)
+
+        self.assertEqual(["fuzzy", "peanut"], [store.store_key for store in selected])

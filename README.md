@@ -67,6 +67,7 @@ TAX_LOOKUP_ALAPI_TOKEN=your_alapi_token_here
 - `attachment_question_id` 可选，不填时使用 `.env` 中的默认值
 - 税务局 runner 额外字段：
   - `portal_enabled`: 是否允许该门店进入税务局开票 runner
+  - `portal_priority`: runner 默认执行顺序，数值越小越先执行
   - `portal_company_switch_name`: 身份切换列表里的目标公司名
   - `portal_company_verify_name`: 切换完成后首页/业务页里用于校验的公司名
   - `portal_company_role`: 身份类型，支持 `legal_representative`、`tax_operator`
@@ -95,6 +96,22 @@ python3 -m app.main smoke-test --env-file .env
 
 ```bash
 python3 -m app.main tax-lookup-test --env-file .env --company-name "深圳易思商务咨询有限公司厦门分公司"
+```
+
+税务局 runner 首次本机安装：
+
+```bash
+python3 -m venv .venv
+env -u http_proxy -u https_proxy .venv/bin/python -m pip install -r requirements.txt
+env -u http_proxy -u https_proxy PLAYWRIGHT_BROWSERS_PATH=./data/ms-playwright .venv/bin/python -m playwright install chromium
+```
+
+税务局 runner 日常命令建议使用仓库内虚拟环境：
+
+```bash
+.venv/bin/python -m app.main portal-sync --store-key fuzzy
+.venv/bin/python -m app.main portal-issue-dry-run --store-key fuzzy
+.venv/bin/python -m app.main portal-issue-run --store-key fuzzy
 ```
 
 只同步服务器上的最新模板到本地 `output/`：
@@ -129,8 +146,10 @@ python3 -m app.main portal-issue-run --env-file .env --store-key fuzzy --skip-sy
 - `TAX_PORTAL_HOME_URL`: 税务局首页
 - `TAX_PORTAL_IDENTITY_SWITCH_URL`: 企业办税身份切换页
 - `TAX_PORTAL_BATCH_ISSUE_URL`: 批量开票页
+- `TAX_PORTAL_DISABLE_PROXY`: 为 `true` 时，对 runner 拉起的 Chrome 显式禁用代理，只影响这次税务局自动化，不改系统代理
 - `TAX_PORTAL_LOGIN_TIMEOUT_MINUTES`: 登录等待超时
 - `TAX_PORTAL_BLOCK_ON_EMPTY_AMOUNT`: 为 `true` 时，模板里金额为空将直接阻断提交
+- `PLAYWRIGHT_BROWSERS_PATH`: Playwright 浏览器二进制目录，当前建议使用 `./data/ms-playwright`
 - `TAX_PORTAL_SYNC_FROM_SERVER`: 为 `true` 时，runner 开票前先从服务器同步最新 `output/*.xlsx`
 - `TAX_PORTAL_REMOTE_HOST`: 服务器地址，如 `root@139.196.140.215`
 - `TAX_PORTAL_REMOTE_OUTPUT_DIR`: 服务器上的 output 目录，当前生产为 `/var/lib/auto-invoice-issuance/output`
