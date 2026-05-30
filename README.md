@@ -109,10 +109,14 @@ env -u http_proxy -u https_proxy PLAYWRIGHT_BROWSERS_PATH=./data/ms-playwright .
 税务局 runner 日常命令建议使用仓库内虚拟环境：
 
 ```bash
-.venv/bin/python -m app.main portal-sync --store-key fuzzy
-.venv/bin/python -m app.main portal-issue-dry-run --store-key fuzzy
-.venv/bin/python -m app.main portal-issue-run --store-key fuzzy
+./tax-portal sync --store-key fuzzy
+./tax-portal dry-run --store-key fuzzy
+./tax-portal run --store-key fuzzy
 ```
+
+- `./tax-portal sync`：先把服务器上的最新模板同步到本地 `output/*.xlsx`
+- `./tax-portal dry-run`：导入税务局批量开票页做校验，不真实提交
+- `./tax-portal run`：执行真实提交
 
 当前推荐的税务局浏览器模式是 `chrome_cdp`：
 
@@ -126,7 +130,7 @@ env -u http_proxy -u https_proxy PLAYWRIGHT_BROWSERS_PATH=./data/ms-playwright .
 1. 启动专用税务局 Chrome CDP 实例：
 
 ```bash
-.venv/bin/python -m app.main portal-open-chrome-cdp --env-file .env
+./tax-portal open
 ```
 
 2. 在新打开的 Chrome 窗口里手动登录税务局，进入目标企业首页。
@@ -140,52 +144,45 @@ env -u http_proxy -u https_proxy PLAYWRIGHT_BROWSERS_PATH=./data/ms-playwright .
 3. 跑导入校验：
 
 ```bash
-env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
-TAX_PORTAL_BROWSER_BACKEND=chrome_cdp \
-TAX_PORTAL_CHROME_CDP_URL=http://127.0.0.1:9222 \
-TAX_PORTAL_SYNC_FROM_CHROME_PROFILE=false \
-.venv/bin/python -m app.main portal-issue-dry-run --env-file .env --store-key fuzzy --skip-sync
+./tax-portal dry-run --store-key fuzzy --skip-sync
 ```
 
 4. 跑真实提交：
 
 ```bash
-env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
-TAX_PORTAL_BROWSER_BACKEND=chrome_cdp \
-TAX_PORTAL_CHROME_CDP_URL=http://127.0.0.1:9222 \
-TAX_PORTAL_SYNC_FROM_CHROME_PROFILE=false \
-.venv/bin/python -m app.main portal-issue-run --env-file .env --store-key fuzzy --skip-sync
+./tax-portal run --store-key fuzzy --skip-sync
 ```
 
 说明：
 
-- 上面的 `env -u ...` 是为了避免本机代理环境影响 `connect_over_cdp`
-- `--skip-sync` 表示直接使用本地 `output/*.xlsx`
-- 如果要先同步服务器模板，再跑开票，先执行 `portal-sync`
+- `./tax-portal sync` 适合“先拉最新模板到本地，再人工检查或修改本地 Excel”这类场景
+- `./tax-portal run` / `./tax-portal dry-run` 会自动清掉代理环境变量，并强制使用 `chrome_cdp`
+- `--skip-sync` 表示直接使用当前本地 `output/*.xlsx`，不在执行前重新从服务器覆盖
+- 如果要先同步服务器模板，再跑开票，先执行 `./tax-portal sync`，再执行 `./tax-portal dry-run --skip-sync` 或 `./tax-portal run --skip-sync`
 
 只同步服务器上的最新模板到本地 `output/`：
 
 ```bash
-python3 -m app.main portal-sync --env-file .env --store-key fuzzy
+./tax-portal sync --store-key fuzzy
 ```
 
 税务局 runner 只做导入校验，不真实提交：
 
 ```bash
-python3 -m app.main portal-issue-dry-run --env-file .env --store-key fuzzy
+./tax-portal dry-run --store-key fuzzy
 ```
 
 税务局 runner 真实提交：
 
 ```bash
-python3 -m app.main portal-issue-run --env-file .env --store-key fuzzy
+./tax-portal run --store-key fuzzy
 ```
 
 如果你先从服务器拉了一份模板到本地 `output/`，并且手工改过这份本地文件，希望本次开票直接使用本地修正版而不是重新从服务器覆盖，增加 `--skip-sync`：
 
 ```bash
-python3 -m app.main portal-issue-dry-run --env-file .env --store-key fuzzy --skip-sync
-python3 -m app.main portal-issue-run --env-file .env --store-key fuzzy --skip-sync
+./tax-portal dry-run --store-key fuzzy --skip-sync
+./tax-portal run --store-key fuzzy --skip-sync
 ```
 
 税务局 runner 相关环境变量：

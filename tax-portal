@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PYTHON_BIN="${ROOT_DIR}/.venv/bin/python"
+ENV_FILE="${ROOT_DIR}/.env"
+DEFAULT_CDP_URL="http://127.0.0.1:9222"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./tax-portal open [extra app.main args]
+  ./tax-portal sync [extra app.main args]
+  ./tax-portal dry-run [extra app.main args]
+  ./tax-portal run [extra app.main args]
+
+Examples:
+  ./tax-portal open
+  ./tax-portal sync --store-key fuzzy
+  ./tax-portal dry-run --store-key fuzzy --skip-sync
+  ./tax-portal run --store-key fuzzy --skip-sync
+EOF
+}
+
+require_runtime() {
+  if [[ ! -x "${PYTHON_BIN}" ]]; then
+    echo "Missing virtualenv python: ${PYTHON_BIN}" >&2
+    echo "Create it first with: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt" >&2
+    exit 1
+  fi
+}
+
+run_cdp_command() {
+  exec env \
+    -u http_proxy \
+    -u https_proxy \
+    -u HTTP_PROXY \
+    -u HTTPS_PROXY \
+    -u ALL_PROXY \
+    -u all_proxy \
+    -u NO_PROXY \
+    -u no_proxy \
+    TAX_PORTAL_BROWSER_BACKEND=chrome_cdp \
+    TAX_PORTAL_CHROME_CDP_URL="${TAX_PORTAL_CHROME_CDP_URL:-${DEFAULT_CDP_URL}}" \
+    TAX_PORTAL_SYNC_FROM_CHROME_PROFILE=false \
+    "${PYTHON_BIN}" -m app.main "$@"
+}
+
+main() {
+  require_runtime
+  cd "${ROOT_DIR}"
+
+  local subcommand="${1:-}"
+  if [[ -z "${subcommand}" ]]; then
+    usage
+    exit 1
+  fi
+  shift || true
+
+  case "${subcommand}" in
+    open)
+      exec "${PYTHON_BIN}" -m app.main portal-open-chrome-cdp --env-file "${ENV_FILE}" "$@"
+      ;;
+    sync)
+      exec "${PYTHON_BIN}" -m app.main portal-sync --env-file "${ENV_FILE}" "$@"
+      ;;
+    dry-run)
+      run_cdp_command portal-issue-dry-run --env-file "${ENV_FILE}" "$@"
+      ;;
+    run)
+      run_cdp_command portal-issue-run --env-file "${ENV_FILE}" "$@"
+      ;;
+    help|-h|--help)
+      usage
+      ;;
+    *)
+      echo "Unknown subcommand: ${subcommand}" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
