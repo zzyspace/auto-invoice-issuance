@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 from app.config import load_app_config
 from app.main import (
+    _portal_chrome_cdp_ready,
     _resolve_portal_issue_config,
     _select_portal_stores,
     build_parser,
@@ -17,6 +18,30 @@ from app.main import (
 
 
 class MainCommandTests(unittest.TestCase):
+    def test_portal_chrome_cdp_ready_requires_page_target(self) -> None:
+        version_response = MagicMock()
+        version_response.__enter__.return_value.status = 200
+
+        targets_response = MagicMock()
+        targets_response.__enter__.return_value.status = 200
+        targets_response.__enter__.return_value.read.return_value = b'[]'
+
+        with patch("app.main.urlopen", side_effect=[version_response, targets_response]):
+            self.assertFalse(_portal_chrome_cdp_ready("http://127.0.0.1:9222"))
+
+    def test_portal_chrome_cdp_ready_accepts_page_target(self) -> None:
+        version_response = MagicMock()
+        version_response.__enter__.return_value.status = 200
+
+        targets_response = MagicMock()
+        targets_response.__enter__.return_value.status = 200
+        targets_response.__enter__.return_value.read.return_value = (
+            b'[{"id":"1","type":"page","url":"https://example.com"}]'
+        )
+
+        with patch("app.main.urlopen", side_effect=[version_response, targets_response]):
+            self.assertTrue(_portal_chrome_cdp_ready("http://127.0.0.1:9222"))
+
     def test_parser_accepts_skip_sync_flag(self) -> None:
         parser = build_parser()
         args = parser.parse_args(
@@ -172,6 +197,44 @@ stores:
             self.assertEqual("ready", payload["status"])
             self.assertEqual("http://127.0.0.1:9555", payload["cdp_url"])
             self.assertTrue(payload["launched"])
+
+    def test_command_portal_open_chrome_cdp_skips_launch_when_page_target_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            env_path = tmp_path / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "TZ=Asia/Shanghai",
+                        "TENCENT_SURVEY_COOKIE=cookie=value",
+                        "TENCENT_SURVEY_EXPORT_URL=https://wj.qq.com/api/answer_exports/generate",
+                        "TENCENT_SURVEY_EXPORT_METHOD=POST",
+                        "OPENAI_BASE_URL=https://example.com/v1",
+                        "OPENAI_API_KEY=key",
+                        "SMTP_HOST=smtp.example.com",
+                        "SMTP_USERNAME=user",
+                        "SMTP_PASSWORD=pass",
+                        "SMTP_FROM=from@example.com",
+                        "SMTP_TO=to@example.com",
+                        "TEMPLATE_XLSX_PATH=./template.xlsx",
+                        "STATE_DB_PATH=./state.db",
+                        "STORES_CONFIG_PATH=./stores.yaml",
+                        "TAX_PORTAL_CHROME_CDP_URL=http://127.0.0.1:9555",
+                        f"TAX_PORTAL_CHROME_CDP_USER_DATA_DIR={tmp_path / 'cdp-profile'}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with patch("app.main._portal_chrome_cdp_ready", return_value=True):
+                with patch("subprocess.Popen") as mocked_popen:
+                    with patch("builtins.print") as mocked_print:
+                        exit_code = command_portal_open_chrome_cdp(env_path)
+
+            self.assertEqual(0, exit_code)
+            mocked_popen.assert_not_called()
+            payload = json.loads(mocked_print.call_args.args[0])
+            self.assertFalse(payload["launched"])
 
     def test_select_portal_stores_orders_by_priority(self) -> None:
         class FakeStore:

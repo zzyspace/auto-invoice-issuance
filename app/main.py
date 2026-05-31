@@ -178,11 +178,20 @@ def command_portal_sync(env_file: Path, store_keys: list[str] | None) -> int:
 
 def _portal_chrome_cdp_ready(cdp_url: str, timeout_seconds: float = 2.0) -> bool:
     version_url = cdp_url.rstrip("/") + "/json/version"
+    targets_url = cdp_url.rstrip("/") + "/json/list"
     try:
         with urlopen(version_url, timeout=timeout_seconds) as response:
-            return response.status == 200
-    except (URLError, OSError):
+            if response.status != 200:
+                return False
+        with urlopen(targets_url, timeout=timeout_seconds) as response:
+            if response.status != 200:
+                return False
+            payload = json.load(response)
+    except (URLError, OSError, ValueError, TypeError):
         return False
+    if not isinstance(payload, list):
+        return False
+    return any(isinstance(item, dict) and item.get("type") == "page" for item in payload)
 
 
 def _wait_for_portal_chrome_cdp(cdp_url: str, timeout_seconds: float = 30.0) -> bool:

@@ -117,6 +117,7 @@ env -u http_proxy -u https_proxy PLAYWRIGHT_BROWSERS_PATH=./data/ms-playwright .
 - `./tax-portal sync`：先把服务器上的最新模板同步到本地 `output/*.xlsx`
 - `./tax-portal dry-run`：导入税务局批量开票页做校验，不真实提交
 - `./tax-portal run`：执行真实提交
+- `./tax-portal dry-run` / `./tax-portal run`：如果本地还没有打开专用 Chrome CDP 窗口，会先自动帮你拉起，再继续原流程
 
 当前推荐的税务局浏览器模式是 `chrome_cdp`：
 
@@ -132,6 +133,8 @@ env -u http_proxy -u https_proxy PLAYWRIGHT_BROWSERS_PATH=./data/ms-playwright .
 ```bash
 ./tax-portal open
 ```
+
+也可以直接执行 `./tax-portal dry-run ...` 或 `./tax-portal run ...`，如果本地还没打开专用 Chrome，它们会先自动拉起一个。
 
 2. 在新打开的 Chrome 窗口里手动登录税务局，进入目标企业首页。
 
@@ -157,6 +160,7 @@ env -u http_proxy -u https_proxy PLAYWRIGHT_BROWSERS_PATH=./data/ms-playwright .
 
 - `./tax-portal sync` 适合“先拉最新模板到本地，再人工检查或修改本地 Excel”这类场景
 - `./tax-portal run` / `./tax-portal dry-run` 会自动清掉代理环境变量，并强制使用 `chrome_cdp`
+- 如果本地 `http://127.0.0.1:9222` 没有可用 CDP，会先自动执行一次“打开专用 Chrome”再继续
 - `--skip-sync` 表示直接使用当前本地 `output/*.xlsx`，不在执行前重新从服务器覆盖
 - 如果要先同步服务器模板，再跑开票，先执行 `./tax-portal sync`，再执行 `./tax-portal dry-run --skip-sync` 或 `./tax-portal run --skip-sync`
 
