@@ -53,6 +53,9 @@ class TaxPortalRunner:
         self.syncer = PortalWorkbookSyncer(config)
         self.network_diag_enabled = self._env_flag("TAX_PORTAL_NETWORK_DIAG")
         self.network_diag_threshold_ms = float(os.environ.get("TAX_PORTAL_NETWORK_DIAG_THRESHOLD_MS", "800"))
+        self._attached_cdp_browser_type: object | None = None
+        self._attached_cdp_url: str | None = None
+        self._attached_cdp_connections: list[object] = []
         if config.portal_browser_backend not in {"playwright", "chrome_cdp"}:
             raise ValueError(
                 "TAX_PORTAL_BROWSER_BACKEND must be one of: playwright, chrome_cdp."
@@ -98,6 +101,9 @@ class TaxPortalRunner:
         cdp_url = self.config.portal_chrome_cdp_url or "http://127.0.0.1:9222"
         self._log("runner", f"connecting to current Chrome session via CDP: {cdp_url}")
         browser = playwright.chromium.connect_over_cdp(cdp_url)
+        self._attached_cdp_browser_type = playwright.chromium
+        self._attached_cdp_url = cdp_url
+        self._attached_cdp_connections = [browser]
         if not browser.contexts:
             raise PortalRunnerError(
                 "Connected to Chrome via CDP, but no browser context was available."
@@ -115,15 +121,32 @@ class TaxPortalRunner:
                     home_page.close()
             except Exception:
                 pass
+            for connection in self._attached_cdp_connections[1:]:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+            self._attached_cdp_browser_type = None
+            self._attached_cdp_url = None
+            self._attached_cdp_connections = []
         return results
 
-    def _resolve_attached_home_page(self, context: object) -> object:
+    def _find_attached_portal_page(self, context: object) -> object | None:
+        portal_candidate: object | None = None
         for candidate in getattr(context, "pages", []):
             try:
                 if self._is_home_page(candidate):
                     return candidate
+                if portal_candidate is None and self._is_portal_related_page(candidate):
+                    portal_candidate = candidate
             except Exception:
                 continue
+        return portal_candidate
+
+    def _resolve_attached_home_page(self, context: object) -> object:
+        portal_candidate = self._find_attached_portal_page(context)
+        if portal_candidate is not None:
+            return portal_candidate
         page = context.new_page()
         try:
             setattr(page, "_codex_created_page", True)
@@ -183,12 +206,18 @@ class TaxPortalRunner:
             ),
         )
         try:
+            if self.config.portal_browser_backend == "chrome_cdp":
+                home_page = self._find_attached_portal_page(context) or home_page
             if self.config.portal_browser_backend == "chrome_cdp" and self._is_home_page(home_page):
                 self._log(store.store_key, f"reusing attached Chrome home page: {home_page.url}")
+            elif self.config.portal_browser_backend == "chrome_cdp" and self._is_portal_related_page(home_page):
+                self._log(store.store_key, f"reusing attached Chrome portal page: {home_page.url}")
             else:
                 self._log(store.store_key, f"opening portal home page: {self.config.portal_home_url}")
                 self._goto(self.config.portal_home_url, home_page)
             home_page = self._ensure_logged_in(home_page, result)
+            home_page = self._ensure_authenticated_home_page(home_page, result)
+            context = getattr(home_page, "context", context)
             home_page = self._ensure_company(home_page, store, result)
             self._wait_for_home_page_ready(home_page, store)
             self._wait_before_open_batch_page(store.store_key)
@@ -279,7 +308,7 @@ class TaxPortalRunner:
         return result
 
     def _ensure_logged_in(self, page: object, result: PortalIssueResult) -> object:
-        authenticated_page = self._find_authenticated_page(page)
+        authenticated_page = self._confirmed_authenticated_page(page)
         if authenticated_page is not None:
             return authenticated_page
         deadline = monotonic() + self.config.portal_login_timeout_minutes * 60
@@ -287,15 +316,30 @@ class TaxPortalRunner:
         clicked_public_login = False
         reauth_seen_at: float | None = None
         last_heartbeat_at: float | None = None
+        last_cdp_refresh_at: float | None = None
         self._log(result.store_key, "login required; waiting for successful login...")
         while monotonic() < deadline:
-            authenticated_page = self._find_authenticated_page(page)
+            authenticated_page = self._confirmed_authenticated_page(page)
             if authenticated_page is not None:
                 if authenticated_page is page:
                     self._log(result.store_key, "login confirmed")
                 else:
                     self._log(result.store_key, f"login confirmed on another page: {authenticated_page.url}")
                 return authenticated_page
+            now = monotonic()
+            if self.config.portal_browser_backend == "chrome_cdp":
+                if last_cdp_refresh_at is None or now - last_cdp_refresh_at >= 5.0:
+                    refreshed_page = self._confirmed_authenticated_page(self._refresh_attached_authenticated_page())
+                    last_cdp_refresh_at = now
+                    if refreshed_page is not None:
+                        if refreshed_page is page:
+                            self._log(result.store_key, "login confirmed after refreshing attached Chrome pages")
+                        else:
+                            self._log(
+                                result.store_key,
+                                f"login confirmed after refreshing attached Chrome pages: {refreshed_page.url}",
+                            )
+                        return refreshed_page
             if self._is_public_landing_page(page):
                 if not clicked_public_login:
                     self._log(result.store_key, "public landing detected; clicking login entry")
@@ -304,7 +348,6 @@ class TaxPortalRunner:
                 sleep(1)
                 continue
             if self._page_requires_reauth(page):
-                now = monotonic()
                 if reauth_seen_at is None:
                     reauth_seen_at = now
                     self._log(
@@ -1024,15 +1067,34 @@ class TaxPortalRunner:
         page.goto(url, wait_until="domcontentloaded")
 
     def _is_login_page(self, page: object) -> bool:
-        url = page.url
+        url = getattr(page, "url", "")
         return "tpass.xiamen.chinatax.gov.cn:8443/#/login" in url or self._page_contains(page, "打开电子税务局APP扫一扫")
 
+    def _is_portal_related_page(self, page: object) -> bool:
+        url = getattr(page, "url", "")
+        return "etax.xiamen.chinatax.gov.cn:8443" in url or "tpass.xiamen.chinatax.gov.cn:8443" in url
+
+    def _is_authenticated_portal_shell_page(self, page: object) -> bool:
+        if not self._is_portal_related_page(page):
+            return False
+        if self._is_login_page(page) or self._page_contains(page, "会话失效，请重新登录"):
+            return False
+        if self._page_contains(page, "我要办税"):
+            return True
+        if not self._page_contains(page, "首页"):
+            return False
+        return (
+            self._page_contains(page, "我要查询")
+            or self._page_contains(page, "我的提醒")
+            or self._page_contains(page, "我的待办")
+        )
+
     def _is_loginb_pending_page(self, page: object) -> bool:
-        url = page.url
+        url = getattr(page, "url", "")
         return "etax.xiamen.chinatax.gov.cn:8443/loginb/" in url and not self._is_home_page(page)
 
     def _page_requires_reauth(self, page: object) -> bool:
-        url = page.url
+        url = getattr(page, "url", "")
         return (
             "tpass.xiamen.chinatax.gov.cn:8443/#/login" in url
             or self._is_loginb_pending_page(page)
@@ -1042,8 +1104,23 @@ class TaxPortalRunner:
         )
 
     def _is_home_page(self, page: object) -> bool:
-        url = page.url
+        url = getattr(page, "url", "")
         return "etax.xiamen.chinatax.gov.cn:8443" in url and self._page_contains(page, "我要办税")
+
+    def _ensure_authenticated_home_page(self, page: object, result: PortalIssueResult) -> object:
+        if self._is_home_page(page) or not self._is_authenticated_portal_shell_page(page):
+            return page
+        self._log(
+            result.store_key,
+            f"authenticated portal shell detected outside home; opening portal home from {getattr(page, 'url', '<unknown>')}",
+        )
+        return self._navigate_with_reauth(
+            page,
+            self.config.portal_home_url,
+            result,
+            expected_text="我要办税",
+            step_name="open authenticated portal home",
+        )
 
     def _open_login_from_public_landing(self, page: object) -> None:
         try:
@@ -1109,14 +1186,64 @@ class TaxPortalRunner:
             raise PortalRunnerError(f"Failed to {step_name}: {last_error}") from last_error
         raise PortalRunnerError(f"Failed to {step_name}.")
 
-    def _find_authenticated_page(self, page: object) -> object | None:
-        for candidate in self._page_candidates(page):
+    def _first_authenticated_page(self, pages: list[object]) -> object | None:
+        shell_page: object | None = None
+        for candidate in pages:
             try:
                 if self._is_home_page(candidate):
                     return candidate
+                if shell_page is None and self._is_authenticated_portal_shell_page(candidate):
+                    shell_page = candidate
             except Exception:
                 continue
-        return None
+        return shell_page
+
+    def _find_authenticated_page(self, page: object) -> object | None:
+        return self._first_authenticated_page(self._page_candidates(page))
+
+    def _confirmed_authenticated_page(self, page: object | None) -> object | None:
+        if page is None:
+            return None
+        authenticated_page = self._find_authenticated_page(page)
+        if authenticated_page is None:
+            return None
+        wait_for_load_state = getattr(authenticated_page, "wait_for_load_state", None)
+        if callable(wait_for_load_state):
+            try:
+                wait_for_load_state("load", timeout=min(self.config.portal_action_timeout_ms, 5000))
+            except Exception:
+                pass
+        return self._find_authenticated_page(authenticated_page)
+
+    def _refresh_attached_authenticated_page(self) -> object | None:
+        if self.config.portal_browser_backend != "chrome_cdp":
+            return None
+        browser_type = self._attached_cdp_browser_type
+        cdp_url = self._attached_cdp_url
+        if browser_type is None or not cdp_url:
+            return None
+        try:
+            browser = browser_type.connect_over_cdp(cdp_url)
+        except Exception:
+            return None
+        try:
+            if not browser.contexts:
+                browser.close()
+                return None
+            context = browser.contexts[0]
+            context.set_default_timeout(self.config.portal_action_timeout_ms)
+            authenticated_page = self._first_authenticated_page(list(getattr(context, "pages", [])))
+            if authenticated_page is None:
+                browser.close()
+                return None
+            self._attached_cdp_connections.append(browser)
+            return authenticated_page
+        except Exception:
+            try:
+                browser.close()
+            except Exception:
+                pass
+            return None
 
     @staticmethod
     def _page_candidates(page: object) -> list[object]:

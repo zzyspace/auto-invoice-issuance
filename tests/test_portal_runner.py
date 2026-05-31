@@ -140,6 +140,70 @@ class PortalRunnerUrlTests(unittest.TestCase):
 
             self.assertEqual("chrome_cdp", runner.config.portal_browser_backend)
 
+    def test_resolve_attached_home_page_reuses_existing_portal_page_before_opening_new_tab(self) -> None:
+        class FakeLocator:
+            def __init__(self, page: "FakePage") -> None:
+                self.page = page
+
+            def inner_text(self) -> str:
+                return self.page.body_text
+
+        class FakePage:
+            def __init__(self, url: str, body_text: str) -> None:
+                self.url = url
+                self.body_text = body_text
+
+            def locator(self, selector: str) -> FakeLocator:
+                return FakeLocator(self)
+
+        class FakeContext:
+            def __init__(self, pages: list[FakePage]) -> None:
+                self.pages = pages
+
+            def new_page(self) -> object:
+                raise AssertionError("new_page should not be called when a portal page is already attached")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=None,
+                portal_browser_backend="chrome_cdp",
+                portal_chrome_cdp_url="http://127.0.0.1:9222",
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+            new_tab_page = FakePage("chrome://new-tab-page/", "")
+            login_page = FakePage(
+                "https://tpass.xiamen.chinatax.gov.cn:8443/#/login",
+                "打开电子税务局APP扫一扫",
+            )
+
+            resolved_page = runner._resolve_attached_home_page(  # noqa: SLF001
+                FakeContext([new_tab_page, login_page])
+            )
+
+            self.assertIs(login_page, resolved_page)
+
     def test_run_with_attached_chrome_uses_existing_browser_context(self) -> None:
         class FakePage:
             def __init__(self, url: str, body_text: str) -> None:
@@ -772,6 +836,183 @@ class PortalRunnerUrlTests(unittest.TestCase):
 
             self.assertIs(home_page, authenticated_page)
 
+    def test_confirmed_authenticated_page_rechecks_load_redirect_to_login(self) -> None:
+        class FakeLocator:
+            def __init__(self, page: "FakePage") -> None:
+                self.page = page
+
+            def inner_text(self) -> str:
+                return self.page.body_text
+
+        class FakePage:
+            def __init__(self) -> None:
+                self.url = "https://etax.xiamen.chinatax.gov.cn:8443/loginb/"
+                self.body_text = "首页 我要办税 我要查询"
+                self.context = SimpleNamespace(pages=[self])
+
+            def locator(self, selector: str) -> FakeLocator:
+                return FakeLocator(self)
+
+            def wait_for_load_state(self, state: str, timeout: int) -> None:
+                if state == "load":
+                    self.url = "https://tpass.xiamen.chinatax.gov.cn:8443/#/login"
+                    self.body_text = "打开电子税务局APP扫一扫"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=tmp_path / "profile",
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+
+            authenticated_page = runner._confirmed_authenticated_page(FakePage())  # noqa: SLF001
+
+            self.assertIsNone(authenticated_page)
+
+    def test_ensure_logged_in_returns_authenticated_shell_page_from_another_tab(self) -> None:
+        class FakeLocator:
+            def __init__(self, page: "FakePage") -> None:
+                self.page = page
+
+            def inner_text(self) -> str:
+                return self.page.body_text
+
+        class FakePage:
+            def __init__(self, url: str, body_text: str) -> None:
+                self.url = url
+                self.body_text = body_text
+                self.context = None
+
+            def locator(self, selector: str) -> FakeLocator:
+                return FakeLocator(self)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=tmp_path / "profile",
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+            login_page = FakePage(
+                "https://tpass.xiamen.chinatax.gov.cn:8443/#/login",
+                "打开电子税务局APP扫一扫",
+            )
+            shell_page = FakePage(
+                "https://etax.xiamen.chinatax.gov.cn:8443/workbench/home",
+                "首页 我要查询 我的提醒",
+            )
+            context = SimpleNamespace(pages=[login_page, shell_page])
+            login_page.context = context
+            shell_page.context = context
+            result = type("FakeResult", (), {"artifacts_dir": None, "store_key": "fuzzy"})()
+
+            authenticated_page = runner._ensure_logged_in(login_page, result)  # noqa: SLF001
+
+            self.assertIs(shell_page, authenticated_page)
+
+    def test_ensure_authenticated_home_page_normalizes_authenticated_shell_page(self) -> None:
+        class FakeLocator:
+            def __init__(self, page: "FakePage") -> None:
+                self.page = page
+
+            def inner_text(self) -> str:
+                return self.page.body_text
+
+        class FakePage:
+            def __init__(self, url: str, body_text: str) -> None:
+                self.url = url
+                self.body_text = body_text
+
+            def locator(self, selector: str) -> FakeLocator:
+                return FakeLocator(self)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=tmp_path / "profile",
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+            shell_page = FakePage(
+                "https://etax.xiamen.chinatax.gov.cn:8443/workbench/home",
+                "首页 我要查询 我的提醒",
+            )
+            result = SimpleNamespace(store_key="fuzzy")
+            home_page = object()
+
+            with patch.object(runner, "_navigate_with_reauth", return_value=home_page) as mocked_nav:
+                normalized_page = runner._ensure_authenticated_home_page(shell_page, result)  # noqa: SLF001
+
+            self.assertIs(home_page, normalized_page)
+            mocked_nav.assert_called_once_with(
+                shell_page,
+                config.portal_home_url,
+                result,
+                expected_text="我要办税",
+                step_name="open authenticated portal home",
+            )
+
     def test_ensure_logged_in_does_not_refresh_qr_during_transient_post_scan_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
@@ -804,11 +1045,11 @@ class PortalRunnerUrlTests(unittest.TestCase):
             result = type("FakeResult", (), {"artifacts_dir": None, "store_key": "fuzzy"})()
             page = object()
 
-            monotonic_values = iter([0.0, 1.0, 2.0, 3.0])
+            monotonic_values = iter([0.0, 1.0, 2.0, 3.0, 4.0])
 
             with patch("app.portal_runner.monotonic", side_effect=lambda: next(monotonic_values)):
                 with patch("app.portal_runner.sleep", lambda _: None):
-                    with patch.object(runner, "_is_home_page", side_effect=[False, False, True]):
+                    with patch.object(runner, "_is_home_page", side_effect=[False, False, True, True]):
                         with patch.object(runner, "_is_public_landing_page", side_effect=[True, False]):
                             with patch.object(runner, "_page_requires_reauth", return_value=True):
                                 with patch.object(runner, "_open_login_from_public_landing") as mocked_open:
@@ -851,12 +1092,12 @@ class PortalRunnerUrlTests(unittest.TestCase):
             page = object()
 
             monotonic_values = iter(
-                [0.0, 1.0, 2.0, 2.0 + QR_REFRESH_GRACE_SECONDS + 0.1, 9.0, 10.0]
+                [0.0, 1.0, 2.0, 2.0 + QR_REFRESH_GRACE_SECONDS + 0.1, 9.0, 10.0, 11.0]
             )
 
             with patch("app.portal_runner.monotonic", side_effect=lambda: next(monotonic_values)):
                 with patch("app.portal_runner.sleep", lambda _: None):
-                    with patch.object(runner, "_is_home_page", side_effect=[False, False, False, True]):
+                    with patch.object(runner, "_is_home_page", side_effect=[False, False, False, True, True]):
                         with patch.object(runner, "_is_public_landing_page", return_value=False):
                             with patch.object(runner, "_page_requires_reauth", return_value=True):
                                 with patch.object(runner, "_try_refresh_login_qr") as mocked_refresh:
