@@ -10,6 +10,7 @@ from time import monotonic, sleep
 from typing import Callable
 
 from app.models import AppConfig, PortalIssueDetail, PortalIssueResult, PortalIssueRow, StoreConfig
+from app.portal_local_login import PortalLocalLoginError, PortalMacLoginAutomator
 from app.portal_sync import PortalWorkbookSyncer
 from app.portal_workbook import load_portal_issue_rows, sha256_file, summarize_portal_issue_rows
 from app.state import StateStore
@@ -182,6 +183,7 @@ class TaxPortalRunner:
             store_key=store.store_key,
             store_name=store.store_name,
             company_verify_name=store.effective_portal_company_verify_name(),
+            portal_company_role=store.portal_company_role,
             workbook_path=store.output_xlsx_path,
             workbook_sha256=workbook_sha,
             mode="submit" if self.submit else "dry_run",
@@ -314,6 +316,7 @@ class TaxPortalRunner:
         deadline = monotonic() + self.config.portal_login_timeout_minutes * 60
         refreshed_qr = False
         clicked_public_login = False
+        local_app_login_attempted = False
         reauth_seen_at: float | None = None
         last_heartbeat_at: float | None = None
         last_cdp_refresh_at: float | None = None
@@ -324,7 +327,10 @@ class TaxPortalRunner:
                 if authenticated_page is page:
                     self._log(result.store_key, "login confirmed")
                 else:
-                    self._log(result.store_key, f"login confirmed on another page: {authenticated_page.url}")
+                    self._log(
+                        result.store_key,
+                        f"login confirmed on another page: {getattr(authenticated_page, 'url', '<unknown>')}",
+                    )
                 return authenticated_page
             now = monotonic()
             if self.config.portal_browser_backend == "chrome_cdp":
@@ -337,7 +343,8 @@ class TaxPortalRunner:
                         else:
                             self._log(
                                 result.store_key,
-                                f"login confirmed after refreshing attached Chrome pages: {refreshed_page.url}",
+                                "login confirmed after refreshing attached Chrome pages: "
+                                f"{getattr(refreshed_page, 'url', '<unknown>')}",
                             )
                         return refreshed_page
             if self._is_public_landing_page(page):
@@ -348,6 +355,13 @@ class TaxPortalRunner:
                 sleep(1)
                 continue
             if self._page_requires_reauth(page):
+                if (
+                    not local_app_login_attempted
+                    and self._is_login_page(page)
+                    and self._local_app_login_enabled()
+                ):
+                    local_app_login_attempted = True
+                    self._attempt_local_app_login(page, result)
                 if reauth_seen_at is None:
                     reauth_seen_at = now
                     self._log(
@@ -370,6 +384,24 @@ class TaxPortalRunner:
             sleep(2)
         self._capture_artifact(page, result.artifacts_dir, "login-timeout")
         raise PortalRunnerError("Timed out waiting for tax portal login.")
+
+    def _local_app_login_enabled(self) -> bool:
+        return PortalMacLoginAutomator.is_enabled(self.config)
+
+    def _attempt_local_app_login(self, page: object, result: PortalIssueResult) -> bool:
+        role_label = ROLE_LABELS.get(result.portal_company_role, "法定代表人")
+        self._log(result.store_key, "starting local app scan-login automation")
+        automator = PortalMacLoginAutomator(self.config, result.store_key, role_label, self._log)
+        try:
+            qr_path = automator.automate(page, result.artifacts_dir)
+        except PortalLocalLoginError as exc:
+            self._log(
+                result.store_key,
+                f"local app scan-login automation failed; falling back to manual login wait error={exc}",
+            )
+            return False
+        self._log(result.store_key, f"local app scan-login automation finished qr_path={qr_path}")
+        return True
 
     def _ensure_company(self, home_page: object, store: StoreConfig, result: PortalIssueResult) -> object:
         verify_name = store.effective_portal_company_verify_name()

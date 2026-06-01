@@ -123,7 +123,7 @@ env -u http_proxy -u https_proxy PLAYWRIGHT_BROWSERS_PATH=./data/ms-playwright .
 
 - 不再依赖独立 Playwright profile 里的税务局会话
 - 先启动一个专用 Chrome 实例
-- 在这个专用实例里手动登录一次税务局
+- 可以在这个专用实例里手动登录一次税务局；如果配置了电子税务局账号密码，runner 也可以在扫码页自动完成 app 登录和扫码确认
 - 后续 runner 直接接管这份活跃会话
 
 推荐流程：
@@ -136,7 +136,10 @@ env -u http_proxy -u https_proxy PLAYWRIGHT_BROWSERS_PATH=./data/ms-playwright .
 
 也可以直接执行 `./tax-portal dry-run ...` 或 `./tax-portal run ...`，如果本地还没打开专用 Chrome，它们会先自动拉起一个。
 
-2. 在新打开的 Chrome 窗口里手动登录税务局，进入目标企业首页。
+2. 二选一：
+
+   - 在新打开的 Chrome 窗口里手动登录税务局，进入目标企业首页
+   - 或者配置本机 `电子税务局` app 账号密码，让 runner 在扫码页自动完成登录和扫码确认
 
    建议：
 
@@ -197,6 +200,9 @@ env -u http_proxy -u https_proxy PLAYWRIGHT_BROWSERS_PATH=./data/ms-playwright .
 - `TAX_PORTAL_CHROME_CDP_URL`: 当 `TAX_PORTAL_BROWSER_BACKEND=chrome_cdp` 时，连接当前 Chrome 的 CDP 地址，默认 `http://127.0.0.1:9222`
 - `TAX_PORTAL_CHROME_CDP_USER_DATA_DIR`: `portal-open-chrome-cdp` 启动专用 Chrome 实例时使用的独立 user data dir，默认 `./data/tax-portal-chrome-cdp`
 - `TAX_PORTAL_CHROME_EXECUTABLE_PATH`: 可选，显式指定 Chrome 可执行文件路径
+- `TAX_PORTAL_ETAX_APP_USERNAME`: 可选，本机 `电子税务局` app 登录账号；配置后，runner 在扫码页会尝试自动登录并扫码
+- `TAX_PORTAL_ETAX_APP_PASSWORD`: 可选，本机 `电子税务局` app 登录密码
+- `TAX_PORTAL_ETAX_APP_PATH`: 可选，本机 `电子税务局` app 路径，默认 `/Applications/电子税务局.app`
 - `TAX_PORTAL_SYNC_FROM_CHROME_PROFILE`: 为 `true` 时，runner 启动前先把当前 Chrome profile 的税务局会话相关数据同步到 `TAX_PORTAL_USER_DATA_DIR/Default`
 - `TAX_PORTAL_CHROME_PROFILE_DIR`: 可选，显式指定要同步的 Chrome profile 目录；不填时默认读取本机 Chrome `Local State` 的最近使用 profile
 - `TAX_PORTAL_HOME_URL`: 税务局首页
@@ -212,6 +218,12 @@ env -u http_proxy -u https_proxy PLAYWRIGHT_BROWSERS_PATH=./data/ms-playwright .
 - `TAX_PORTAL_SSH_KEY_PATH`: 可选，专门给 runner 用的 SSH 私钥路径
 - `TAX_PORTAL_SSH_PORT`: SSH 端口
 - `TAX_PORTAL_SYNC_CONNECT_TIMEOUT_SECONDS`: 同步模板时的 SSH 连接超时
+
+开启 `电子税务局` app 自动扫码前，请先手动完成一次本机准备：
+
+- 允许当前终端 / Python 进程使用“辅助功能”和“自动化”
+- 完成一次 `照片` app 首次初始化
+- 确保税务验证码会同步到 macOS `信息`
 
 `portal-open-chrome-cdp` 默认会自动拉起一个带 CDP 的专用 Chrome 实例。等价的手工启动命令示例：
 

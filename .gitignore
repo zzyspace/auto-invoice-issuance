@@ -12,3 +12,4 @@ data/tax-portal-profile/
 data/tax-portal-artifacts/
 data/ms-playwright/
 data/tax-portal-chrome-cdp/
+.cache/

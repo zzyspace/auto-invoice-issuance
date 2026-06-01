@@ -244,6 +244,9 @@ def load_app_config(env_path: Optional[Path] = None) -> AppConfig:
             or base_dir.joinpath("data", "tax-portal-chrome-cdp").resolve()
         ),
         portal_chrome_executable_path=resolve_optional_path("TAX_PORTAL_CHROME_EXECUTABLE_PATH"),
+        portal_etax_app_username=os.environ.get("TAX_PORTAL_ETAX_APP_USERNAME") or None,
+        portal_etax_app_password=os.environ.get("TAX_PORTAL_ETAX_APP_PASSWORD") or None,
+        portal_etax_app_path=_optional_path("TAX_PORTAL_ETAX_APP_PATH", "/Applications/电子税务局.app"),
         portal_browser_channel=os.environ.get("TAX_PORTAL_BROWSER_CHANNEL", "chrome"),
         portal_disable_proxy=_parse_bool(
             os.environ.get("TAX_PORTAL_DISABLE_PROXY", "false"),

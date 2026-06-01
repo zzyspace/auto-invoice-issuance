@@ -951,6 +951,57 @@ class PortalRunnerUrlTests(unittest.TestCase):
 
             self.assertIs(shell_page, authenticated_page)
 
+    def test_ensure_logged_in_attempts_local_app_automation_once_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=tmp_path / "profile",
+                portal_login_timeout_minutes=1,
+                portal_browser_backend="chrome_cdp",
+                portal_etax_app_username="demo-user",
+                portal_etax_app_password="demo-pass",
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+            result = SimpleNamespace(artifacts_dir=None, store_key="fuzzy", portal_company_role="legal_representative")
+            page = SimpleNamespace(url="https://tpass.xiamen.chinatax.gov.cn:8443/#/login")
+            home_page = object()
+
+            monotonic_values = iter([0.0, 1.0, 2.0, 3.0])
+
+            with patch("app.portal_runner.monotonic", side_effect=lambda: next(monotonic_values)):
+                with patch("app.portal_runner.sleep", lambda _: None):
+                    with patch.object(runner, "_confirmed_authenticated_page", side_effect=[None, None, None, home_page]):
+                        with patch.object(runner, "_is_public_landing_page", return_value=False):
+                            with patch.object(runner, "_page_requires_reauth", return_value=True):
+                                with patch.object(runner, "_is_login_page", return_value=True):
+                                    with patch.object(runner, "_refresh_attached_authenticated_page", return_value=None):
+                                        with patch.object(runner, "_attempt_local_app_login", return_value=True) as mocked_attempt:
+                                            authenticated_page = runner._ensure_logged_in(page, result)  # noqa: SLF001
+
+            self.assertIs(home_page, authenticated_page)
+            mocked_attempt.assert_called_once_with(page, result)
+
     def test_ensure_authenticated_home_page_normalizes_authenticated_shell_page(self) -> None:
         class FakeLocator:
             def __init__(self, page: "FakePage") -> None:

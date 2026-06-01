@@ -95,6 +95,9 @@ class AppConfig:
     portal_chrome_cdp_url: Optional[str] = None
     portal_chrome_cdp_user_data_dir: Optional[Path] = None
     portal_chrome_executable_path: Optional[Path] = None
+    portal_etax_app_username: Optional[str] = None
+    portal_etax_app_password: Optional[str] = None
+    portal_etax_app_path: Optional[Path] = None
     portal_browser_channel: str = "chrome"
     portal_disable_proxy: bool = False
     portal_headless: bool = False
@@ -243,6 +246,7 @@ class PortalIssueResult:
     store_key: str
     store_name: str
     company_verify_name: str
+    portal_company_role: str
     workbook_path: Path
     workbook_sha256: str
     mode: str
