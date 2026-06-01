@@ -150,7 +150,7 @@ env -u http_proxy -u https_proxy PLAYWRIGHT_BROWSERS_PATH=./data/ms-playwright .
 自动扫码登录当前实现的实际步骤：
 
 1. Chrome 落到税务局扫码页后，runner 会截取二维码并写入 `TAX_PORTAL_ARTIFACTS_DIR`
-2. 把二维码导入本机 `照片` 资料库
+2. 通过 `Photos` 自动化把二维码导入本机 `照片` 资料库；runner 不再主动把 `照片` 主窗口切到前台
 3. 拉起 `电子税务局` app，进入“我的”
 4. 走短信登录：
    - 账号 / 密码登录
@@ -241,6 +241,7 @@ env -u http_proxy -u https_proxy PLAYWRIGHT_BROWSERS_PATH=./data/ms-playwright .
 
 - 允许当前终端 / Python 进程使用“辅助功能”和“自动化”
 - 完成一次 `照片` app 首次初始化
+- 允许 `osascript` 控制 `照片`；二维码导入现在走后台导入优先，但仍依赖这项自动化权限
 - 确保税务验证码会同步到 macOS `信息`
 - 首次使用时，建议先手工确认 `电子税务局` app 的短信登录、身份类型选择、指纹提示、扫码页、内部照片选择器都能正常出现
 

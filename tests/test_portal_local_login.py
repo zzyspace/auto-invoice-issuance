@@ -176,6 +176,26 @@ class PortalLocalLoginTests(unittest.TestCase):
 
         self.assertEqual(["internal_picker"], events)
 
+    def test_import_qr_into_photos_avoids_foreground_activation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = self._build_config(tmp_path)
+            automator = PortalMacLoginAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
+            scripts: list[str] = []
+
+            with patch.object(
+                automator,
+                "_run_applescript",
+                side_effect=lambda script, timeout_seconds: scripts.append(script) or "",
+            ):
+                with patch("app.portal_local_login.sleep", return_value=None):
+                    automator._import_qr_into_photos(tmp_path / "login-qr.png")  # noqa: SLF001
+
+        self.assertEqual(1, len(scripts))
+        self.assertIn('tell application "Photos"', scripts[0])
+        self.assertIn("import POSIX file", scripts[0])
+        self.assertNotIn("activate", scripts[0])
+
     def test_wait_for_login_confirmation_ready_raises_on_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)

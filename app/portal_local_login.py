@@ -546,7 +546,6 @@ class PortalMacLoginAutomator:
         self._log(f"importing tax portal login QR into Photos path={qr_path}")
         script = f"""
         tell application "Photos"
-            activate
             import POSIX file {self._apple_string(str(qr_path))} skip check duplicates yes
         end tell
         """
