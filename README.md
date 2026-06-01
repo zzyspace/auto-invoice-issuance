@@ -147,6 +147,24 @@ env -u http_proxy -u https_proxy PLAYWRIGHT_BROWSERS_PATH=./data/ms-playwright .
    - 最好保留“已登录的税务局首页”这个 tab，runner 会优先复用它
    - 如果这个首页 tab 不在了，runner 会退化成自己新开一个“干净首页”再继续
 
+自动扫码登录当前实现的实际步骤：
+
+1. Chrome 落到税务局扫码页后，runner 会截取二维码并写入 `TAX_PORTAL_ARTIFACTS_DIR`
+2. 把二维码导入本机 `照片` 资料库
+3. 拉起 `电子税务局` app，进入“我的”
+4. 走短信登录：
+   - 账号 / 密码登录
+   - 点击 `获取验证码`，并等待按钮变成 `xx秒重新获取`
+   - 优先使用 macOS 一次性验证码填充；没有出现时，再从 macOS `信息` 读取最新厦门税务验证码
+5. 登录后固定按顺序处理：
+   - `请选择身份类型` -> 选择 `法定代表人` 或 `办税员`
+   - `是否开启指纹快捷登录?` -> 点击 `暂不设置`
+   - 回到已登录首页
+6. 点击首页右上角扫码图标
+7. 在扫码页点击右下角 `相册`
+8. 打开的不是系统 `照片` app 主窗口，而是税务 app 内部的照片选择器；runner 会在这个内部选择器里优先选择左上第一张二维码图片
+9. 进入 `登录确认` 界面后点击 `登录`
+
 3. 跑导入校验：
 
 ```bash
@@ -224,6 +242,18 @@ env -u http_proxy -u https_proxy PLAYWRIGHT_BROWSERS_PATH=./data/ms-playwright .
 - 允许当前终端 / Python 进程使用“辅助功能”和“自动化”
 - 完成一次 `照片` app 首次初始化
 - 确保税务验证码会同步到 macOS `信息`
+- 首次使用时，建议先手工确认 `电子税务局` app 的短信登录、身份类型选择、指纹提示、扫码页、内部照片选择器都能正常出现
+
+自动扫码登录的调试信号：
+
+- `requesting SMS verification code`：开始请求短信验证码
+- `SMS verification code request accepted attempt=N`：验证码发送成功
+- `selected identity role in 电子税务局 app role=... attempt=N`：身份类型选择成功
+- `dismissed fingerprint quick login prompt`：已处理指纹快捷登录提示
+- `opening scan flow in 电子税务局 app`：开始进入扫码页
+- `opening album from scan page`：开始打开扫码页右下角相册入口
+- `selecting latest imported QR image from album`：开始在税务 app 内部照片选择器里选图
+- `confirming scan login in 电子税务局 app`：进入登录确认并准备提交
 
 `portal-open-chrome-cdp` 默认会自动拉起一个带 CDP 的专用 Chrome 实例。等价的手工启动命令示例：
 

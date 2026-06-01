@@ -570,12 +570,31 @@ class PortalMacLoginAutomator:
     def _wait_for_process(self, bundle_id: str, *, timeout_seconds: float) -> None:
         self._log("waiting for 电子税务局 app process")
         deadline = monotonic() + timeout_seconds
+        saw_process = False
+        warned_window_pending = False
         while monotonic() < deadline:
             pids = self._find_process_pids(bundle_id)
             if pids:
-                self._log(f"detected candidate process pids bundle_id={bundle_id} pids={pids}")
-                return
+                saw_process = True
+                for pid in pids:
+                    nodes = self._ax.find_nodes(pid)
+                    if not nodes:
+                        continue
+                    self._remember_window_size(nodes)
+                    if self._nodes_look_ready(nodes):
+                        self._log(
+                            f"detected candidate process pids bundle_id={bundle_id} pids={pids} ready_pid={pid}"
+                        )
+                        return
+                if not warned_window_pending:
+                    self._log(
+                        "电子税务局 process detected but UI window is not ready yet; "
+                        "waiting before starting click automation"
+                    )
+                    warned_window_pending = True
             sleep(VISIBLE_ELEMENT_POLL_SECONDS)
+        if saw_process:
+            raise PortalLocalLoginError(f"Timed out waiting for accessible UI in process {bundle_id}.")
         raise PortalLocalLoginError(f"Timed out waiting for process {bundle_id}.")
 
     def _ensure_etax_session(self, bundle_id: str) -> None:
@@ -1058,19 +1077,26 @@ class PortalMacLoginAutomator:
         for pid in self._find_process_pids(bundle_id):
             nodes = self._ax.find_nodes(pid)
             if nodes:
-                for node in nodes:
-                    if node.role == "AXWindow" and node.size is not None:
-                        self._etax_last_window_size = node.size
-                        break
+                self._remember_window_size(nodes)
                 return nodes
         focused_nodes = self._ax.find_focused_nodes()
         if focused_nodes:
-            for node in focused_nodes:
-                if node.role == "AXWindow" and node.size is not None:
-                    self._etax_last_window_size = node.size
-                    break
+            self._remember_window_size(focused_nodes)
             return focused_nodes
         return []
+
+    def _remember_window_size(self, nodes: list[AXNode]) -> None:
+        for node in nodes:
+            if node.role == "AXWindow" and node.size is not None:
+                self._etax_last_window_size = node.size
+                return
+
+    @staticmethod
+    def _nodes_look_ready(nodes: list[AXNode]) -> bool:
+        for node in nodes:
+            if node.role == "AXWindow" and node.position is not None and node.size is not None:
+                return True
+        return any(node.texts for node in nodes)
 
     def _find_named_node(self, bundle_id: str, names: tuple[str, ...], *, contains: bool = False) -> AXNode | None:
         normalized_names = [self._normalized_text(name) for name in names if self._normalized_text(name)]
@@ -1331,14 +1357,12 @@ class PortalMacLoginAutomator:
         self._ax.type_text(value)
 
     def _activate_application(self, bundle_id: str) -> None:
-        if bundle_id == ETAX_APP_BUNDLE_ID_FALLBACK:
-            command = ["open", "-a", str(self._etax_app_path)]
-        elif bundle_id == MESSAGES_BUNDLE_ID:
+        if bundle_id == MESSAGES_BUNDLE_ID:
             command = ["open", "-a", "Messages"]
         elif bundle_id == PHOTOS_BUNDLE_ID:
             command = ["open", "-a", "Photos"]
         else:
-            return
+            command = ["open", "-a", str(self._etax_app_path)]
         try:
             self._run_command(command, timeout_seconds=5.0)
         except PortalLocalLoginError:

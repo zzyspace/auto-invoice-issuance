@@ -252,6 +252,62 @@ class PortalLocalLoginTests(unittest.TestCase):
             events,
         )
 
+    def test_wait_for_process_waits_for_accessibility_nodes_after_pid_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = self._build_config(tmp_path)
+            automator = PortalMacLoginAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
+            logs: list[str] = []
+
+            class FakeAX:
+                def __init__(self) -> None:
+                    self.find_nodes_calls = 0
+
+                def find_nodes(self, pid: int) -> list[AXNode]:
+                    self.find_nodes_calls += 1
+                    if self.find_nodes_calls == 1:
+                        return []
+                    return [
+                        AXNode(
+                            element=1,
+                            role="AXWindow",
+                            subrole="",
+                            texts=("首页",),
+                            position=(10.0, 20.0),
+                            size=(300.0, 500.0),
+                        )
+                    ]
+
+            fake_ax = FakeAX()
+            automator._ax = fake_ax  # type: ignore[assignment]
+
+            with patch.object(automator, "_find_process_pids", return_value=[12345]):
+                with patch("app.portal_local_login.sleep", return_value=None):
+                    with patch.object(automator, "_log", side_effect=lambda message: logs.append(message)):
+                        automator._wait_for_process("cn.gov.chinatax.gt4.app", timeout_seconds=1.0)  # noqa: SLF001
+
+            self.assertEqual(2, fake_ax.find_nodes_calls)
+            self.assertIn(
+                "电子税务局 process detected but UI window is not ready yet; waiting before starting click automation",
+                logs,
+            )
+
+    def test_activate_application_uses_etax_path_for_resolved_bundle_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = self._build_config(tmp_path)
+            automator = PortalMacLoginAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
+            commands: list[list[str]] = []
+
+            with patch.object(
+                automator,
+                "_run_command",
+                side_effect=lambda command, timeout_seconds: commands.append(command) or "",
+            ):
+                automator._activate_application("com.vendor.actual-etax-bundle")  # noqa: SLF001
+
+        self.assertEqual([["open", "-a", str(config.portal_etax_app_path)]], commands)
+
     def test_ensure_etax_session_uses_messages_fallback_when_prompt_fill_unavailable(self) -> None:
         events: list[str] = []
 
