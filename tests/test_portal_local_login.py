@@ -176,6 +176,80 @@ class PortalLocalLoginTests(unittest.TestCase):
 
         self.assertEqual(["internal_picker"], events)
 
+    def test_click_node_for_etax_bundle_waits_before_click(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = self._build_config(tmp_path)
+            automator = PortalMacLoginAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
+            node = AXNode(
+                element=1,
+                role="AXButton",
+                subrole="",
+                texts=("登录",),
+                position=(10.0, 10.0),
+                size=(100.0, 20.0),
+            )
+            events: list[str] = []
+
+            class FakeAX:
+                def click_node(self, target: AXNode) -> bool:
+                    events.append(f"click:{target.texts[0]}")
+                    return True
+
+            automator._ax = FakeAX()  # type: ignore[assignment]
+
+            with patch("app.portal_local_login.sleep", side_effect=lambda seconds: events.append(f"sleep:{seconds}")):
+                clicked = automator._click_node_for_bundle("cn.gov.chinatax.gt4.app", node)  # noqa: SLF001
+
+        self.assertTrue(clicked)
+        self.assertEqual(["sleep:1.0", "click:登录"], events)
+
+    def test_click_at_for_etax_bundle_waits_before_click(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = self._build_config(tmp_path)
+            automator = PortalMacLoginAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
+            events: list[str] = []
+
+            class FakeAX:
+                def click_at(self, x: float, y: float) -> None:
+                    events.append(f"click_at:{x}:{y}")
+
+            automator._ax = FakeAX()  # type: ignore[assignment]
+
+            with patch("app.portal_local_login.sleep", side_effect=lambda seconds: events.append(f"sleep:{seconds}")):
+                automator._click_at_for_bundle("cn.gov.chinatax.gt4.app", 12.0, 34.0)  # noqa: SLF001
+
+        self.assertEqual(["sleep:1.0", "click_at:12.0:34.0"], events)
+
+    def test_click_node_for_photos_bundle_skips_etax_pre_click_wait(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = self._build_config(tmp_path)
+            automator = PortalMacLoginAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
+            node = AXNode(
+                element=1,
+                role="AXButton",
+                subrole="",
+                texts=("照片",),
+                position=(10.0, 10.0),
+                size=(100.0, 20.0),
+            )
+            events: list[str] = []
+
+            class FakeAX:
+                def click_node(self, target: AXNode) -> bool:
+                    events.append(f"click:{target.texts[0]}")
+                    return True
+
+            automator._ax = FakeAX()  # type: ignore[assignment]
+
+            with patch("app.portal_local_login.sleep", side_effect=lambda seconds: events.append(f"sleep:{seconds}")):
+                clicked = automator._click_node_for_bundle("com.apple.Photos", node)  # noqa: SLF001
+
+        self.assertTrue(clicked)
+        self.assertEqual(["click:照片"], events)
+
     def test_import_qr_into_photos_avoids_foreground_activation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)

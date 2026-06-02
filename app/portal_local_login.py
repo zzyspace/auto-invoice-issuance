@@ -60,6 +60,7 @@ QR_LOCATOR_CANDIDATES = (
 ETAX_PROCESS_PATTERN = r"cn\.gov\.chinatax\.gt4\.app|GT4\.app|电子税务局"
 MESSAGES_PROCESS_PATTERN = r"Messages|信息"
 PHOTOS_PROCESS_PATTERN = r"Photos|照片"
+ETAX_CLICK_PRE_DELAY_SECONDS = 1.0
 MOUSE_DOWN = 1
 MOUSE_UP = 2
 MOUSE_MOVED = 5
@@ -676,7 +677,7 @@ class PortalMacLoginAutomator:
             image_nodes = [node for node in nodes if node.role in {"AXImage", "AXButton"} and node.center is not None]
             image_nodes.sort(key=lambda node: (node.position[1] if node.position else 10**9, node.position[0] if node.position else 10**9))
             for node in image_nodes:
-                if self._ax.click_node(node):
+                if self._click_node_for_bundle(bundle_id, node):
                     return
             sleep(VISIBLE_ELEMENT_POLL_SECONDS)
         self._click_etax_latest_photo(bundle_id)
@@ -850,7 +851,7 @@ class PortalMacLoginAutomator:
             )
         else:
             left, top, width, height = bounds
-        self._ax.click_at(left + width * x_ratio, top + height * y_ratio)
+        self._click_at_for_bundle(bundle_id, left + width * x_ratio, top + height * y_ratio)
 
     def _dismiss_fingerprint_prompt(self, bundle_id: str) -> None:
         self._activate_application(bundle_id)
@@ -872,7 +873,7 @@ class PortalMacLoginAutomator:
             )
         else:
             left, top, width, height = bounds
-        self._ax.click_at(left + width * 0.33, top + height * 0.69)
+        self._click_at_for_bundle(bundle_id, left + width * 0.33, top + height * 0.69)
 
     def _wait_for_post_login_state(self, bundle_id: str, *, timeout_seconds: float) -> str:
         deadline = monotonic() + timeout_seconds
@@ -972,7 +973,7 @@ class PortalMacLoginAutomator:
         deadline = monotonic() + timeout_seconds
         while monotonic() < deadline:
             node = self._find_named_node(bundle_id, names, contains=contains)
-            if node is not None and self._ax.click_node(node):
+            if node is not None and self._click_node_for_bundle(bundle_id, node):
                 return node.texts[0] if node.texts else "clicked"
             sleep(VISIBLE_ELEMENT_POLL_SECONDS)
         raise PortalLocalLoginError(f"Timed out clicking element in bundle {bundle_id}.")
@@ -1001,7 +1002,7 @@ class PortalMacLoginAutomator:
     ) -> None:
         self._activate_application(bundle_id)
         node = self._find_text_field_node(bundle_id, labels=labels, field_index=field_index, secure=secure)
-        if node is None or not self._ax.click_node(node):
+        if node is None or not self._click_node_for_bundle(bundle_id, node):
             raise PortalLocalLoginError("Unable to find target text field")
 
     def _set_text_input_value(
@@ -1022,7 +1023,7 @@ class PortalMacLoginAutomator:
             )
         if self._ax.set_text_value(node, value):
             return
-        if not self._ax.click_node(node):
+        if not self._click_node_for_bundle(bundle_id, node):
             raise PortalLocalLoginError(
                 "Unable to focus target text field for keyboard fallback "
                 f"field_index={field_index} secure={secure} labels={labels or ('<none>',)}"
@@ -1046,6 +1047,22 @@ class PortalMacLoginAutomator:
             if re.fullmatch(r"\d{6}", text):
                 return text
         return ""
+
+    @staticmethod
+    def _is_etax_bundle(bundle_id: str) -> bool:
+        return bundle_id not in {MESSAGES_BUNDLE_ID, PHOTOS_BUNDLE_ID}
+
+    def _wait_before_bundle_click(self, bundle_id: str) -> None:
+        if self._is_etax_bundle(bundle_id):
+            sleep(ETAX_CLICK_PRE_DELAY_SECONDS)
+
+    def _click_node_for_bundle(self, bundle_id: str, node: AXNode) -> bool:
+        self._wait_before_bundle_click(bundle_id)
+        return self._ax.click_node(node)
+
+    def _click_at_for_bundle(self, bundle_id: str, x: float, y: float) -> None:
+        self._wait_before_bundle_click(bundle_id)
+        self._ax.click_at(x, y)
 
     def _send_key_to_front_process(self, bundle_id: str, *, key_code: int) -> None:
         _ = bundle_id
@@ -1176,14 +1193,15 @@ class PortalMacLoginAutomator:
             )
         )
         if len(tabbar_nodes) >= index + 1:
-            if self._ax.click_node(tabbar_nodes[index]):
+            if self._click_node_for_bundle(bundle_id, tabbar_nodes[index]):
                 return
         window = self._window_node(bundle_id)
         if window is None or window.position is None or window.size is None:
             bounds = self._window_bounds_for_bundle(bundle_id)
             if bounds is not None:
                 x, y, width, height = bounds
-                self._ax.click_at(
+                self._click_at_for_bundle(
+                    bundle_id,
                     x + width * ((index + 0.5) / 5.0),
                     y + height * (1.0 - (28.0 / max(height, 1.0))),
                 )
@@ -1194,7 +1212,7 @@ class PortalMacLoginAutomator:
             )
         x = window.position[0] + window.size[0] * ((index + 0.5) / 5.0)
         y = window.position[1] + window.size[1] - 28.0
-        self._ax.click_at(x, y)
+        self._click_at_for_bundle(bundle_id, x, y)
 
     def _click_etax_scan_icon(self, bundle_id: str) -> None:
         self._activate_application(bundle_id)
@@ -1203,12 +1221,12 @@ class PortalMacLoginAutomator:
             bounds = self._window_bounds_for_bundle(bundle_id)
             if bounds is not None:
                 x, y, width, height = bounds
-                self._ax.click_at(x + width * SCAN_ICON_X_RATIO, y + height * SCAN_ICON_Y_RATIO)
+                self._click_at_for_bundle(bundle_id, x + width * SCAN_ICON_X_RATIO, y + height * SCAN_ICON_Y_RATIO)
                 return
             raise PortalLocalLoginError("Unable to determine 电子税务局 window frame for scan icon click.")
         x = window.position[0] + window.size[0] * SCAN_ICON_X_RATIO
         y = window.position[1] + window.size[1] * SCAN_ICON_Y_RATIO
-        self._ax.click_at(x, y)
+        self._click_at_for_bundle(bundle_id, x, y)
 
     def _click_etax_album_button(self, bundle_id: str) -> None:
         self._activate_application(bundle_id)
@@ -1217,12 +1235,12 @@ class PortalMacLoginAutomator:
             bounds = self._window_bounds_for_bundle(bundle_id)
             if bounds is not None:
                 x, y, width, height = bounds
-                self._ax.click_at(x + width - 26.0, y + height - 24.0)
+                self._click_at_for_bundle(bundle_id, x + width - 26.0, y + height - 24.0)
                 return
             raise PortalLocalLoginError("Unable to determine 电子税务局 window frame for album button click.")
         x = window.position[0] + window.size[0] - 26.0
         y = window.position[1] + window.size[1] - 24.0
-        self._ax.click_at(x, y)
+        self._click_at_for_bundle(bundle_id, x, y)
 
     def _click_etax_latest_photo(self, bundle_id: str) -> None:
         self._activate_application(bundle_id)
@@ -1231,12 +1249,12 @@ class PortalMacLoginAutomator:
             bounds = self._window_bounds_for_bundle(bundle_id)
             if bounds is not None:
                 x, y, width, height = bounds
-                self._ax.click_at(x + width * 0.18, y + height * 0.23)
+                self._click_at_for_bundle(bundle_id, x + width * 0.18, y + height * 0.23)
                 return
             raise PortalLocalLoginError("Unable to determine 电子税务局 window frame for latest photo click.")
         x = window.position[0] + window.size[0] * 0.18
         y = window.position[1] + window.size[1] * 0.23
-        self._ax.click_at(x, y)
+        self._click_at_for_bundle(bundle_id, x, y)
 
     def _click_photos_first_item(self) -> None:
         self._activate_application(PHOTOS_BUNDLE_ID)
@@ -1270,7 +1288,7 @@ class PortalMacLoginAutomator:
             )
         else:
             left, top, width, height = bounds
-        self._ax.click_at(left + width * x_ratio, top + height * y_ratio)
+        self._click_at_for_bundle(bundle_id, left + width * x_ratio, top + height * y_ratio)
 
     def _click_scan_album_region(self, bundle_id: str, attempt: int) -> None:
         self._activate_application(bundle_id)
@@ -1294,7 +1312,7 @@ class PortalMacLoginAutomator:
             (0.92, 0.74),
         )
         x_ratio, y_ratio = targets[min(attempt - 1, len(targets) - 1)]
-        self._ax.click_at(left + width * x_ratio, top + height * y_ratio)
+        self._click_at_for_bundle(bundle_id, left + width * x_ratio, top + height * y_ratio)
 
     def _set_login_account_value(self, bundle_id: str, value: str) -> None:
         if self._try_set_field_value(bundle_id, value, field_index=1, secure=False):
@@ -1310,7 +1328,7 @@ class PortalMacLoginAutomator:
 
     def _focus_sms_code_input(self, bundle_id: str) -> None:
         node = self._find_text_field_node(bundle_id, labels=("短信验证码",), field_index=2, secure=False)
-        if node is not None and self._ax.click_node(node):
+        if node is not None and self._click_node_for_bundle(bundle_id, node):
             return
         self._click_login_field_relative(bundle_id, x_ratio=0.43, y_ratio=0.49)
 
@@ -1348,7 +1366,7 @@ class PortalMacLoginAutomator:
             left, top, width, height = bounds
             x = left + width * x_ratio
             y = top + height * y_ratio
-        self._ax.click_at(x, y)
+        self._click_at_for_bundle(bundle_id, x, y)
 
     def _clear_and_type_text(self, value: str) -> None:
         self._ax.send_modified_key(KEY_A, CG_EVENT_FLAG_MASK_COMMAND)
