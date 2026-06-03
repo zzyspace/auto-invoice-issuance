@@ -23,8 +23,10 @@ ROLE_LABELS = {
 
 QR_REFRESH_GRACE_SECONDS = 5.0
 LOGIN_WAIT_HEARTBEAT_SECONDS = 15.0
-HOME_PAGE_BEFORE_BATCH_PAGE_DELAY_SECONDS = 5.0
+HOME_PAGE_BEFORE_BATCH_PAGE_DELAY_SECONDS = 3.0
 POST_SUBMIT_SUCCESS_WAIT_SECONDS = 3.0
+BROWSER_CLICK_DELAY_MS = 1000
+BROWSER_CLICK_DELAY_SECONDS = BROWSER_CLICK_DELAY_MS / 1000
 BROWSER_SESSION_SYNC_ENTRIES = (
     "Cookies",
     "Cookies-journal",
@@ -439,21 +441,27 @@ class TaxPortalRunner:
             )
         selected_name = self._select_company_switch_row(home_page, store)
         self._wait_for_switch_confirmation_ready(home_page, store.store_key)
-        self._visible_button_in_dialog(home_page, "确认是否切换", "确定").click()
+        self._click(
+            self._visible_button_in_dialog(home_page, "确认是否切换", "确定"),
+            page=home_page,
+        )
         role_label = ROLE_LABELS.get(store.portal_company_role, "法定代表人")
         self._wait_for_role_selection_ready(home_page, store.store_key, role_label)
         try:
-            self._visible_text_in_dialog(home_page, "身份类型选择", role_label).click()
+            self._click(
+                self._visible_text_in_dialog(home_page, "身份类型选择", role_label),
+                page=home_page,
+            )
         except Exception:
             role_radio = self._visible_radio_in_dialog(home_page, "身份类型选择", role_label)
             try:
-                role_radio.check()
+                self._check(role_radio, page=home_page)
             except Exception:
-                role_radio.click(force=True)
+                self._click(role_radio, page=home_page, force=True)
         sleep(0.2)
         confirm_button = self._visible_button_in_dialog(home_page, "身份类型选择", "确定")
         self._wait_until(lambda: confirm_button.is_enabled(), timeout_seconds=10, message="identity role confirm enable")
-        confirm_button.click()
+        self._click(confirm_button, page=home_page)
         self._wait_for_company_switch_completion(home_page, store.store_key, verify_name)
         if not self._page_contains(home_page, verify_name):
             home_page = self._navigate_with_reauth(
@@ -735,7 +743,7 @@ class TaxPortalRunner:
         self._log(store_key, "batch issue page is not clean; attempting to clear imported rows before continuing")
         clear_button = page.get_by_role("button", name="清空导入")
         try:
-            clear_button.click(timeout=5000)
+            self._click(clear_button, page=page, timeout=5000)
         except Exception as exc:  # noqa: BLE001
             raise PortalRunnerError("Portal batch page is not clean and could not be cleared automatically.") from exc
         self._wait_until(
@@ -744,7 +752,7 @@ class TaxPortalRunner:
             message="open clear imported rows confirmation",
             interval_seconds=0.2,
         )
-        self._visible_button(page, "确定").click()
+        self._click(self._visible_button(page, "确定"), page=page)
         self._wait_until(
             lambda: "共 0 条" in self._body_text(page) and "重新选择" not in self._body_text(page),
             timeout_seconds=15,
@@ -765,7 +773,7 @@ class TaxPortalRunner:
             f"importing workbook {workbook_path.name} rows={summary.row_count}",
         )
         with page.expect_file_chooser() as chooser_info:
-            page.get_by_text("选择文件", exact=True).click()
+            self._click(page.get_by_text("选择文件", exact=True), page=page)
         chooser_info.value.set_files(str(workbook_path))
         self._wait_for_text(page, workbook_path.name)
         success_prefix = f"导入完成，共处理数据{summary.row_count}条，处理成功{summary.row_count}条"
@@ -783,9 +791,9 @@ class TaxPortalRunner:
 
     def _select_all_rows(self, page: object) -> None:
         try:
-            page.get_by_role("checkbox").first.check(force=True)
+            self._check(page.get_by_role("checkbox").first, page=page, force=True)
         except Exception:
-            page.mouse.click(55, 515)
+            self._mouse_click(page, 55, 515)
         self._wait_until(
             lambda: page.get_by_role("checkbox").first.is_checked(),
             timeout_seconds=10,
@@ -799,7 +807,7 @@ class TaxPortalRunner:
         row_count: int,
         total_amount_including_tax: Decimal,
     ) -> None:
-        page.get_by_role("button", name="批量开具").click()
+        self._click(page.get_by_role("button", name="批量开具"), page=page)
         self._wait_for_submit_confirmation_ready(page, store_key, row_count, total_amount_including_tax)
         self._wait_until(
             lambda: self._visible_button_in_dialog(page, "本次勾选批量开具发票", "确定").is_enabled(),
@@ -809,7 +817,7 @@ class TaxPortalRunner:
 
     def _confirm_submit(self, page: object) -> None:
         confirm_button = self._visible_button_in_dialog(page, "本次勾选批量开具发票", "确定")
-        confirm_button.click()
+        self._click(confirm_button, page=page)
 
     def _wait_for_result_modal(self, page: object, store_key: str) -> tuple[list[PortalIssueDetail], int, int]:
         self._wait_until(
@@ -1033,14 +1041,14 @@ class TaxPortalRunner:
             self._log(store.store_key, f"trying company switch candidate: {candidate}")
             try:
                 page.get_by_placeholder("请输入纳税人名称").fill(candidate)
-                page.get_by_role("button", name="查询").click()
+                self._click(page.get_by_role("button", name="查询"), page=page)
                 self._wait_for_switch_query_results_ready(page, store.store_key)
             except Exception:
                 pass
             row = page.locator("tr").filter(has_text=candidate).first
             button = row.get_by_role("button", name="切换")
             try:
-                button.click(timeout=3000)
+                self._click(button, page=page, timeout=3000)
                 return candidate
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
@@ -1156,7 +1164,7 @@ class TaxPortalRunner:
 
     def _open_login_from_public_landing(self, page: object) -> None:
         try:
-            page.get_by_text("登录", exact=True).last.click()
+            self._click(page.get_by_text("登录", exact=True).last, page=page)
         except Exception:
             self._click_text(page, "登录")
 
@@ -1167,7 +1175,7 @@ class TaxPortalRunner:
         )
         for locator in candidates:
             try:
-                locator.click(timeout=1000, force=True)
+                self._click(locator, page=page, timeout=1000, force=True)
                 return True
             except Exception:
                 continue
@@ -1299,12 +1307,32 @@ class TaxPortalRunner:
         except Exception:
             return False
 
-    @staticmethod
-    def _click_text(page: object, text: str) -> None:
+    def _click_text(self, page: object, text: str) -> None:
         try:
-            page.get_by_text(text, exact=True).click()
+            self._click(page.get_by_text(text, exact=True), page=page)
         except Exception:
-            page.get_by_text(text).first.click()
+            self._click(page.get_by_text(text).first, page=page)
+
+    @staticmethod
+    def _wait_before_browser_click(page: object | None) -> None:
+        wait_for_timeout = getattr(page, "wait_for_timeout", None)
+        if callable(wait_for_timeout):
+            wait_for_timeout(BROWSER_CLICK_DELAY_MS)
+            return
+        if page is None:
+            sleep(BROWSER_CLICK_DELAY_SECONDS)
+
+    def _click(self, target: object, *, page: object | None = None, **kwargs: object) -> None:
+        self._wait_before_browser_click(page or getattr(target, "page", None))
+        target.click(**kwargs)
+
+    def _check(self, target: object, *, page: object | None = None, **kwargs: object) -> None:
+        self._wait_before_browser_click(page or getattr(target, "page", None))
+        target.check(**kwargs)
+
+    def _mouse_click(self, page: object, x: int, y: int, **kwargs: object) -> None:
+        self._wait_before_browser_click(page)
+        page.mouse.click(x, y, **kwargs)
 
     @staticmethod
     def _visible_button(page: object, name: str) -> object:

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.models import AppConfig, StoreConfig
-from app.portal_runner import QR_REFRESH_GRACE_SECONDS, TaxPortalRunner
+from app.portal_runner import BROWSER_CLICK_DELAY_MS, QR_REFRESH_GRACE_SECONDS, TaxPortalRunner
 from app.state import StateStore
 
 
@@ -2573,6 +2573,80 @@ class PortalRunnerUrlTests(unittest.TestCase):
                 runner._ensure_batch_page_clean(page, "fuzzy")  # noqa: SLF001
 
             self.assertEqual("共 0 条", page.body_text)
+
+    def test_click_waits_one_second_before_click(self) -> None:
+        class FakePage:
+            def __init__(self, events: list[str]) -> None:
+                self.events = events
+
+            def wait_for_timeout(self, timeout_ms: int) -> None:
+                self.events.append(f"wait:{timeout_ms}")
+
+        class FakeTarget:
+            def __init__(self, page: FakePage, events: list[str]) -> None:
+                self.page = page
+                self.events = events
+
+            def click(self, timeout: int | None = None, force: bool = False) -> None:
+                self.events.append(f"click:{timeout}:{force}")
+
+        runner = TaxPortalRunner.__new__(TaxPortalRunner)
+        events: list[str] = []
+        page = FakePage(events)
+        target = FakeTarget(page, events)
+
+        runner._click(target, timeout=3000, force=True)  # noqa: SLF001
+
+        self.assertEqual([f"wait:{BROWSER_CLICK_DELAY_MS}", "click:3000:True"], events)
+
+    def test_check_waits_one_second_before_check(self) -> None:
+        class FakePage:
+            def __init__(self, events: list[str]) -> None:
+                self.events = events
+
+            def wait_for_timeout(self, timeout_ms: int) -> None:
+                self.events.append(f"wait:{timeout_ms}")
+
+        class FakeTarget:
+            def __init__(self, page: FakePage, events: list[str]) -> None:
+                self.page = page
+                self.events = events
+
+            def check(self, force: bool = False) -> None:
+                self.events.append(f"check:{force}")
+
+        runner = TaxPortalRunner.__new__(TaxPortalRunner)
+        events: list[str] = []
+        page = FakePage(events)
+        target = FakeTarget(page, events)
+
+        runner._check(target, force=True)  # noqa: SLF001
+
+        self.assertEqual([f"wait:{BROWSER_CLICK_DELAY_MS}", "check:True"], events)
+
+    def test_mouse_click_waits_one_second_before_click(self) -> None:
+        class FakeMouse:
+            def __init__(self, events: list[str]) -> None:
+                self.events = events
+
+            def click(self, x: int, y: int) -> None:
+                self.events.append(f"mouse_click:{x}:{y}")
+
+        class FakePage:
+            def __init__(self, events: list[str]) -> None:
+                self.events = events
+                self.mouse = FakeMouse(events)
+
+            def wait_for_timeout(self, timeout_ms: int) -> None:
+                self.events.append(f"wait:{timeout_ms}")
+
+        runner = TaxPortalRunner.__new__(TaxPortalRunner)
+        events: list[str] = []
+        page = FakePage(events)
+
+        runner._mouse_click(page, 55, 515)  # noqa: SLF001
+
+        self.assertEqual([f"wait:{BROWSER_CLICK_DELAY_MS}", "mouse_click:55:515"], events)
 
     def test_company_switch_candidates_fallback_to_verify_name(self) -> None:
         store = StoreConfig(
