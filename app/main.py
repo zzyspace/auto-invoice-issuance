@@ -323,7 +323,7 @@ def command_portal_issue(
             indent=2,
         )
     )
-    return 0 if all(result.status in {"validated", "success"} for result in results) else 1
+    return 0 if all(result.status in {"validated", "success", "skipped"} for result in results) else 1
 
 
 def main(argv: list[str] | None = None) -> int:

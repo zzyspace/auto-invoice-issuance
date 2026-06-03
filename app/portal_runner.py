@@ -209,6 +209,21 @@ class TaxPortalRunner:
                 f"sha256={result.workbook_sha256[:12]}"
             ),
         )
+        if not rows:
+            result.status = "skipped"
+            result.step = "skip_empty_workbook"
+            self._log(
+                store.store_key,
+                "step=skip_empty_workbook status=skipped workbook has no portal-issuable rows; skipping store",
+            )
+            self._update_store_step(
+                store.store_key,
+                result.step,
+                result.status,
+                workbook_sha256=result.workbook_sha256,
+                message="workbook has no portal-issuable rows; skipping store",
+            )
+            return self._finalize_result(result)
         try:
             if self.config.portal_browser_backend == "chrome_cdp":
                 home_page = self._find_attached_portal_page(context) or home_page

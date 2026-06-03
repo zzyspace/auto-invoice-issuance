@@ -1372,6 +1372,78 @@ class PortalRunnerUrlTests(unittest.TestCase):
             self.assertLess(events.index("wait_for_home_page_ready"), events.index("sleep_before_batch"))
             self.assertLess(events.index("sleep_before_batch"), events.index("new_page:attempt1"))
 
+    def test_run_store_skips_empty_workbook_before_opening_batch_page(self) -> None:
+        class FakeContext:
+            def __init__(self) -> None:
+                self.new_page_count = 0
+
+            def new_page(self) -> object:
+                self.new_page_count += 1
+                raise AssertionError("new_page should not be called for an empty workbook")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=tmp_path / "profile",
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+            store = StoreConfig(
+                store_key="fuzzy",
+                store_name="Fuzzy",
+                survey_id="1",
+                output_xlsx_path=tmp_path / "output.xlsx",
+                initial_last_processed_id=1,
+                portal_enabled=True,
+                portal_company_switch_name="厦门市思明区浮几创意餐厅",
+                portal_company_verify_name="厦门市思明区浮几创意餐厅",
+            )
+            summary = SimpleNamespace(row_count=0, total_amount_including_tax=Decimal("0.00"))
+            context = FakeContext()
+            home_page = object()
+
+            with patch("app.portal_runner.load_portal_issue_rows", return_value=[]):
+                with patch("app.portal_runner.summarize_portal_issue_rows", return_value=summary):
+                    with patch("app.portal_runner.sha256_file", return_value="abc123"):
+                        with patch.object(runner, "_goto") as mocked_goto:
+                            with patch.object(runner, "_ensure_logged_in") as mocked_ensure_logged_in:
+                                with patch.object(runner, "_ensure_company") as mocked_ensure_company:
+                                    with patch.object(runner, "_wait_for_home_page_ready") as mocked_wait_home_ready:
+                                        with patch.object(runner, "_wait_before_open_batch_page") as mocked_wait_before_batch:
+                                            with patch.object(runner, "_finalize_result", side_effect=lambda result: result):
+                                                with patch.object(runner, "_log"):
+                                                    result = runner._run_store(context, home_page, store)  # noqa: SLF001
+
+            self.assertEqual("skipped", result.status)
+            self.assertEqual("skip_empty_workbook", result.step)
+            self.assertEqual(0, result.expected_count)
+            self.assertEqual(0, context.new_page_count)
+            mocked_goto.assert_not_called()
+            mocked_ensure_logged_in.assert_not_called()
+            mocked_ensure_company.assert_not_called()
+            mocked_wait_home_ready.assert_not_called()
+            mocked_wait_before_batch.assert_not_called()
+
     def test_select_company_switch_row_waits_for_query_results_before_clicking_switch(self) -> None:
         class FakeLocator:
             def __init__(self, events: list[str]) -> None:

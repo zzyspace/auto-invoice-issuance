@@ -65,14 +65,15 @@ class BatchProcessor:
             csv_text = self.services.survey_client.export_csv(store)
             records = parse_survey_csv(csv_text)
             new_records = select_new_records(records, last_processed_id)
-            if not new_records:
+            if new_records:
+                invoices = self._normalize_records(store, new_records, result)
+                result.status = "success"
+                result.processed_count = len(invoices)
+                result.last_processed_id_after = max(record.submission_id for record in new_records)
+            else:
+                invoices = []
                 result.status = "no_new_data"
-                return result.finalize()
-            invoices = self._normalize_records(store, new_records, result)
             backup_result = self.services.excel_writer.write_store_workbook(store, invoices)
-            result.status = "success"
-            result.processed_count = len(invoices)
-            result.last_processed_id_after = max(record.submission_id for record in new_records)
             result.output_path = backup_result.output_path
             result.backup_path = backup_result.backup_path
             return result.finalize()

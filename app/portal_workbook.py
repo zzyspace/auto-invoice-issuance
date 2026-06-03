@@ -79,9 +79,6 @@ def load_portal_issue_rows(path: Path, block_on_empty_amount: bool = True) -> li
             )
         )
 
-    if not issue_rows:
-        raise ValueError(f"No portal-issuable rows found in workbook: {path}")
-
     issue_rows.sort(key=lambda row: _sort_key(row.invoice_serial))
     return issue_rows
 

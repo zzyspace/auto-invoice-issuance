@@ -74,8 +74,10 @@ class FakeTaxLookupClient:
 class FakeExcelWriter:
     def __init__(self, output_root: Path) -> None:
         self.output_root = output_root
+        self.calls: list[tuple[str, int]] = []
 
     def write_store_workbook(self, store: StoreConfig, invoices: list[object]) -> BackupResult:
+        self.calls.append((store.store_key, len(invoices)))
         output_path = self.output_root / f"{store.store_key}.xlsx"
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(str(len(invoices)), encoding="utf-8")
@@ -175,3 +177,38 @@ class BatchProcessorTests(unittest.TestCase):
                 processor.run([store])
 
             self.assertEqual(307, state_store.get_last_processed_id(store))
+
+    def test_no_new_data_still_writes_empty_workbook(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            store = StoreConfig(
+                store_key="store_a",
+                store_name="门店A",
+                survey_id="22512014",
+                output_xlsx_path=tmp_path / "out_a.xlsx",
+                initial_last_processed_id=307,
+            )
+            csv_text = CSV_TEMPLATE.format(
+                rows="307,2026/5/26 11:00,2026/5/26 11:01,31,吴翔,,a@example.com,a.png,,"
+            )
+            state_store = StateStore(tmp_path / "state.db")
+            excel_writer = FakeExcelWriter(tmp_path / "outputs")
+            processor = BatchProcessor(
+                Services(
+                    survey_client=FakeSurveyClient({"store_a": csv_text}),
+                    vision_client=FakeVisionClient(),
+                    tax_lookup_client=FakeTaxLookupClient(),
+                    excel_writer=excel_writer,
+                    state_store=state_store,
+                    mailer=FakeMailer(),
+                )
+            )
+
+            summary = processor.run([store])
+
+            self.assertEqual(1, len(summary.no_new_data))
+            self.assertEqual("store_a", summary.no_new_data[0].store_key)
+            self.assertEqual([("store_a", 0)], excel_writer.calls)
+            self.assertEqual(307, state_store.get_last_processed_id(store))
+            self.assertEqual("0", (tmp_path / "outputs" / "store_a.xlsx").read_text(encoding="utf-8"))
+            self.assertEqual(tmp_path / "outputs" / "store_a.xlsx", summary.no_new_data[0].output_path)

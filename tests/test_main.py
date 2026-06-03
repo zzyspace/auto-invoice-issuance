@@ -12,6 +12,7 @@ from app.main import (
     _resolve_portal_issue_config,
     _select_portal_stores,
     build_parser,
+    command_portal_issue,
     command_portal_open_chrome_cdp,
     command_portal_sync,
 )
@@ -235,6 +236,41 @@ stores:
             mocked_popen.assert_not_called()
             payload = json.loads(mocked_print.call_args.args[0])
             self.assertFalse(payload["launched"])
+
+    def test_command_portal_issue_treats_skipped_store_as_success(self) -> None:
+        fake_config = MagicMock()
+        fake_config.stores_config_path = Path("/tmp/stores.yaml")
+        fake_config.state_db_path = Path("/tmp/state.db")
+        selected_store = MagicMock()
+        skipped_result = MagicMock(
+            store_key="fuzzy",
+            company_verify_name="Fuzzy",
+            mode="dry_run",
+            status="skipped",
+            step="skip_empty_workbook",
+            expected_count=0,
+            submitted_count=0,
+            success_count=0,
+            failure_count=0,
+            error=None,
+            artifacts_dir=None,
+        )
+
+        with patch("app.main.load_app_config", return_value=fake_config):
+            with patch("app.main.load_store_configs", return_value=[selected_store]):
+                with patch("app.main._select_portal_stores", return_value=[selected_store]):
+                    with patch("app.main.StateStore"):
+                        with patch("app.portal_runner.TaxPortalRunner") as mocked_runner_cls:
+                            mocked_runner_cls.return_value.run.return_value = [skipped_result]
+                            with patch("builtins.print"):
+                                exit_code = command_portal_issue(
+                                    Path("/tmp/.env"),
+                                    store_keys=["fuzzy"],
+                                    submit=False,
+                                    skip_sync=False,
+                                )
+
+        self.assertEqual(0, exit_code)
 
     def test_select_portal_stores_orders_by_priority(self) -> None:
         class FakeStore:

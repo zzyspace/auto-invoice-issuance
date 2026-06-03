@@ -5,7 +5,7 @@ import unittest
 from decimal import Decimal
 from pathlib import Path
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
 from app.portal_workbook import load_portal_issue_rows, sha256_file, summarize_portal_issue_rows
 
@@ -80,3 +80,23 @@ class PortalWorkbookTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "missing 金额"):
                 load_portal_issue_rows(workbook_path, block_on_empty_amount=True)
+
+    def test_load_portal_issue_rows_returns_empty_list_for_cleared_template(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workbook_path = Path(tmp_dir) / "portal.xlsx"
+            build_portal_workbook(workbook_path)
+
+            workbook = load_workbook(workbook_path)
+            for sheet_name in ("1-发票基本信息", "2-发票明细信息"):
+                sheet = workbook[sheet_name]
+                for row in range(4, sheet.max_row + 1):
+                    for column in range(1, sheet.max_column + 1):
+                        sheet.cell(row, column).value = None
+            workbook.save(workbook_path)
+
+            rows = load_portal_issue_rows(workbook_path, block_on_empty_amount=False)
+            summary = summarize_portal_issue_rows(rows)
+
+            self.assertEqual([], rows)
+            self.assertEqual(0, summary.row_count)
+            self.assertEqual(Decimal("0.00"), summary.total_amount_including_tax)
