@@ -241,7 +241,7 @@ env -u http_proxy -u https_proxy PLAYWRIGHT_BROWSERS_PATH=./data/ms-playwright .
 
 - 允许当前终端 / Python 进程使用“辅助功能”和“自动化”
 - 完成一次 `照片` app 首次初始化
-- 允许 `osascript` 控制 `照片`；二维码导入现在走后台导入优先，但仍依赖这项自动化权限
+- 二维码导入现在通过 Launch Services 后台交给 `照片` app 打开/导入，不再依赖 `osascript -> 照片` 的 Automation 授权
 - 确保税务验证码会同步到 macOS `信息`
 - 首次使用时，建议先手工确认 `电子税务局` app 的短信登录、身份类型选择、指纹提示、扫码页、内部照片选择器都能正常出现
 

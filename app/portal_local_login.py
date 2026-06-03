@@ -503,17 +503,6 @@ class PortalMacLoginAutomator:
                 "macOS Accessibility is not enabled for the Python process that runs tax-portal. "
                 "Enable Accessibility for the actual Python executable used by ./tax-portal, then retry."
             )
-        try:
-            self._run_applescript(
-                'tell application "Photos" to count media items',
-                timeout_seconds=5.0,
-            )
-        except PortalLocalLoginError as exc:
-            raise PortalLocalLoginError(
-                "Photos automation is not available for osascript. "
-                "Grant osascript Automation access to Photos, then retry. "
-                f"Original error: {exc}"
-            ) from exc
 
     def _capture_qr_code(self, page: object, artifacts_dir: Path | None) -> Path:
         self._log("capturing tax portal login QR")
@@ -545,12 +534,16 @@ class PortalMacLoginAutomator:
 
     def _import_qr_into_photos(self, qr_path: Path) -> None:
         self._log(f"importing tax portal login QR into Photos path={qr_path}")
-        script = f"""
-        tell application "Photos"
-            import POSIX file {self._apple_string(str(qr_path))} skip check duplicates yes
-        end tell
-        """
-        self._run_applescript(script, timeout_seconds=UI_ACTION_TIMEOUT_SECONDS)
+        try:
+            self._run_command(
+                ["open", "-g", "-a", "Photos", str(qr_path)],
+                timeout_seconds=UI_ACTION_TIMEOUT_SECONDS,
+            )
+        except PortalLocalLoginError as exc:
+            raise PortalLocalLoginError(
+                "Failed to hand tax portal QR image to Photos via Launch Services. "
+                f"Original error: {exc}"
+            ) from exc
         sleep(PHOTOS_IMPORT_SETTLE_SECONDS)
         self._log("imported tax portal login QR into Photos")
 
@@ -1404,28 +1397,6 @@ class PortalMacLoginAutomator:
         except subprocess.TimeoutExpired as exc:
             raise PortalLocalLoginError(f"Command timed out: {' '.join(command)}") from exc
         return (completed.stdout or "").strip()
-
-    def _run_applescript(self, script: str, *, timeout_seconds: float) -> str:
-        try:
-            completed = subprocess.run(
-                ["osascript", "-"],
-                input=script,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
-            )
-        except subprocess.CalledProcessError as exc:
-            stderr = (exc.stderr or "").strip()
-            raise PortalLocalLoginError(stderr or "AppleScript command failed.") from exc
-        except subprocess.TimeoutExpired as exc:
-            raise PortalLocalLoginError("AppleScript command timed out.") from exc
-        return (completed.stdout or "").strip()
-
-    @staticmethod
-    def _apple_string(value: str) -> str:
-        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-        return f'"{escaped}"'
 
     def _log(self, message: str) -> None:
         self._logger(self.store_key, message)

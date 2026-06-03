@@ -250,25 +250,22 @@ class PortalLocalLoginTests(unittest.TestCase):
         self.assertTrue(clicked)
         self.assertEqual(["click:照片"], events)
 
-    def test_import_qr_into_photos_avoids_foreground_activation(self) -> None:
+    def test_import_qr_into_photos_uses_launch_services_open_in_background(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
             config = self._build_config(tmp_path)
             automator = PortalMacLoginAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
-            scripts: list[str] = []
+            commands: list[list[str]] = []
 
             with patch.object(
                 automator,
-                "_run_applescript",
-                side_effect=lambda script, timeout_seconds: scripts.append(script) or "",
+                "_run_command",
+                side_effect=lambda command, timeout_seconds: commands.append(command) or "",
             ):
                 with patch("app.portal_local_login.sleep", return_value=None):
                     automator._import_qr_into_photos(tmp_path / "login-qr.png")  # noqa: SLF001
 
-        self.assertEqual(1, len(scripts))
-        self.assertIn('tell application "Photos"', scripts[0])
-        self.assertIn("import POSIX file", scripts[0])
-        self.assertNotIn("activate", scripts[0])
+        self.assertEqual([["open", "-g", "-a", "Photos", str(tmp_path / "login-qr.png")]], commands)
 
     def test_wait_for_login_confirmation_ready_raises_on_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -574,15 +571,23 @@ class PortalLocalLoginTests(unittest.TestCase):
             config = self._build_config(tmp_path)
             automator = PortalMacLoginAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
 
-            with patch.object(
-                automator,
-                "_run_applescript",
-                side_effect=PortalLocalLoginError("execution error -10827"),
-            ):
+            with patch.object(automator._ax, "is_process_trusted", return_value=False):
                 with self.assertRaises(PortalLocalLoginError) as ctx:
                     automator._verify_gui_automation_prerequisites()  # noqa: SLF001
 
         self.assertIn("Python process that runs tax-portal", str(ctx.exception))
+
+    def test_verify_gui_automation_prerequisites_stops_after_accessibility_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = self._build_config(tmp_path)
+            automator = PortalMacLoginAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
+
+            with patch.object(automator._ax, "is_process_trusted", return_value=True):
+                with patch.object(automator, "_run_command") as mocked_run_command:
+                    automator._verify_gui_automation_prerequisites()  # noqa: SLF001
+
+        mocked_run_command.assert_not_called()
 
     def test_set_text_input_value_falls_back_to_keyboard_input(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

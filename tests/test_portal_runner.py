@@ -2264,6 +2264,64 @@ class PortalRunnerUrlTests(unittest.TestCase):
                 mocked_wait_text.call_args_list,
             )
 
+    def test_wait_for_home_page_shell_ready_uses_minimum_60_second_timeout(self) -> None:
+        class FakePage:
+            def __init__(self) -> None:
+                self.load_states: list[tuple[str, int]] = []
+
+            def wait_for_load_state(self, state: str, timeout: int) -> None:
+                self.load_states.append((state, timeout))
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=tmp_path / "profile",
+                portal_action_timeout_ms=30000,
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+            page = FakePage()
+
+            with patch.object(runner, "_wait_for_text") as mocked_wait_text:
+                with patch.object(runner, "_body_text", return_value="首页 我要办税"):
+                    with patch.object(runner, "_log"):
+                        runner._wait_for_home_page_shell_ready(page, "peanut")  # noqa: SLF001
+
+            self.assertEqual(
+                [
+                    ("domcontentloaded", 60000),
+                    ("load", 60000),
+                    ("networkidle", 60000),
+                ],
+                page.load_states,
+            )
+            self.assertEqual(
+                [
+                    ((page, "我要办税"), {"timeout_ms": 60000}),
+                ],
+                mocked_wait_text.call_args_list,
+            )
+
     def test_run_store_waits_for_home_page_before_opening_batch_page(self) -> None:
         class FakeBatchPage:
             def __init__(self, events: list[str]) -> None:

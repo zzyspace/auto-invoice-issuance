@@ -27,6 +27,7 @@ HOME_PAGE_BEFORE_BATCH_PAGE_DELAY_SECONDS = 3.0
 POST_SUBMIT_SUCCESS_WAIT_SECONDS = 3.0
 BROWSER_CLICK_DELAY_MS = 1000
 BROWSER_CLICK_DELAY_SECONDS = BROWSER_CLICK_DELAY_MS / 1000
+HOME_PAGE_SHELL_MIN_TIMEOUT_MS = 60000
 BROWSER_SESSION_SYNC_ENTRIES = (
     "Cookies",
     "Cookies-journal",
@@ -519,8 +520,13 @@ class TaxPortalRunner:
         content_predicate: Callable[[], bool] | None = None,
         content_message: str | None = None,
         wait_for_load_states: bool = True,
+        timeout_ms_override: int | None = None,
     ) -> None:
-        timeout_ms = self.config.portal_action_timeout_ms
+        timeout_ms = (
+            timeout_ms_override
+            if timeout_ms_override is not None
+            else self.config.portal_action_timeout_ms
+        )
         self._log(store_key, f"waiting for {page_name} elements and requests to finish loading")
         if wait_for_load_states:
             for state in ("domcontentloaded", "load"):
@@ -555,6 +561,7 @@ class TaxPortalRunner:
             store_key,
             "authenticated home page shell",
             required_texts=("我要办税",),
+            timeout_ms_override=max(self.config.portal_action_timeout_ms, HOME_PAGE_SHELL_MIN_TIMEOUT_MS),
         )
 
     def _wait_for_home_page_ready(self, page: object, store: StoreConfig) -> None:
