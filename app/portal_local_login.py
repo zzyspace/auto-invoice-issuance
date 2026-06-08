@@ -24,6 +24,7 @@ OTP_AUTOFILL_TIMEOUT_SECONDS = 20.0
 OTP_MESSAGES_FALLBACK_TIMEOUT_SECONDS = 60.0
 PHOTOS_IMPORT_SETTLE_SECONDS = 1.0
 QR_MIN_DIMENSION_PX = 120
+QR_CAPTURE_RETRY_DELAY_SECONDS = 3.0
 OTP_REGEX = re.compile(r"【厦门税务】您的验证码是[:：]\s*(\d{6})")
 OTP_DIGITS_REGEX = re.compile(r"(?<!\d)(\d{6})(?!\d)")
 SMS_RESEND_COUNTDOWN_REGEX = re.compile(r"\d+秒重新获取")
@@ -509,6 +510,19 @@ class PortalMacLoginAutomator:
         target_dir = artifacts_dir or Path(mkdtemp(prefix="portal-local-login-"))
         ensure_parent_dir(target_dir / "placeholder.txt")
         target = target_dir / "login-qr.png"
+        if self._try_capture_qr_code(page, target):
+            self._log(f"captured tax portal login QR path={target}")
+            return target
+        self._log(
+            f"tax portal login QR not ready; waiting {QR_CAPTURE_RETRY_DELAY_SECONDS:.0f}s before retry"
+        )
+        sleep(QR_CAPTURE_RETRY_DELAY_SECONDS)
+        if self._try_capture_qr_code(page, target):
+            self._log(f"captured tax portal login QR path={target}")
+            return target
+        raise PortalLocalLoginError("Failed to locate a visible QR element on the tax portal login page.")
+
+    def _try_capture_qr_code(self, page: object, target: Path) -> bool:
         for selector in QR_LOCATOR_CANDIDATES:
             locator = getattr(page, "locator")(selector)
             try:
@@ -526,11 +540,10 @@ class PortalMacLoginAutomator:
                     if box.get("width", 0) < QR_MIN_DIMENSION_PX or box.get("height", 0) < QR_MIN_DIMENSION_PX:
                         continue
                     candidate.screenshot(path=str(target))
-                    self._log(f"captured tax portal login QR path={target}")
-                    return target
+                    return True
                 except Exception:
                     continue
-        raise PortalLocalLoginError("Failed to locate a visible QR element on the tax portal login page.")
+        return False
 
     def _import_qr_into_photos(self, qr_path: Path) -> None:
         self._log(f"importing tax portal login QR into Photos path={qr_path}")
