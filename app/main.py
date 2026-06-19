@@ -313,6 +313,17 @@ def command_portal_issue(
                     "submitted_count": result.submitted_count,
                     "success_count": result.success_count,
                     "failure_count": result.failure_count,
+                    "failed_details": [
+                        {
+                            "invoice_serial": detail.invoice_serial,
+                            "digital_invoice_number": detail.digital_invoice_number,
+                            "buyer_email": detail.buyer_email,
+                            "status": detail.status,
+                            "failure_reason": detail.failure_reason,
+                        }
+                        for detail in result.details
+                        if detail.status == "失败"
+                    ],
                     "skip_sync": skip_sync,
                     "error": result.error,
                     "artifacts_dir": str(result.artifacts_dir) if result.artifacts_dir else None,

@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from app.models import AppConfig, StoreConfig
+from app.models import AppConfig, PortalIssueDetail, StoreConfig
 from app.portal_runner import BROWSER_CLICK_DELAY_MS, QR_REFRESH_GRACE_SECONDS, TaxPortalRunner
 from app.state import StateStore
 
@@ -1844,12 +1844,117 @@ class PortalRunnerUrlTests(unittest.TestCase):
             with patch.object(runner, "_wait_until", side_effect=fake_wait_until):
                 with patch.object(runner, "_wait_for_result_modal_ready", side_effect=fake_wait_ready):
                     with patch.object(runner, "_body_text", side_effect=fake_body_text):
-                        details, success_count, failure_count = runner._wait_for_result_modal(object(), "fuzzy")  # noqa: SLF001
+                        details, success_count, failure_count, modal_text = runner._wait_for_result_modal(  # noqa: SLF001
+                            object(),
+                            "fuzzy",
+                        )
 
             self.assertLess(events.index("wait_result_modal_ready"), events.index("read_result_body_parse"))
             self.assertEqual(1, success_count)
             self.assertEqual(0, failure_count)
             self.assertEqual(1, len(details))
+            self.assertEqual(body_text, modal_text)
+
+    def test_wait_for_result_modal_parses_failed_row_with_failure_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=tmp_path / "profile",
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+            body_text = (
+                "批量开具结果 开具成功发票0份 开具失败发票1份 "
+                "1 1 普通发票 - 218.16 3341663489@qq.com 失败 购买方纳税人识别号有误 共 1 条"
+            )
+
+            with patch.object(runner, "_wait_until", side_effect=lambda predicate, **_: self.assertTrue(predicate())):
+                with patch.object(runner, "_wait_for_result_modal_ready"):
+                    with patch.object(runner, "_body_text", return_value=body_text):
+                        details, success_count, failure_count, modal_text = runner._wait_for_result_modal(  # noqa: SLF001
+                            object(),
+                            "fuzzy",
+                        )
+
+            self.assertEqual(0, success_count)
+            self.assertEqual(1, failure_count)
+            self.assertEqual(body_text, modal_text)
+            self.assertEqual(1, len(details))
+            self.assertEqual("1", details[0].invoice_serial)
+            self.assertEqual("失败", details[0].status)
+            self.assertIsNone(details[0].digital_invoice_number)
+            self.assertEqual("3341663489@qq.com", details[0].buyer_email)
+            self.assertEqual("购买方纳税人识别号有误", details[0].failure_reason)
+
+    def test_capture_submit_result_artifacts_writes_screenshot_and_text(self) -> None:
+        class FakePage:
+            def screenshot(self, path: str, full_page: bool) -> None:
+                self.captured_path = path
+                self.full_page = full_page
+                Path(path).write_text("fake image", encoding="utf-8")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=tmp_path / "profile",
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+            page = FakePage()
+            artifacts_dir = tmp_path / "artifacts"
+
+            runner._capture_submit_result_artifacts(  # noqa: SLF001
+                page,
+                artifacts_dir,
+                "fuzzy",
+                "批量开具结果\n开具成功发票0份\n开具失败发票1份",
+            )
+
+            self.assertTrue((artifacts_dir / "fuzzy-submit-result.png").exists())
+            self.assertEqual(
+                "批量开具结果\n开具成功发票0份\n开具失败发票1份",
+                (artifacts_dir / "fuzzy-submit-result.txt").read_text(encoding="utf-8"),
+            )
 
     def test_ensure_company_returns_when_company_appears_after_home_page_settles(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2620,7 +2725,7 @@ class PortalRunnerUrlTests(unittest.TestCase):
                                                                             with patch.object(
                                                                                 runner,
                                                                                 "_wait_for_result_modal",
-                                                                                return_value=([], 1, 0),
+                                                                                return_value=([], 1, 0, "批量开具结果"),
                                                                             ):
                                                                                 with patch.object(
                                                                                     runner,
@@ -2636,6 +2741,113 @@ class PortalRunnerUrlTests(unittest.TestCase):
 
             self.assertEqual("success", result.status)
             self.assertIn("sleep:3.0", events)
+
+    def test_run_store_captures_submit_result_artifacts_when_portal_reports_failures(self) -> None:
+        class FakeBatchPage:
+            def __init__(self, events: list[str]) -> None:
+                self.events = events
+
+            def set_default_timeout(self, timeout: int) -> None:
+                self.events.append(f"set_default_timeout:{timeout}")
+
+            def close(self) -> None:
+                self.events.append("close_batch_page")
+
+        class FakeContext:
+            def __init__(self, events: list[str]) -> None:
+                self.events = events
+
+            def new_page(self) -> FakeBatchPage:
+                self.events.append("new_page")
+                return FakeBatchPage(self.events)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=tmp_path / "profile",
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=True)
+            store = StoreConfig(
+                store_key="fuzzy",
+                store_name="Fuzzy",
+                survey_id="1",
+                output_xlsx_path=tmp_path / "output.xlsx",
+                initial_last_processed_id=1,
+                portal_enabled=True,
+                portal_company_switch_name="厦门市思明区浮几创意餐厅",
+                portal_company_verify_name="厦门市思明区浮几创意餐厅",
+            )
+            summary = SimpleNamespace(row_count=1, total_amount_including_tax=Decimal("123.45"))
+            rows = [object()]
+            home_page = object()
+            detail = PortalIssueDetail(
+                invoice_serial="1",
+                digital_invoice_number=None,
+                buyer_email="demo@example.com",
+                status="失败",
+                failure_reason="购买方纳税人识别号有误",
+            )
+            events: list[str] = []
+
+            with patch("app.portal_runner.load_portal_issue_rows", return_value=rows):
+                with patch("app.portal_runner.summarize_portal_issue_rows", return_value=summary):
+                    with patch("app.portal_runner.sha256_file", return_value="abc123"):
+                        with patch.object(runner, "_goto"):
+                            with patch.object(runner, "_ensure_logged_in", return_value=home_page):
+                                with patch.object(runner, "_ensure_company", return_value=home_page):
+                                    with patch.object(runner, "_wait_for_home_page_ready"):
+                                        with patch.object(runner, "_wait_before_open_batch_page"):
+                                            with patch.object(runner, "_install_network_diag"):
+                                                with patch.object(runner, "_wait_for_batch_page", side_effect=lambda page, *_: page):
+                                                    with patch.object(runner, "_ensure_batch_page_clean"):
+                                                        with patch.object(runner, "_import_workbook"):
+                                                            with patch.object(runner, "_select_all_rows"):
+                                                                with patch.object(runner, "_open_submit_confirmation"):
+                                                                    with patch.object(runner, "_confirm_submit"):
+                                                                        with patch.object(
+                                                                            runner,
+                                                                            "_wait_for_result_modal",
+                                                                            return_value=([detail], 0, 1, "批量开具结果 失败"),
+                                                                        ):
+                                                                            with patch.object(
+                                                                                runner,
+                                                                                "_capture_submit_result_artifacts",
+                                                                            ) as mocked_capture:
+                                                                                with patch.object(
+                                                                                    runner,
+                                                                                    "_finalize_result",
+                                                                                    side_effect=lambda result: result,
+                                                                                ):
+                                                                                    with patch.object(runner, "_log"):
+                                                                                        result = runner._run_store(  # noqa: SLF001
+                                                                                            FakeContext(events),
+                                                                                            home_page,
+                                                                                            store,
+                                                                                        )
+
+            self.assertEqual("failed", result.status)
+            mocked_capture.assert_called_once()
 
     def test_ensure_batch_page_clean_clears_existing_imported_rows(self) -> None:
         class FakeButton:

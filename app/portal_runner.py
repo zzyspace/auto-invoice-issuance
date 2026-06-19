@@ -281,13 +281,30 @@ class TaxPortalRunner:
                     summary.total_amount_including_tax,
                 )
                 self._confirm_submit(batch_page)
-                details, success_count, failure_count = self._wait_for_result_modal(batch_page, store.store_key)
+                details, success_count, failure_count, result_modal_text = self._wait_for_result_modal(
+                    batch_page,
+                    store.store_key,
+                )
                 result.details = tuple(details)
                 result.submitted_count = summary.row_count
                 result.success_count = success_count
                 result.failure_count = failure_count
                 result.status = "success" if failure_count == 0 else "failed"
                 result.step = "submit_result"
+                if failure_count > 0:
+                    self._capture_submit_result_artifacts(
+                        batch_page,
+                        result.artifacts_dir,
+                        store.store_key,
+                        result_modal_text,
+                    )
+                    parsed_failed_details = [detail for detail in details if detail.status == "失败"]
+                    if len(parsed_failed_details) < failure_count:
+                        self._log(
+                            store.store_key,
+                            "submit result reported failures but parsed fewer failed detail rows than expected; "
+                            "saved submit result artifacts for manual inspection",
+                        )
                 self._log(
                     store.store_key,
                     f"step=submit_result status={result.status} "
@@ -841,35 +858,140 @@ class TaxPortalRunner:
         confirm_button = self._visible_button_in_dialog(page, "本次勾选批量开具发票", "确定")
         self._click(confirm_button, page=page)
 
-    def _wait_for_result_modal(self, page: object, store_key: str) -> tuple[list[PortalIssueDetail], int, int]:
+    def _wait_for_result_modal(self, page: object, store_key: str) -> tuple[list[PortalIssueDetail], int, int, str]:
         self._wait_until(
             lambda: "批量开具结果" in self._body_text(page),
             timeout_seconds=90,
             message="wait for portal issue result",
         )
         self._wait_for_result_modal_ready(page, store_key)
-        body_text = self._body_text(page)
-        match = re.search(r"开具成功发票(\d+)份.*?开具失败发票(\d+)份", body_text)
+        modal_text = self._result_modal_text(page)
+        compact_text = re.sub(r"\s+", "", modal_text)
+        match = re.search(r"开具成功发票(\d+)份.*?开具失败发票(\d+)份", compact_text)
         if not match:
             raise PortalRunnerError("Could not parse portal issue result summary.")
         success_count = int(match.group(1))
         failure_count = int(match.group(2))
-        detail_pattern = re.compile(
-            r"(\d+)\s+(\d+)\s+普通发票\s+(\d{20})\s+([0-9]+(?:\.[0-9]+)?)\s+(\S+@\S+)\s+(成功|失败)\s+(-|[^0-9]+?)(?=\s+\d+\s+\d+\s+普通发票|\s+共\s+\d+\s+条|$)"
-        )
-        details: list[PortalIssueDetail] = []
-        for invoice_index, invoice_serial, digital_number, _amount, email, status, failure_reason in detail_pattern.findall(body_text):
-            _ = invoice_index
-            details.append(
-                PortalIssueDetail(
-                    invoice_serial=invoice_serial,
-                    digital_invoice_number=digital_number,
-                    buyer_email=email,
-                    status=status,
-                    failure_reason=None if failure_reason == "-" else failure_reason.strip(),
+        details = self._parse_result_modal_details(modal_text)
+        return details, success_count, failure_count, modal_text
+
+    @staticmethod
+    def _normalize_modal_text(text: str) -> str:
+        return re.sub(r"\s+", " ", text or "").strip()
+
+    def _result_modal_text(self, page: object) -> str:
+        if hasattr(page, "locator"):
+            try:
+                dialog = page.locator('[role="dialog"], .el-message-box, .el-dialog__wrapper').filter(
+                    has_text="批量开具结果"
                 )
-            )
-        return details, success_count, failure_count
+                count = dialog.count()
+                for index in range(count):
+                    candidate_dialog = dialog.nth(index)
+                    if not candidate_dialog.is_visible():
+                        continue
+                    text = candidate_dialog.inner_text()
+                    if text.strip():
+                        return text
+                fallback = dialog.last.inner_text()
+                if fallback.strip():
+                    return fallback
+            except Exception:
+                pass
+        return self._body_text(page)
+
+    def _parse_result_modal_details(self, modal_text: str) -> list[PortalIssueDetail]:
+        details: list[PortalIssueDetail] = []
+        for segment in self._result_detail_segments(modal_text):
+            detail = self._parse_result_detail_segment(segment)
+            if detail is not None:
+                details.append(detail)
+        return details
+
+    def _result_detail_segments(self, modal_text: str) -> list[str]:
+        line_segments = [
+            self._normalize_modal_text(line)
+            for line in (modal_text or "").splitlines()
+            if self._normalize_modal_text(line)
+        ]
+        parsed_lines = [segment for segment in line_segments if self._looks_like_result_detail_segment(segment)]
+        if parsed_lines:
+            return parsed_lines
+
+        normalized = self._normalize_modal_text(modal_text)
+        if not normalized:
+            return []
+
+        row_start_pattern = re.compile(r"(?<!\S)\d+\s+\d+\s+普通发票\b")
+        matches = list(row_start_pattern.finditer(normalized))
+        if not matches:
+            return []
+
+        total_pattern = re.compile(r"\s+共\s*\d+\s*条")
+        segments: list[str] = []
+        for index, match in enumerate(matches):
+            start = match.start()
+            if index + 1 < len(matches):
+                end = matches[index + 1].start()
+            else:
+                total_match = total_pattern.search(normalized, pos=start)
+                end = total_match.start() if total_match else len(normalized)
+            segment = normalized[start:end].strip()
+            if segment:
+                segments.append(segment)
+        return segments
+
+    @staticmethod
+    def _looks_like_result_detail_segment(segment: str) -> bool:
+        normalized = TaxPortalRunner._normalize_modal_text(segment)
+        return bool(
+            re.match(r"^\d+\s+\d+\s+普通发票\b", normalized)
+            and re.search(r"\b(成功|失败)\b", normalized)
+        )
+
+    @staticmethod
+    def _looks_like_amount_token(token: str) -> bool:
+        return bool(re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", token))
+
+    def _parse_result_detail_segment(self, segment: str) -> PortalIssueDetail | None:
+        normalized = self._normalize_modal_text(segment)
+        match = re.match(r"^(?P<row_index>\d+)\s+(?P<invoice_serial>\d+)\s+普通发票\s+(?P<tail>.+)$", normalized)
+        if not match:
+            return None
+        tokens = match.group("tail").split(" ")
+        status_index: int | None = None
+        for index in range(len(tokens) - 1, -1, -1):
+            if tokens[index] in {"成功", "失败"}:
+                status_index = index
+                break
+        if status_index is None:
+            return None
+
+        status = tokens[status_index]
+        failure_reason_text = " ".join(tokens[status_index + 1 :]).strip()
+        failure_reason = None if not failure_reason_text or failure_reason_text == "-" else failure_reason_text
+
+        cursor = status_index - 1
+        buyer_email: str | None = None
+        if cursor >= 0 and ("@" in tokens[cursor] or tokens[cursor] == "-"):
+            buyer_email = None if tokens[cursor] == "-" else tokens[cursor]
+            cursor -= 1
+
+        if cursor >= 0 and self._looks_like_amount_token(tokens[cursor]):
+            cursor -= 1
+
+        digital_invoice_number: str | None = None
+        if cursor >= 0:
+            digital_token = tokens[cursor]
+            digital_invoice_number = None if digital_token == "-" else digital_token
+
+        return PortalIssueDetail(
+            invoice_serial=match.group("invoice_serial"),
+            digital_invoice_number=digital_invoice_number,
+            buyer_email=buyer_email,
+            status=status,
+            failure_reason=failure_reason,
+        )
 
     def _prepare_artifacts_dir(self, store_key: str) -> Path:
         timestamp = Path(str(int(monotonic() * 1000)))
@@ -887,6 +1009,28 @@ class TaxPortalRunner:
             page.screenshot(path=str(target), full_page=True)
         except Exception:
             return
+
+    @staticmethod
+    def _write_artifact_text(artifacts_dir: Path | None, filename: str, text: str) -> None:
+        if artifacts_dir is None:
+            return
+        ensure_parent_dir(artifacts_dir / "placeholder.txt")
+        target = artifacts_dir / filename
+        try:
+            target.write_text(text, encoding="utf-8")
+        except Exception:
+            return
+
+    def _capture_submit_result_artifacts(
+        self,
+        page: object,
+        artifacts_dir: Path | None,
+        store_key: str,
+        modal_text: str,
+    ) -> None:
+        stem = f"{store_key}-submit-result"
+        self._capture_artifact(page, artifacts_dir, stem)
+        self._write_artifact_text(artifacts_dir, f"{stem}.txt", modal_text)
 
     @staticmethod
     def _log(store_key: str, message: str) -> None:

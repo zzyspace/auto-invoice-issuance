@@ -75,9 +75,11 @@ class FakeExcelWriter:
     def __init__(self, output_root: Path) -> None:
         self.output_root = output_root
         self.calls: list[tuple[str, int]] = []
+        self.last_invoices_by_store: dict[str, list[object]] = {}
 
     def write_store_workbook(self, store: StoreConfig, invoices: list[object]) -> BackupResult:
         self.calls.append((store.store_key, len(invoices)))
+        self.last_invoices_by_store[store.store_key] = list(invoices)
         output_path = self.output_root / f"{store.store_key}.xlsx"
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(str(len(invoices)), encoding="utf-8")
@@ -212,3 +214,59 @@ class BatchProcessorTests(unittest.TestCase):
             self.assertEqual(307, state_store.get_last_processed_id(store))
             self.assertEqual("0", (tmp_path / "outputs" / "store_a.xlsx").read_text(encoding="utf-8"))
             self.assertEqual(tmp_path / "outputs" / "store_a.xlsx", summary.no_new_data[0].output_path)
+
+    def test_invalid_enterprise_tax_id_uses_lookup_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            store = StoreConfig(
+                store_key="store_a",
+                store_name="门店A",
+                survey_id="22512014",
+                output_xlsx_path=tmp_path / "out_a.xlsx",
+                initial_last_processed_id=307,
+            )
+            csv_text = CSV_TEMPLATE.format(
+                rows=(
+                    "308,2026/5/26 11:00,2026/5/26 11:01,31,"
+                    "厦门宏发美电子有限公司,9135020376929010,a@example.com,a.png,,"
+                )
+            )
+            state_store = StateStore(tmp_path / "state.db")
+            excel_writer = FakeExcelWriter(tmp_path / "outputs")
+
+            class RecordingTaxLookupClient:
+                def __init__(self) -> None:
+                    self.calls: list[str] = []
+
+                def lookup(self, company_name: str) -> TaxLookupResult:
+                    self.calls.append(company_name)
+                    return TaxLookupResult(
+                        provider="fake",
+                        status="success",
+                        tax_id="91350203769290107U",
+                        matched_name=company_name,
+                        candidate_count=1,
+                        message="ok",
+                    )
+
+            tax_lookup_client = RecordingTaxLookupClient()
+            processor = BatchProcessor(
+                Services(
+                    survey_client=FakeSurveyClient({"store_a": csv_text}),
+                    vision_client=FakeVisionClient(),
+                    tax_lookup_client=tax_lookup_client,
+                    excel_writer=excel_writer,
+                    state_store=state_store,
+                    mailer=FakeMailer(),
+                )
+            )
+
+            summary = processor.run([store])
+
+            self.assertEqual(["厦门宏发美电子有限公司"], tax_lookup_client.calls)
+            written_invoices = excel_writer.last_invoices_by_store["store_a"]
+            self.assertEqual(1, len(written_invoices))
+            self.assertEqual("91350203769290107U", written_invoices[0].tax_id)
+            self.assertTrue(
+                any("已改用查询结果" in warning for warning in summary.succeeded[0].warnings)
+            )

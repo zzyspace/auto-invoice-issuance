@@ -10,7 +10,12 @@ from app.models import BatchRunSummary, NormalizedInvoice, StoreConfig, StoreRun
 from app.state import StateStore
 from app.survey_client import TencentSurveyClient
 from app.tax_lookup import TaxLookupClient
-from app.utils import format_decimal_text, looks_like_natural_person, normalize_tax_id
+from app.utils import (
+    format_decimal_text,
+    looks_like_natural_person,
+    looks_like_valid_enterprise_tax_id,
+    normalize_tax_id,
+)
 from app.vision_client import OpenAICompatibleVisionClient
 
 
@@ -92,18 +97,42 @@ class BatchProcessor:
         for index, record in enumerate(records, start=1):
             warnings: list[str] = []
             natural_person = looks_like_natural_person(record.invoice_title)
-            tax_id = normalize_tax_id(record.tax_id_raw)
+            provided_tax_id = normalize_tax_id(record.tax_id_raw)
+            tax_id = provided_tax_id
+            invalid_enterprise_tax_id = False
+            if not natural_person and tax_id and not looks_like_valid_enterprise_tax_id(tax_id):
+                invalid_enterprise_tax_id = True
+                tax_id = None
             if not natural_person and not tax_id:
                 try:
                     looked_up = self.services.tax_lookup_client.lookup(record.invoice_title)
                 except Exception as exc:  # noqa: BLE001
+                    if invalid_enterprise_tax_id and provided_tax_id:
+                        warnings.append(
+                            "编号 "
+                            f"{record.submission_id} [tax_lookup:invalid_tax_id] "
+                            f"企业抬头原税号格式异常，未能自动修正: {provided_tax_id}"
+                        )
                     warnings.append(
                         f"编号 {record.submission_id} [tax_lookup:provider_error] 税号查询失败: {exc}"
                     )
                 else:
                     if looked_up.tax_id:
                         tax_id = looked_up.tax_id
+                        if invalid_enterprise_tax_id and provided_tax_id:
+                            warnings.append(
+                                "编号 "
+                                f"{record.submission_id} [tax_lookup:replaced_invalid_tax_id] "
+                                f"企业抬头原税号格式异常，已改用查询结果: {provided_tax_id} -> {tax_id}"
+                            )
                     else:
+                        if invalid_enterprise_tax_id and provided_tax_id:
+                            warnings.append(
+                                "编号 "
+                                f"{record.submission_id} [tax_lookup:invalid_tax_id] "
+                                f"企业抬头原税号格式异常，且未查询到可替代税号: "
+                                f"{record.invoice_title} ({provided_tax_id})"
+                            )
                         warning = self._build_tax_lookup_warning(record.submission_id, record.invoice_title, looked_up)
                         if warning:
                             warnings.append(warning)

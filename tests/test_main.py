@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from app.config import load_app_config
+from app.models import PortalIssueDetail
 from app.main import (
     _portal_chrome_cdp_ready,
     _resolve_portal_issue_config,
@@ -252,6 +253,7 @@ stores:
             submitted_count=0,
             success_count=0,
             failure_count=0,
+            details=(),
             error=None,
             artifacts_dir=None,
         )
@@ -271,6 +273,63 @@ stores:
                                 )
 
         self.assertEqual(0, exit_code)
+
+    def test_command_portal_issue_includes_failed_details_in_json_output(self) -> None:
+        fake_config = MagicMock()
+        fake_config.stores_config_path = Path("/tmp/stores.yaml")
+        fake_config.state_db_path = Path("/tmp/state.db")
+        selected_store = MagicMock()
+        failed_result = MagicMock(
+            store_key="peanut",
+            company_verify_name="Peanut",
+            mode="submit",
+            status="failed",
+            step="submit_result",
+            expected_count=1,
+            submitted_count=1,
+            success_count=0,
+            failure_count=1,
+            details=(
+                PortalIssueDetail(
+                    invoice_serial="1",
+                    digital_invoice_number=None,
+                    buyer_email="demo@example.com",
+                    status="失败",
+                    failure_reason="购买方纳税人识别号有误",
+                ),
+            ),
+            error=None,
+            artifacts_dir=Path("/tmp/artifacts"),
+        )
+
+        with patch("app.main.load_app_config", return_value=fake_config):
+            with patch("app.main.load_store_configs", return_value=[selected_store]):
+                with patch("app.main._select_portal_stores", return_value=[selected_store]):
+                    with patch("app.main.StateStore"):
+                        with patch("app.portal_runner.TaxPortalRunner") as mocked_runner_cls:
+                            mocked_runner_cls.return_value.run.return_value = [failed_result]
+                            with patch("builtins.print") as mocked_print:
+                                exit_code = command_portal_issue(
+                                    Path("/tmp/.env"),
+                                    store_keys=["peanut"],
+                                    submit=True,
+                                    skip_sync=False,
+                                )
+
+        self.assertEqual(1, exit_code)
+        payload = json.loads(mocked_print.call_args.args[0])
+        self.assertEqual(
+            [
+                {
+                    "invoice_serial": "1",
+                    "digital_invoice_number": None,
+                    "buyer_email": "demo@example.com",
+                    "status": "失败",
+                    "failure_reason": "购买方纳税人识别号有误",
+                }
+            ],
+            payload[0]["failed_details"],
+        )
 
     def test_select_portal_stores_orders_by_priority(self) -> None:
         class FakeStore:

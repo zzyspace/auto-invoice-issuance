@@ -33,6 +33,7 @@ ORGANIZATION_KEYWORDS = (
     "学校",
     "医院",
 )
+ENTERPRISE_TAX_ID_PATTERN = re.compile(r"^(?:\d{15}|[0-9A-Z]{18})$")
 
 
 def parse_json_object(raw: str, default: Optional[dict[str, Any]] = None) -> dict[str, Any]:
@@ -80,10 +81,18 @@ def normalize_tax_id(value: str) -> Optional[str]:
     raw = (value or "").strip()
     if not raw:
         return None
-    cleaned = raw.replace(" ", "")
-    if is_ascii_alphanumeric(cleaned):
-        return cleaned
+    cleaned = re.sub(r"\s+", "", raw)
+    normalized = cleaned.upper()
+    if is_ascii_alphanumeric(normalized):
+        return normalized
     return None
+
+
+def looks_like_valid_enterprise_tax_id(value: str) -> bool:
+    normalized = normalize_tax_id(value)
+    if not normalized:
+        return False
+    return bool(ENTERPRISE_TAX_ID_PATTERN.fullmatch(normalized))
 
 
 def normalize_company_name(value: str) -> str:
