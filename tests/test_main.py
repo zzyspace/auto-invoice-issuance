@@ -12,6 +12,7 @@ from app.main import (
     _portal_chrome_cdp_ready,
     _resolve_portal_issue_config,
     _select_portal_stores,
+    _terminate_portal_chrome_instance,
     build_parser,
     command_portal_issue,
     command_portal_open_chrome_cdp,
@@ -274,6 +275,72 @@ stores:
 
         self.assertEqual(0, exit_code)
 
+    def test_command_portal_issue_closes_local_apps_after_submit_without_failures(self) -> None:
+        fake_config = MagicMock()
+        fake_config.stores_config_path = Path("/tmp/stores.yaml")
+        fake_config.state_db_path = Path("/tmp/state.db")
+        selected_store = MagicMock()
+        success_result = MagicMock(
+            store_key="fuzzy",
+            company_verify_name="Fuzzy",
+            mode="submit",
+            status="success",
+            step="submit_result",
+            expected_count=1,
+            submitted_count=1,
+            success_count=1,
+            failure_count=0,
+            details=(),
+            error=None,
+            artifacts_dir=Path("/tmp/artifacts"),
+        )
+        skipped_result = MagicMock(
+            store_key="peanut",
+            company_verify_name="Peanut",
+            mode="submit",
+            status="skipped",
+            step="skip_empty_workbook",
+            expected_count=0,
+            submitted_count=0,
+            success_count=0,
+            failure_count=0,
+            details=(),
+            error=None,
+            artifacts_dir=Path("/tmp/artifacts-2"),
+        )
+
+        with patch("app.main.load_app_config", return_value=fake_config):
+            with patch("app.main.load_store_configs", return_value=[selected_store]):
+                with patch("app.main._select_portal_stores", return_value=[selected_store]):
+                    with patch("app.main.StateStore"):
+                        with patch("app.main._close_successful_portal_run_apps") as mocked_cleanup:
+                            with patch("app.portal_runner.TaxPortalRunner") as mocked_runner_cls:
+                                mocked_runner_cls.return_value.run.return_value = [success_result, skipped_result]
+                                with patch("builtins.print"):
+                                    exit_code = command_portal_issue(
+                                        Path("/tmp/.env"),
+                                        store_keys=["fuzzy"],
+                                        submit=True,
+                                        skip_sync=False,
+                                    )
+
+        self.assertEqual(0, exit_code)
+        mocked_cleanup.assert_called_once_with(fake_config)
+
+    def test_terminate_portal_chrome_instance_passes_pattern_after_separator(self) -> None:
+        completed = MagicMock(returncode=1, stderr="", stdout="")
+        user_data_dir = Path("/tmp/tax-portal-chrome-cdp").resolve()
+
+        with patch("app.main.subprocess.run", return_value=completed) as mocked_run:
+            _terminate_portal_chrome_instance(user_data_dir)
+
+        mocked_run.assert_called_once_with(
+            ["pkill", "-f", "--", f"--user-data-dir={user_data_dir}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
     def test_command_portal_issue_includes_failed_details_in_json_output(self) -> None:
         fake_config = MagicMock()
         fake_config.stores_config_path = Path("/tmp/stores.yaml")
@@ -306,17 +373,19 @@ stores:
             with patch("app.main.load_store_configs", return_value=[selected_store]):
                 with patch("app.main._select_portal_stores", return_value=[selected_store]):
                     with patch("app.main.StateStore"):
-                        with patch("app.portal_runner.TaxPortalRunner") as mocked_runner_cls:
-                            mocked_runner_cls.return_value.run.return_value = [failed_result]
-                            with patch("builtins.print") as mocked_print:
-                                exit_code = command_portal_issue(
-                                    Path("/tmp/.env"),
-                                    store_keys=["peanut"],
-                                    submit=True,
-                                    skip_sync=False,
-                                )
+                        with patch("app.main._close_successful_portal_run_apps") as mocked_cleanup:
+                            with patch("app.portal_runner.TaxPortalRunner") as mocked_runner_cls:
+                                mocked_runner_cls.return_value.run.return_value = [failed_result]
+                                with patch("builtins.print") as mocked_print:
+                                    exit_code = command_portal_issue(
+                                        Path("/tmp/.env"),
+                                        store_keys=["peanut"],
+                                        submit=True,
+                                        skip_sync=False,
+                                    )
 
         self.assertEqual(1, exit_code)
+        mocked_cleanup.assert_not_called()
         payload = json.loads(mocked_print.call_args.args[0])
         self.assertEqual(
             [

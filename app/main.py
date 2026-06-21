@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import plistlib
 import subprocess
 import sys
 import time
@@ -21,6 +22,10 @@ from app.survey_client import TencentSurveyClient
 from app.tax_lookup import TaxLookupClient
 from app.utils import next_daily_run
 from app.vision_client import OpenAICompatibleVisionClient
+
+PHOTOS_BUNDLE_ID = "com.apple.Photos"
+ETAX_BUNDLE_ID_FALLBACK = "cn.gov.chinatax.gt4.app"
+ETAX_PROCESS_PATTERN = r"cn\.gov\.chinatax\.gt4\.app|GT4\.app|电子税务局"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -334,7 +339,94 @@ def command_portal_issue(
             indent=2,
         )
     )
-    return 0 if all(result.status in {"validated", "success", "skipped"} for result in results) else 1
+    exit_code = 0 if all(result.status in {"validated", "success", "skipped"} for result in results) else 1
+    if submit and all(result.status != "failed" for result in results):
+        _close_successful_portal_run_apps(config)
+    return exit_code
+
+
+def _close_successful_portal_run_apps(config: object) -> None:
+    if sys.platform != "darwin":
+        return
+    errors: list[str] = []
+    chrome_user_data_dir = getattr(config, "portal_chrome_cdp_user_data_dir", None)
+    etax_app_path = getattr(config, "portal_etax_app_path", None)
+
+    try:
+        _terminate_portal_chrome_instance(chrome_user_data_dir)
+    except RuntimeError as exc:
+        errors.append(f"Chrome: {exc}")
+    try:
+        _quit_macos_application(PHOTOS_BUNDLE_ID, process_pattern=r"Photos|照片")
+    except RuntimeError as exc:
+        errors.append(f"Photos: {exc}")
+    try:
+        _quit_macos_application(
+            _resolve_macos_bundle_id(etax_app_path, fallback=ETAX_BUNDLE_ID_FALLBACK),
+            process_pattern=ETAX_PROCESS_PATTERN,
+        )
+    except RuntimeError as exc:
+        errors.append(f"电子税务局: {exc}")
+    if errors:
+        print(
+            "[tax-portal][runner] successful run cleanup completed with warnings: "
+            + "; ".join(errors),
+            file=sys.stderr,
+        )
+
+
+def _terminate_portal_chrome_instance(user_data_dir: Path | None) -> None:
+    if user_data_dir is None:
+        return
+    completed = subprocess.run(
+        ["pkill", "-f", "--", f"--user-data-dir={Path(user_data_dir).resolve()}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode not in {0, 1}:
+        stderr = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(stderr or "failed to terminate Chrome CDP instance")
+
+
+def _quit_macos_application(bundle_id: str, *, process_pattern: str) -> None:
+    if not _macos_process_running(process_pattern):
+        return
+    completed = subprocess.run(
+        ["osascript", "-e", f'tell application id "{bundle_id}" to quit'],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        stderr = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(stderr or f"failed to quit application {bundle_id}")
+
+
+def _macos_process_running(process_pattern: str) -> bool:
+    completed = subprocess.run(
+        ["pgrep", "-f", process_pattern],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode in {0, 1}:
+        return completed.returncode == 0
+    stderr = (completed.stderr or completed.stdout or "").strip()
+    raise RuntimeError(stderr or f"failed to inspect process pattern {process_pattern}")
+
+
+def _resolve_macos_bundle_id(app_path: Path | None, *, fallback: str) -> str:
+    if app_path is None:
+        return fallback
+    info_plist = Path(app_path) / "Contents" / "Info.plist"
+    try:
+        with info_plist.open("rb") as handle:
+            payload = plistlib.load(handle)
+    except (FileNotFoundError, plistlib.InvalidFileException, OSError):
+        return fallback
+    bundle_id = str(payload.get("CFBundleIdentifier") or "").strip()
+    return bundle_id or fallback
 
 
 def main(argv: list[str] | None = None) -> int:
