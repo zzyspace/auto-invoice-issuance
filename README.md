@@ -80,6 +80,12 @@ TAX_LOOKUP_ALAPI_TOKEN=your_alapi_token_here
 python3 -m app.main run-once --env-file .env
 ```
 
+如果要从本地仓库直接触发生产服务器立刻跑一轮：
+
+```bash
+./run-once-server
+```
+
 启动定时服务：
 
 ```bash
@@ -367,6 +373,24 @@ ssh root@139.196.140.215 \
 ```
 
 ### 运行检查
+
+如果只是想让生产机立刻跑一轮生成最新 `output`，仓库内也提供了简短命令：
+
+```bash
+./run-once-server
+```
+
+默认目标是 `root@139.196.140.215`。如果后续目标机变化，也可以显式传入：
+
+```bash
+./run-once-server root@139.196.140.215
+```
+
+这个脚本会在服务器上执行：
+
+1. 以 `invoicebot` 用户启动一次性 `systemd-run`
+2. 在 `/opt/auto-invoice-issuance/current` 下执行 `run-once`
+3. 使用 `/etc/auto-invoice-issuance.env` 读取生产环境配置
 
 常用检查命令：
 
