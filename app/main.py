@@ -230,7 +230,25 @@ def _resolve_portal_chrome_executable(config: object) -> str:
     )
 
 
-def command_portal_open_chrome_cdp(env_file: Path) -> int:
+def _resolve_portal_open_target_store(config: object, store_keys: list[str] | None) -> object | None:
+    try:
+        stores = load_store_configs(config.stores_config_path)
+    except Exception:
+        if store_keys:
+            raise
+        return None
+    try:
+        selected = _select_portal_stores(stores, store_keys)
+    except Exception:
+        if store_keys:
+            raise
+        return None
+    if not selected:
+        return None
+    return selected[0]
+
+
+def command_portal_open_chrome_cdp(env_file: Path, store_keys: list[str] | None = None) -> int:
     config = load_app_config(env_file)
     cdp_url = config.portal_chrome_cdp_url or "http://127.0.0.1:9222"
     if _portal_chrome_cdp_ready(cdp_url):
@@ -254,6 +272,8 @@ def command_portal_open_chrome_cdp(env_file: Path) -> int:
         raise ValueError("TAX_PORTAL_CHROME_CDP_USER_DATA_DIR is required to launch a dedicated Chrome instance.")
     user_data_dir.mkdir(parents=True, exist_ok=True)
     log_path = user_data_dir / "chrome-cdp.log"
+    target_store = _resolve_portal_open_target_store(config, store_keys)
+    launch_url = config.portal_home_url_for_store(target_store)
     with log_path.open("ab") as log_file:
         process = subprocess.Popen(
             [
@@ -262,7 +282,7 @@ def command_portal_open_chrome_cdp(env_file: Path) -> int:
                 f"--user-data-dir={user_data_dir}",
                 "--no-first-run",
                 "--new-window",
-                config.portal_home_url,
+                launch_url,
             ],
             stdout=log_file,
             stderr=subprocess.STDOUT,
@@ -279,6 +299,7 @@ def command_portal_open_chrome_cdp(env_file: Path) -> int:
                 "cdp_url": cdp_url,
                 "user_data_dir": str(user_data_dir),
                 "chrome_executable": chrome_executable,
+                "launch_url": launch_url,
                 "pid": process.pid,
                 "log_path": str(log_path),
                 "launched": True,
@@ -442,7 +463,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "portal-sync":
         return command_portal_sync(env_file, args.store_keys)
     if args.command == "portal-open-chrome-cdp":
-        return command_portal_open_chrome_cdp(env_file)
+        return command_portal_open_chrome_cdp(env_file, args.store_keys)
     if args.command == "portal-issue-dry-run":
         return command_portal_issue(env_file, args.store_keys, submit=False, skip_sync=args.skip_sync)
     if args.command == "portal-issue-run":

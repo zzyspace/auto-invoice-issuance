@@ -2300,6 +2300,95 @@ class PortalRunnerUrlTests(unittest.TestCase):
             self.assertIs(page, returned_page)
             mocked_nav.assert_called_once()
 
+    def test_ensure_company_reopens_target_area_home_when_store_area_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=tmp_path / "profile",
+                portal_home_url="https://etax.{store_area}.chinatax.gov.cn:8443/loginb/",
+                portal_identity_switch_url=(
+                    "https://tpass.{store_area}.chinatax.gov.cn:8443/#/identitySwitch/enterprise"
+                    "?client_id=y56b7aay5brf48f8aa7bf24dd54d775r"
+                ),
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+            store = StoreConfig(
+                store_key="fuzzy_qz",
+                store_name="FuzzyQZ",
+                survey_id="27114382",
+                output_xlsx_path=tmp_path / "output.xlsx",
+                initial_last_processed_id=1,
+                portal_enabled=True,
+                portal_company_switch_name="泉州市鲤城区浮几餐饮店（个体工商户）（待确认）",
+                portal_company_verify_name="泉州市鲤城区浮几餐饮店（个体工商户）",
+                store_area="quanzhou",
+                store_area_name="泉州",
+            )
+            result = SimpleNamespace(workbook_sha256="abc123")
+            current_home_page = SimpleNamespace(url="https://etax.xiamen.chinatax.gov.cn:8443/loginb/")
+            target_home_page = SimpleNamespace(url="https://etax.quanzhou.chinatax.gov.cn:8443/loginb/")
+            switch_page = SimpleNamespace(url="https://tpass.quanzhou.chinatax.gov.cn:8443/#/identitySwitch/enterprise")
+            final_home_page = SimpleNamespace(url="https://etax.quanzhou.chinatax.gov.cn:8443/loginb/")
+
+            with patch.object(runner, "_wait_for_home_page_shell_ready"):
+                with patch.object(runner, "_page_contains", return_value=False):
+                    with patch.object(runner, "_wait_for_company_name", return_value=False):
+                        with patch.object(runner, "_wait_for_switch_page_ready"):
+                            with patch.object(runner, "_switch_page_shows_active_company", return_value=True):
+                                with patch.object(
+                                    runner,
+                                    "_navigate_with_reauth",
+                                    side_effect=[target_home_page, switch_page, final_home_page],
+                                ) as mocked_nav:
+                                    with patch.object(runner, "_update_store_step"):
+                                        with patch.object(runner, "_log"):
+                                            returned_page = runner._ensure_company(current_home_page, store, result)  # noqa: SLF001
+
+            self.assertIs(final_home_page, returned_page)
+            self.assertEqual(3, mocked_nav.call_count)
+            mocked_nav.assert_any_call(
+                current_home_page,
+                "https://etax.quanzhou.chinatax.gov.cn:8443/loginb/",
+                result,
+                expected_text="我要办税",
+                step_name="open 泉州 portal home",
+            )
+            mocked_nav.assert_any_call(
+                target_home_page,
+                "https://tpass.quanzhou.chinatax.gov.cn:8443/#/identitySwitch/enterprise?client_id=y56b7aay5brf48f8aa7bf24dd54d775r",
+                result,
+                expected_text="企业办税",
+                step_name="switch company",
+            )
+            mocked_nav.assert_any_call(
+                switch_page,
+                "https://etax.quanzhou.chinatax.gov.cn:8443/loginb/",
+                result,
+                expected_text="我要办税",
+                step_name="return home with active company 泉州市鲤城区浮几餐饮店（个体工商户）",
+            )
+
     def test_wait_for_home_page_ready_waits_for_load_states_texts_and_network_idle(self) -> None:
         class FakePage:
             def __init__(self) -> None:

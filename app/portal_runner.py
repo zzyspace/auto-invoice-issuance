@@ -43,6 +43,10 @@ BROWSER_SESSION_SYNC_ENTRIES = (
     "WebStorage",
     "Network",
 )
+PORTAL_TPASS_LOGIN_RE = re.compile(r"^https://tpass\.([a-z0-9-]+)\.chinatax\.gov\.cn:8443/#/login(?:[/?#].*)?$")
+PORTAL_ETAX_HOST_RE = re.compile(r"^https://etax\.([a-z0-9-]+)\.chinatax\.gov\.cn:8443(?:[/?#].*)?$")
+PORTAL_TPASS_HOST_RE = re.compile(r"^https://tpass\.([a-z0-9-]+)\.chinatax\.gov\.cn:8443(?:[/?#].*)?$")
+PORTAL_DPPT_HOST_RE = re.compile(r"^https://dppt\.([a-z0-9-]+)\.chinatax\.gov\.cn:8443(?:[/?#].*)?$")
 
 
 class PortalRunnerError(RuntimeError):
@@ -233,10 +237,11 @@ class TaxPortalRunner:
             elif self.config.portal_browser_backend == "chrome_cdp" and self._is_portal_related_page(home_page):
                 self._log(store.store_key, f"reusing attached Chrome portal page: {home_page.url}")
             else:
-                self._log(store.store_key, f"opening portal home page: {self.config.portal_home_url}")
-                self._goto(self.config.portal_home_url, home_page)
+                home_url = self.config.portal_home_url_for_store(store)
+                self._log(store.store_key, f"opening portal home page: {home_url}")
+                self._goto(home_url, home_page)
             home_page = self._ensure_logged_in(home_page, result)
-            home_page = self._ensure_authenticated_home_page(home_page, result)
+            home_page = self._ensure_authenticated_home_page(home_page, result, store)
             context = getattr(home_page, "context", context)
             home_page = self._ensure_company(home_page, store, result)
             self._wait_for_home_page_ready(home_page, store)
@@ -440,6 +445,21 @@ class TaxPortalRunner:
 
     def _ensure_company(self, home_page: object, store: StoreConfig, result: PortalIssueResult) -> object:
         verify_name = store.effective_portal_company_verify_name()
+        target_area = store.effective_store_area()
+        current_area = self._portal_area_from_url(getattr(home_page, "url", ""))
+        if current_area and current_area != target_area:
+            target_area_name = store.effective_store_area_name()
+            self._log(
+                store.store_key,
+                f"portal area changed: {current_area} -> {target_area}; reopening {target_area_name} portal home",
+            )
+            home_page = self._navigate_with_reauth(
+                home_page,
+                self.config.portal_home_url_for_store(store),
+                result,
+                expected_text="我要办税",
+                step_name=f"open {target_area_name} portal home",
+            )
         self._wait_for_home_page_shell_ready(home_page, store.store_key)
         if self._page_contains(home_page, verify_name):
             self._log(store.store_key, f"company already active: {verify_name}")
@@ -457,7 +477,7 @@ class TaxPortalRunner:
         )
         home_page = self._navigate_with_reauth(
             home_page,
-            self.config.portal_identity_switch_url,
+            self.config.portal_identity_switch_url_for_store(store),
             result,
             expected_text="企业办税",
             step_name="switch company",
@@ -467,7 +487,7 @@ class TaxPortalRunner:
             self._log(store.store_key, f"company already active on switch page: {verify_name}")
             return self._navigate_with_reauth(
                 home_page,
-                self.config.portal_home_url,
+                self.config.portal_home_url_for_store(store),
                 result,
                 expected_text="我要办税",
                 step_name=f"return home with active company {verify_name}",
@@ -499,7 +519,7 @@ class TaxPortalRunner:
         if not self._page_contains(home_page, verify_name):
             home_page = self._navigate_with_reauth(
                 home_page,
-                self.config.portal_home_url,
+                self.config.portal_home_url_for_store(store),
                 result,
                 expected_text=verify_name,
                 step_name=f"switch company to {verify_name}",
@@ -518,7 +538,7 @@ class TaxPortalRunner:
         )
         page = self._navigate_with_reauth(
             page,
-            self.config.portal_batch_issue_url,
+            self.config.portal_batch_issue_url_for_store(store),
             result,
             expected_text=None,
             step_name="open batch issue page",
@@ -1274,11 +1294,11 @@ class TaxPortalRunner:
 
     def _is_login_page(self, page: object) -> bool:
         url = getattr(page, "url", "")
-        return "tpass.xiamen.chinatax.gov.cn:8443/#/login" in url or self._page_contains(page, "打开电子税务局APP扫一扫")
+        return self._is_tpass_login_url(url) or self._page_contains(page, "打开电子税务局APP扫一扫")
 
     def _is_portal_related_page(self, page: object) -> bool:
         url = getattr(page, "url", "")
-        return "etax.xiamen.chinatax.gov.cn:8443" in url or "tpass.xiamen.chinatax.gov.cn:8443" in url
+        return self._portal_area_from_url(url) is not None
 
     def _is_authenticated_portal_shell_page(self, page: object) -> bool:
         if not self._is_portal_related_page(page):
@@ -1297,12 +1317,12 @@ class TaxPortalRunner:
 
     def _is_loginb_pending_page(self, page: object) -> bool:
         url = getattr(page, "url", "")
-        return "etax.xiamen.chinatax.gov.cn:8443/loginb/" in url and not self._is_home_page(page)
+        return self._is_etax_url(url) and "/loginb/" in url and not self._is_home_page(page)
 
     def _page_requires_reauth(self, page: object) -> bool:
         url = getattr(page, "url", "")
         return (
-            "tpass.xiamen.chinatax.gov.cn:8443/#/login" in url
+            self._is_tpass_login_url(url)
             or self._is_loginb_pending_page(page)
             or self._page_contains(page, "打开电子税务局APP扫一扫")
             or self._page_contains(page, "会话失效，请重新登录")
@@ -1311,9 +1331,14 @@ class TaxPortalRunner:
 
     def _is_home_page(self, page: object) -> bool:
         url = getattr(page, "url", "")
-        return "etax.xiamen.chinatax.gov.cn:8443" in url and self._page_contains(page, "我要办税")
+        return self._is_etax_url(url) and self._page_contains(page, "我要办税")
 
-    def _ensure_authenticated_home_page(self, page: object, result: PortalIssueResult) -> object:
+    def _ensure_authenticated_home_page(
+        self,
+        page: object,
+        result: PortalIssueResult,
+        store: StoreConfig | None = None,
+    ) -> object:
         if self._is_home_page(page) or not self._is_authenticated_portal_shell_page(page):
             return page
         self._log(
@@ -1322,7 +1347,7 @@ class TaxPortalRunner:
         )
         return self._navigate_with_reauth(
             page,
-            self.config.portal_home_url,
+            self.config.portal_home_url_for_store(store),
             result,
             expected_text="我要办税",
             step_name="open authenticated portal home",
@@ -1350,11 +1375,27 @@ class TaxPortalRunner:
     def _is_public_landing_page(self, page: object) -> bool:
         url = page.url.rstrip("/")
         return (
-            url == "https://etax.xiamen.chinatax.gov.cn:8443"
+            bool(PORTAL_ETAX_HOST_RE.fullmatch(url))
             and self._page_contains(page, "环境检测")
             and self._page_contains(page, "电子税务局APP下载")
             and self._page_contains(page, "登录")
         )
+
+    @staticmethod
+    def _is_tpass_login_url(url: str) -> bool:
+        return PORTAL_TPASS_LOGIN_RE.match(url) is not None
+
+    @staticmethod
+    def _is_etax_url(url: str) -> bool:
+        return PORTAL_ETAX_HOST_RE.match(url) is not None
+
+    @staticmethod
+    def _portal_area_from_url(url: str) -> str | None:
+        for pattern in (PORTAL_ETAX_HOST_RE, PORTAL_TPASS_HOST_RE, PORTAL_DPPT_HOST_RE):
+            match = pattern.match(url)
+            if match is not None:
+                return match.group(1)
+        return None
 
     def _navigate_with_reauth(
         self,

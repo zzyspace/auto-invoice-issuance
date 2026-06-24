@@ -239,6 +239,85 @@ stores:
             payload = json.loads(mocked_print.call_args.args[0])
             self.assertFalse(payload["launched"])
 
+    def test_command_portal_open_chrome_cdp_uses_selected_store_area_home_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            env_path = tmp_path / ".env"
+            stores_path = tmp_path / "stores.yaml"
+            chrome_path = tmp_path / "Chrome"
+            chrome_path.write_text("", encoding="utf-8")
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "TZ=Asia/Shanghai",
+                        "TENCENT_SURVEY_COOKIE=cookie=value",
+                        "TENCENT_SURVEY_EXPORT_URL=https://wj.qq.com/api/answer_exports/generate",
+                        "TENCENT_SURVEY_EXPORT_METHOD=POST",
+                        "OPENAI_BASE_URL=https://example.com/v1",
+                        "OPENAI_API_KEY=key",
+                        "SMTP_HOST=smtp.example.com",
+                        "SMTP_USERNAME=user",
+                        "SMTP_PASSWORD=pass",
+                        "SMTP_FROM=from@example.com",
+                        "SMTP_TO=to@example.com",
+                        "TEMPLATE_XLSX_PATH=./template.xlsx",
+                        "STATE_DB_PATH=./state.db",
+                        f"STORES_CONFIG_PATH={stores_path}",
+                        "TAX_PORTAL_CHROME_CDP_URL=http://127.0.0.1:9555",
+                        f"TAX_PORTAL_CHROME_CDP_USER_DATA_DIR={tmp_path / 'cdp-profile'}",
+                        f"TAX_PORTAL_CHROME_EXECUTABLE_PATH={chrome_path}",
+                        "TAX_PORTAL_HOME_URL=https://etax.{store_area}.chinatax.gov.cn:8443/loginb/",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            stores_path.write_text(
+                """
+stores:
+  - store_key: fuzzy
+    store_name: Fuzzy
+    survey_id: "13835974"
+    output_xlsx_path: ./output/fuzzy.xlsx
+    initial_last_processed_id: 1
+    portal_enabled: true
+    portal_priority: 10
+    store_area: xiamen
+    portal_company_switch_name: Fuzzy
+    portal_company_verify_name: Fuzzy
+  - store_key: fuzzy_qz
+    store_name: FuzzyQZ
+    survey_id: "27114382"
+    output_xlsx_path: ./output/fuzzy_qz.xlsx
+    initial_last_processed_id: 1
+    portal_enabled: true
+    portal_priority: 30
+    store_area: quanzhou
+    portal_company_switch_name: FuzzyQZ
+    portal_company_verify_name: FuzzyQZ
+""".strip(),
+                encoding="utf-8",
+            )
+
+            fake_process = MagicMock(pid=23456)
+            with patch("app.main._portal_chrome_cdp_ready", return_value=False):
+                with patch("app.main._wait_for_portal_chrome_cdp", return_value=True):
+                    with patch("subprocess.Popen", return_value=fake_process) as mocked_popen:
+                        with patch("builtins.print") as mocked_print:
+                            exit_code = command_portal_open_chrome_cdp(env_path, ["fuzzy_qz"])
+
+            self.assertEqual(0, exit_code)
+            mocked_popen.assert_called_once()
+            launch_args = mocked_popen.call_args.args[0]
+            self.assertEqual(
+                "https://etax.quanzhou.chinatax.gov.cn:8443/loginb/",
+                launch_args[-1],
+            )
+            payload = json.loads(mocked_print.call_args.args[0])
+            self.assertEqual(
+                "https://etax.quanzhou.chinatax.gov.cn:8443/loginb/",
+                payload["launch_url"],
+            )
+
     def test_command_portal_issue_treats_skipped_store_as_success(self) -> None:
         fake_config = MagicMock()
         fake_config.stores_config_path = Path("/tmp/stores.yaml")

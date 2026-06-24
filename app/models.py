@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+import re
 from typing import Optional
 
 
@@ -21,6 +22,8 @@ class StoreConfig:
     portal_company_switch_name: Optional[str] = None
     portal_company_verify_name: Optional[str] = None
     portal_company_role: str = "legal_representative"
+    store_area: str = "xiamen"
+    store_area_name: Optional[str] = None
 
     def effective_attachment_question_id(self, default_question_id: Optional[str]) -> str:
         question_id = self.attachment_question_id or default_question_id
@@ -41,6 +44,23 @@ class StoreConfig:
         if not value:
             raise ValueError(f"Store '{self.store_key}' is missing portal_company_verify_name.")
         return value
+
+    def effective_store_area(self) -> str:
+        value = (self.store_area or "").strip().lower()
+        if not value:
+            return "xiamen"
+        if not re.fullmatch(r"[a-z0-9-]+", value):
+            raise ValueError(
+                f"Store '{self.store_key}' has invalid store_area={self.store_area!r}; "
+                "expected lowercase letters, numbers, or hyphens."
+            )
+        return value
+
+    def effective_store_area_name(self) -> str:
+        value = (self.store_area_name or "").strip()
+        if value:
+            return value
+        return self.effective_store_area()
 
 
 @dataclass(frozen=True)
@@ -115,6 +135,23 @@ class AppConfig:
     portal_sync_connect_timeout_seconds: int = 10
     portal_sync_strict_host_key_checking: bool = False
     portal_sync_batch_mode: bool = True
+
+    @staticmethod
+    def _render_portal_url(url_template: str, store_area: Optional[str]) -> str:
+        area = (store_area or "").strip().lower() or "xiamen"
+        return url_template.replace("{store_area}", area)
+
+    def portal_home_url_for_store(self, store: Optional[StoreConfig]) -> str:
+        area = store.effective_store_area() if store is not None else None
+        return self._render_portal_url(self.portal_home_url, area)
+
+    def portal_identity_switch_url_for_store(self, store: Optional[StoreConfig]) -> str:
+        area = store.effective_store_area() if store is not None else None
+        return self._render_portal_url(self.portal_identity_switch_url, area)
+
+    def portal_batch_issue_url_for_store(self, store: Optional[StoreConfig]) -> str:
+        area = store.effective_store_area() if store is not None else None
+        return self._render_portal_url(self.portal_batch_issue_url, area)
 
 
 @dataclass(frozen=True)

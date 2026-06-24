@@ -6,6 +6,7 @@ import zipfile
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
+from urllib.error import HTTPError
 from urllib.parse import parse_qsl, urlencode
 from urllib.request import Request, urlopen
 
@@ -68,7 +69,11 @@ class TencentSurveyClient:
         text = response_bytes.decode("utf-8")
         if "编号," in text or "编号\t" in text:
             return text
-        payload_json = json.loads(text)
+        payload_json = self._load_json_payload(
+            response_bytes,
+            response_headers,
+            context="export response",
+        )
         download_url = self._extract_export_download_url(payload_json)
         if not download_url:
             job_id = get_value_by_path(payload_json, "data.id")
@@ -139,8 +144,12 @@ class TencentSurveyClient:
         for _ in range(EXPORT_POLL_MAX_ATTEMPTS):
             timestamp = int(time.time() * 1000)
             url = f"{EXPORT_CHECK_URL}?_={timestamp}&job_id={job_id}"
-            response_bytes, _ = self._request(url, "GET", headers, None)
-            payload = json.loads(response_bytes.decode("utf-8"))
+            response_bytes, response_headers = self._request(url, "GET", headers, None)
+            payload = self._load_json_payload(
+                response_bytes,
+                response_headers,
+                context=f"export poll response for job {job_id}",
+            )
             last_payload = payload
             status = str(get_value_by_path(payload, "data.status_info") or "")
             if status == "Done":
@@ -161,6 +170,47 @@ class TencentSurveyClient:
                     return member.read().decode("utf-8-sig")
         return csv_bytes.decode("utf-8-sig")
 
+    def _load_json_payload(
+        self,
+        response_bytes: bytes,
+        response_headers: dict[str, str],
+        *,
+        context: str,
+    ) -> dict[str, object]:
+        text = response_bytes.decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                self._describe_non_json_response(
+                    text,
+                    response_headers.get("Content-Type", ""),
+                    context=context,
+                )
+            ) from exc
+        if not isinstance(payload, dict):
+            raise ValueError(f"Tencent Survey {context} returned a non-object JSON payload.")
+        return payload
+
+    @staticmethod
+    def _describe_non_json_response(text: str, content_type: str, *, context: str) -> str:
+        preview = " ".join(text.split())[:160]
+        lowered = text[:2000].lower()
+        if "<html" in lowered and "腾讯问卷" in text and "登录" in text:
+            return (
+                f"Tencent Survey {context} returned the login page instead of JSON; "
+                "TENCENT_SURVEY_COOKIE may have expired or been signed out."
+            )
+        if content_type.lower().startswith("text/html"):
+            return (
+                f"Tencent Survey {context} returned HTML instead of JSON "
+                f"(Content-Type={content_type!r}, preview={preview!r})."
+            )
+        return (
+            f"Tencent Survey {context} returned non-JSON content "
+            f"(Content-Type={content_type!r}, preview={preview!r})."
+        )
+
     def _request(
         self,
         url: str,
@@ -169,5 +219,8 @@ class TencentSurveyClient:
         payload: Optional[bytes],
     ) -> tuple[bytes, dict[str, str]]:
         request = Request(url=url, method=method, headers=headers, data=payload)
-        with urlopen(request, timeout=self.config.survey_timeout_seconds, context=self.ssl_context) as response:
-            return response.read(), dict(response.headers)
+        try:
+            with urlopen(request, timeout=self.config.survey_timeout_seconds, context=self.ssl_context) as response:
+                return response.read(), dict(response.headers)
+        except HTTPError as exc:
+            return exc.read(), dict(exc.headers)

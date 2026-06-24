@@ -43,11 +43,11 @@ ensure_chrome_cdp() {
       -u NO_PROXY \
       -u no_proxy \
       TAX_PORTAL_CHROME_CDP_URL="${TAX_PORTAL_CHROME_CDP_URL:-${DEFAULT_CDP_URL}}" \
-      "${PYTHON_BIN}" -m app.main portal-open-chrome-cdp --env-file "${ENV_FILE}"
+      "${PYTHON_BIN}" -m app.main portal-open-chrome-cdp --env-file "${ENV_FILE}" "$@"
   }
 
   local open_payload
-  if ! open_payload="$(exec_env)"; then
+  if ! open_payload="$(exec_env "$@")"; then
     return 1
   fi
   if [[ "${open_payload}" == *'"launched": true'* ]]; then
@@ -56,7 +56,9 @@ ensure_chrome_cdp() {
 }
 
 run_cdp_command() {
-  ensure_chrome_cdp
+  local app_command="${1:-}"
+  shift || true
+  ensure_chrome_cdp "$@"
   exec env \
     -u http_proxy \
     -u https_proxy \
@@ -69,7 +71,7 @@ run_cdp_command() {
     TAX_PORTAL_BROWSER_BACKEND=chrome_cdp \
     TAX_PORTAL_CHROME_CDP_URL="${TAX_PORTAL_CHROME_CDP_URL:-${DEFAULT_CDP_URL}}" \
     TAX_PORTAL_SYNC_FROM_CHROME_PROFILE=false \
-    "${PYTHON_BIN}" -m app.main "$@"
+    "${PYTHON_BIN}" -m app.main "${app_command}" --env-file "${ENV_FILE}" "$@"
 }
 
 main() {
@@ -91,10 +93,10 @@ main() {
       exec "${PYTHON_BIN}" -m app.main portal-sync --env-file "${ENV_FILE}" "$@"
       ;;
     dry-run)
-      run_cdp_command portal-issue-dry-run --env-file "${ENV_FILE}" "$@"
+      run_cdp_command portal-issue-dry-run "$@"
       ;;
     run)
-      run_cdp_command portal-issue-run --env-file "${ENV_FILE}" "$@"
+      run_cdp_command portal-issue-run "$@"
       ;;
     help|-h|--help)
       usage

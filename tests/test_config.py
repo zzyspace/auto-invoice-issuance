@@ -61,6 +61,73 @@ stores:
             stores = load_store_configs(stores_path)
             self.assertEqual("fallback", stores[0].effective_attachment_question_id("fallback"))
 
+    def test_store_area_fields_and_dynamic_portal_urls_are_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.dict(os.environ, {}, clear=True):
+            tmp_path = Path(tmp_dir)
+            stores_path = tmp_path / "stores.yaml"
+            env_path = tmp_path / ".env"
+            stores_path.write_text(
+                """
+stores:
+  - store_key: fuzzy_qz
+    store_name: FuzzyQZ
+    survey_id: "27114382"
+    output_xlsx_path: ./output/fuzzy_qz.xlsx
+    initial_last_processed_id: 0
+    enabled: true
+    portal_enabled: true
+    portal_priority: 30
+    store_area: quanzhou
+    store_area_name: 泉州
+    portal_company_switch_name: 泉州市鲤城区浮几餐饮店（个体工商户）（待确认）
+    portal_company_verify_name: 泉州市鲤城区浮几餐饮店（个体工商户）
+    portal_company_role: legal_representative
+""".strip(),
+                encoding="utf-8",
+            )
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "TZ=Asia/Shanghai",
+                        "TENCENT_SURVEY_COOKIE=cookie=value",
+                        "TENCENT_SURVEY_EXPORT_URL=https://wj.qq.com/api/answer_exports/generate",
+                        "TENCENT_SURVEY_EXPORT_METHOD=POST",
+                        "OPENAI_BASE_URL=https://example.com/v1",
+                        "OPENAI_API_KEY=key",
+                        "SMTP_HOST=smtp.example.com",
+                        "SMTP_USERNAME=user",
+                        "SMTP_PASSWORD=pass",
+                        "SMTP_FROM=from@example.com",
+                        "SMTP_TO=to@example.com",
+                        "TEMPLATE_XLSX_PATH=./template.xlsx",
+                        "STATE_DB_PATH=./state.db",
+                        f"STORES_CONFIG_PATH={stores_path}",
+                        "TAX_PORTAL_HOME_URL=https://etax.{store_area}.chinatax.gov.cn:8443/loginb/",
+                        "TAX_PORTAL_IDENTITY_SWITCH_URL=https://tpass.{store_area}.chinatax.gov.cn:8443/#/identitySwitch/enterprise?client_id=y56b7aay5brf48f8aa7bf24dd54d775r",
+                        "TAX_PORTAL_BATCH_ISSUE_URL=https://dppt.{store_area}.chinatax.gov.cn:8443/blue-invoice-makeout/invoice-batch",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            stores = load_store_configs(stores_path)
+            config = load_app_config(env_path)
+
+            self.assertEqual("quanzhou", stores[0].effective_store_area())
+            self.assertEqual("泉州", stores[0].effective_store_area_name())
+            self.assertEqual(
+                "https://etax.quanzhou.chinatax.gov.cn:8443/loginb/",
+                config.portal_home_url_for_store(stores[0]),
+            )
+            self.assertEqual(
+                "https://tpass.quanzhou.chinatax.gov.cn:8443/#/identitySwitch/enterprise?client_id=y56b7aay5brf48f8aa7bf24dd54d775r",
+                config.portal_identity_switch_url_for_store(stores[0]),
+            )
+            self.assertEqual(
+                "https://dppt.quanzhou.chinatax.gov.cn:8443/blue-invoice-makeout/invoice-batch",
+                config.portal_batch_issue_url_for_store(stores[0]),
+            )
+
     def test_load_app_config_prefers_explicit_tax_lookup_provider(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir, patch.dict(os.environ, {}, clear=True):
             tmp_path = Path(tmp_dir)

@@ -8,6 +8,8 @@ stores:
     enabled: true
     portal_enabled: true
     portal_priority: 10
+    store_area: xiamen
+    store_area_name: 厦门
     portal_company_switch_name: 厦门市思明区门店A（个体工商户）（待确认）
     portal_company_verify_name: 厦门市思明区门店A（个体工商户）
     portal_company_role: legal_representative
@@ -20,6 +22,8 @@ stores:
     enabled: true
     portal_enabled: true
     portal_priority: 20
+    store_area: quanzhou
+    store_area_name: 泉州
     portal_company_switch_name: 泉州市门店B有限公司
     portal_company_verify_name: 泉州市门店B有限公司
     portal_company_role: legal_representative

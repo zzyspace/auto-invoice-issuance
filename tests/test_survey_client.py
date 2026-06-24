@@ -116,3 +116,62 @@ class SurveyClientTests(unittest.TestCase):
         self.assertIn('"survey_id":"22512014"', generate_payload.decode("utf-8"))
         self.assertIn("/api/files/export_check", client.calls[1][0])
         self.assertEqual("https://download.example.com/export.csv.zip", client.calls[2][0])
+
+    def test_export_csv_reports_login_page_when_cookie_expired(self) -> None:
+        responses = [
+            (
+                (
+                    "<!DOCTYPE html><html lang=\"zh-cn\"><head>"
+                    "<title>登录 - 腾讯问卷</title></head><body>请登录</body></html>"
+                ).encode("utf-8"),
+                {"Content-Type": "text/html; charset=utf-8"},
+            )
+        ]
+        client = StubSurveyClient(build_config(), responses)
+        store = StoreConfig(
+            store_key="store_a",
+            store_name="门店A",
+            survey_id="22512014",
+            output_xlsx_path=Path("/tmp/output.xlsx"),
+            initial_last_processed_id=307,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "TENCENT_SURVEY_COOKIE may have expired or been signed out",
+        ):
+            client.export_csv(store)
+
+    def test_export_csv_reports_login_page_during_poll(self) -> None:
+        responses = [
+            (
+                json.dumps(
+                    {
+                        "status": 1,
+                        "data": {"id": 11046713, "status_info": "Ready", "result": "[]"},
+                    }
+                ).encode("utf-8"),
+                {"Content-Type": "application/json"},
+            ),
+            (
+                (
+                    "<!DOCTYPE html><html lang=\"zh-cn\"><head>"
+                    "<title>登录 - 腾讯问卷</title></head><body>请登录</body></html>"
+                ).encode("utf-8"),
+                {"Content-Type": "text/html; charset=utf-8"},
+            ),
+        ]
+        client = StubSurveyClient(build_config(), responses)
+        store = StoreConfig(
+            store_key="store_a",
+            store_name="门店A",
+            survey_id="22512014",
+            output_xlsx_path=Path("/tmp/output.xlsx"),
+            initial_last_processed_id=307,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "TENCENT_SURVEY_COOKIE may have expired or been signed out",
+        ):
+            client.export_csv(store)
