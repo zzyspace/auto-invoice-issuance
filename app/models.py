@@ -22,8 +22,8 @@ class StoreConfig:
     portal_company_switch_name: Optional[str] = None
     portal_company_verify_name: Optional[str] = None
     portal_company_role: str = "legal_representative"
-    store_area: str = "xiamen"
-    store_area_name: Optional[str] = None
+    portal_area: str = "xiamen"
+    portal_area_name: Optional[str] = None
 
     def effective_attachment_question_id(self, default_question_id: Optional[str]) -> str:
         question_id = self.attachment_question_id or default_question_id
@@ -45,22 +45,22 @@ class StoreConfig:
             raise ValueError(f"Store '{self.store_key}' is missing portal_company_verify_name.")
         return value
 
-    def effective_store_area(self) -> str:
-        value = (self.store_area or "").strip().lower()
+    def effective_portal_area(self) -> str:
+        value = (self.portal_area or "").strip().lower()
         if not value:
             return "xiamen"
         if not re.fullmatch(r"[a-z0-9-]+", value):
             raise ValueError(
-                f"Store '{self.store_key}' has invalid store_area={self.store_area!r}; "
+                f"Store '{self.store_key}' has invalid portal_area={self.portal_area!r}; "
                 "expected lowercase letters, numbers, or hyphens."
             )
         return value
 
-    def effective_store_area_name(self) -> str:
-        value = (self.store_area_name or "").strip()
+    def effective_portal_area_name(self) -> str:
+        value = (self.portal_area_name or "").strip()
         if value:
             return value
-        return self.effective_store_area()
+        return self.effective_portal_area()
 
 
 @dataclass(frozen=True)
@@ -137,20 +137,20 @@ class AppConfig:
     portal_sync_batch_mode: bool = True
 
     @staticmethod
-    def _render_portal_url(url_template: str, store_area: Optional[str]) -> str:
-        area = (store_area or "").strip().lower() or "xiamen"
-        return url_template.replace("{store_area}", area)
+    def _render_portal_url(url_template: str, portal_area: Optional[str]) -> str:
+        area = (portal_area or "").strip().lower() or "xiamen"
+        return url_template.replace("{portal_area}", area).replace("{store_area}", area)
 
     def portal_home_url_for_store(self, store: Optional[StoreConfig]) -> str:
-        area = store.effective_store_area() if store is not None else None
+        area = store.effective_portal_area() if store is not None else None
         return self._render_portal_url(self.portal_home_url, area)
 
     def portal_identity_switch_url_for_store(self, store: Optional[StoreConfig]) -> str:
-        area = store.effective_store_area() if store is not None else None
+        area = store.effective_portal_area() if store is not None else None
         return self._render_portal_url(self.portal_identity_switch_url, area)
 
     def portal_batch_issue_url_for_store(self, store: Optional[StoreConfig]) -> str:
-        area = store.effective_store_area() if store is not None else None
+        area = store.effective_portal_area() if store is not None else None
         return self._render_portal_url(self.portal_batch_issue_url, area)
 
 
@@ -282,6 +282,7 @@ class PortalIssueDetail:
 class PortalIssueResult:
     store_key: str
     store_name: str
+    portal_area_name: str
     company_verify_name: str
     portal_company_role: str
     workbook_path: Path

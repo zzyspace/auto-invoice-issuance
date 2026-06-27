@@ -239,7 +239,7 @@ stores:
             payload = json.loads(mocked_print.call_args.args[0])
             self.assertFalse(payload["launched"])
 
-    def test_command_portal_open_chrome_cdp_uses_selected_store_area_home_url(self) -> None:
+    def test_command_portal_open_chrome_cdp_uses_selected_portal_area_home_url(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
             env_path = tmp_path / ".env"
@@ -266,7 +266,7 @@ stores:
                         "TAX_PORTAL_CHROME_CDP_URL=http://127.0.0.1:9555",
                         f"TAX_PORTAL_CHROME_CDP_USER_DATA_DIR={tmp_path / 'cdp-profile'}",
                         f"TAX_PORTAL_CHROME_EXECUTABLE_PATH={chrome_path}",
-                        "TAX_PORTAL_HOME_URL=https://etax.{store_area}.chinatax.gov.cn:8443/loginb/",
+                        "TAX_PORTAL_HOME_URL=https://etax.{portal_area}.chinatax.gov.cn:8443/loginb/",
                     ]
                 ),
                 encoding="utf-8",
@@ -281,7 +281,7 @@ stores:
     initial_last_processed_id: 1
     portal_enabled: true
     portal_priority: 10
-    store_area: xiamen
+    portal_area: xiamen
     portal_company_switch_name: Fuzzy
     portal_company_verify_name: Fuzzy
   - store_key: fuzzy_qz
@@ -291,7 +291,7 @@ stores:
     initial_last_processed_id: 1
     portal_enabled: true
     portal_priority: 30
-    store_area: quanzhou
+    portal_area: quanzhou
     portal_company_switch_name: FuzzyQZ
     portal_company_verify_name: FuzzyQZ
 """.strip(),

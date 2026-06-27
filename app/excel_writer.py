@@ -103,4 +103,3 @@ class InvoiceExcelWriter:
             if not column:
                 continue
             sheet.cell(row_index, column).value = value
-

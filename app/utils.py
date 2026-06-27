@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import ssl
+import shutil
 from copy import copy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -63,6 +64,21 @@ def render_token_template(template: str, context: dict[str, Any]) -> str:
 
 def ensure_parent_dir(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def backup_existing_file(path: Path, backup_dir: Path) -> Optional[Path]:
+    if not path.exists():
+        return None
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    suffix = path.suffix
+    backup_path = backup_dir / f"{timestamp}{suffix}"
+    index = 1
+    while backup_path.exists():
+        backup_path = backup_dir / f"{timestamp}_{index}{suffix}"
+        index += 1
+    ensure_parent_dir(backup_path)
+    shutil.copy2(path, backup_path)
+    return backup_path
 
 
 def build_ssl_context(verify: bool = True, ca_bundle_path: Optional[Path] = None) -> ssl.SSLContext:

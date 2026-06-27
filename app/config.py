@@ -105,8 +105,10 @@ def load_store_configs(path: Path) -> list[StoreConfig]:
                 if item.get("portal_company_verify_name")
                 else None,
                 portal_company_role=str(item.get("portal_company_role", "legal_representative")),
-                store_area=str(item.get("store_area", "xiamen")),
-                store_area_name=str(item["store_area_name"])
+                portal_area=str(item.get("portal_area", item.get("store_area", "xiamen"))),
+                portal_area_name=str(item["portal_area_name"])
+                if item.get("portal_area_name")
+                else str(item["store_area_name"])
                 if item.get("store_area_name")
                 else None,
             )

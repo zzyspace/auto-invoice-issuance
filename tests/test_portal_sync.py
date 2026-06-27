@@ -110,3 +110,31 @@ class PortalSyncTests(unittest.TestCase):
             with patch("app.portal_sync.shutil.which", return_value=None):
                 with self.assertRaisesRegex(PortalWorkbookSyncError, "scp"):
                     syncer.sync_store_workbook(store)
+
+    def test_sync_store_workbook_backs_up_existing_local_workbook_before_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = build_config(tmp_path)
+            syncer = PortalWorkbookSyncer(config)
+            output_path = tmp_path / "output" / "fuzzy_invoice.xlsx"
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text("old workbook", encoding="utf-8")
+            store = StoreConfig(
+                store_key="fuzzy",
+                store_name="Fuzzy",
+                survey_id="1",
+                output_xlsx_path=output_path,
+                initial_last_processed_id=1,
+            )
+
+            def fake_run(command: list[str], **_: object) -> None:
+                Path(command[-1]).write_text("new workbook", encoding="utf-8")
+
+            with patch("app.portal_sync.shutil.which", return_value="scp"):
+                with patch("app.portal_sync.subprocess.run", side_effect=fake_run):
+                    syncer.sync_store_workbook(store)
+
+            backups = list((tmp_path / "backups" / "sync" / "fuzzy").glob("*.xlsx"))
+            self.assertEqual(1, len(backups))
+            self.assertEqual("old workbook", backups[0].read_text(encoding="utf-8"))
+            self.assertEqual("new workbook", output_path.read_text(encoding="utf-8"))

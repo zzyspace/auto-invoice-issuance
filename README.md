@@ -68,8 +68,8 @@ TAX_LOOKUP_ALAPI_TOKEN=your_alapi_token_here
 - 税务局 runner 额外字段：
   - `portal_enabled`: 是否允许该门店进入税务局开票 runner
   - `portal_priority`: runner 默认执行顺序，数值越小越先执行
-  - `store_area`: 税务局域名里的地区编码，如 `xiamen`、`quanzhou`
-  - `store_area_name`: 可选，地区中文名，仅用于日志和可读性
+  - `portal_area`: 税务局域名里的地区编码，如 `xiamen`、`quanzhou`
+  - `portal_area_name`: 可选，地区中文名，仅用于日志和可读性
   - `portal_company_switch_name`: 身份切换列表里的目标公司名
   - `portal_company_verify_name`: 切换完成后首页/业务页里用于校验的公司名
   - `portal_company_role`: 身份类型，支持 `legal_representative`、`tax_operator`
@@ -122,7 +122,7 @@ env -u http_proxy -u https_proxy PLAYWRIGHT_BROWSERS_PATH=./data/ms-playwright .
 ./tax-portal run --store-key fuzzy
 ```
 
-- `./tax-portal sync`：先把服务器上的最新模板同步到本地 `output/*.xlsx`
+- `./tax-portal sync`：先把服务器上的最新模板同步到本地 `output/*.xlsx`，覆盖前会把旧文件备份到 `backups/sync/<store_key>/`
 - `./tax-portal dry-run`：导入税务局批量开票页做校验，不真实提交
 - `./tax-portal run`：执行真实提交
 - `./tax-portal dry-run` / `./tax-portal run`：如果本地还没有打开专用 Chrome CDP 窗口，会先自动帮你拉起，再继续原流程
@@ -188,6 +188,7 @@ env -u http_proxy -u https_proxy PLAYWRIGHT_BROWSERS_PATH=./data/ms-playwright .
 说明：
 
 - `./tax-portal sync` 适合“先拉最新模板到本地，再人工检查或修改本地 Excel”这类场景
+- `./tax-portal sync` 如果会覆盖本地已有 Excel，会先把旧文件备份到 `backups/sync/<store_key>/YYYYmmdd_HHMMSS.xlsx`
 - `./tax-portal run` / `./tax-portal dry-run` 会自动清掉代理环境变量，并强制使用 `chrome_cdp`
 - 如果本地 `http://127.0.0.1:9222` 没有可用 CDP，会先自动执行一次“打开专用 Chrome”再继续
 - `--skip-sync` 表示直接使用当前本地 `output/*.xlsx`，不在执行前重新从服务器覆盖
@@ -231,9 +232,9 @@ env -u http_proxy -u https_proxy PLAYWRIGHT_BROWSERS_PATH=./data/ms-playwright .
 - `TAX_PORTAL_ETAX_APP_PATH`: 可选，本机 `电子税务局` app 路径，默认 `/Applications/电子税务局.app`
 - `TAX_PORTAL_SYNC_FROM_CHROME_PROFILE`: 为 `true` 时，runner 启动前先把当前 Chrome profile 的税务局会话相关数据同步到 `TAX_PORTAL_USER_DATA_DIR/Default`
 - `TAX_PORTAL_CHROME_PROFILE_DIR`: 可选，显式指定要同步的 Chrome profile 目录；不填时默认读取本机 Chrome `Local State` 的最近使用 profile
-- `TAX_PORTAL_HOME_URL`: 税务局首页，支持 `{store_area}` 占位符
-- `TAX_PORTAL_IDENTITY_SWITCH_URL`: 企业办税身份切换页，支持 `{store_area}` 占位符
-- `TAX_PORTAL_BATCH_ISSUE_URL`: 批量开票页，支持 `{store_area}` 占位符
+- `TAX_PORTAL_HOME_URL`: 税务局首页，支持 `{portal_area}` 占位符
+- `TAX_PORTAL_IDENTITY_SWITCH_URL`: 企业办税身份切换页，支持 `{portal_area}` 占位符
+- `TAX_PORTAL_BATCH_ISSUE_URL`: 批量开票页，支持 `{portal_area}` 占位符
 - `TAX_PORTAL_DISABLE_PROXY`: 为 `true` 时，对 runner 拉起的 Chrome 显式禁用代理，只影响这次税务局自动化，不改系统代理
 - `TAX_PORTAL_LOGIN_TIMEOUT_MINUTES`: 登录等待超时
 - `TAX_PORTAL_BLOCK_ON_EMPTY_AMOUNT`: 为 `true` 时，模板里金额为空将直接阻断提交

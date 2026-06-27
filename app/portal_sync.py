@@ -5,7 +5,7 @@ import subprocess
 from pathlib import Path
 
 from app.models import AppConfig, StoreConfig
-from app.utils import ensure_parent_dir
+from app.utils import backup_existing_file, ensure_parent_dir
 
 
 class PortalWorkbookSyncError(RuntimeError):
@@ -40,6 +40,7 @@ class PortalWorkbookSyncer:
             raise PortalWorkbookSyncError(
                 f"Failed to sync workbook for {store.store_key} from server: {stderr or exc}"
             ) from exc
+        backup_existing_file(local_path, self.config.backups_root / "sync" / store.store_key)
         temp_path.replace(local_path)
 
     def _build_command(self, scp_bin: str, remote_path: str, local_path: Path) -> list[str]:

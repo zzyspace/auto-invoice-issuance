@@ -204,6 +204,79 @@ class PortalRunnerUrlTests(unittest.TestCase):
 
             self.assertIs(login_page, resolved_page)
 
+    def test_find_attached_portal_page_requires_matching_portal_area(self) -> None:
+        class FakeLocator:
+            def __init__(self, page: "FakePage") -> None:
+                self.page = page
+
+            def inner_text(self) -> str:
+                return self.page.body_text
+
+        class FakePage:
+            def __init__(self, url: str, body_text: str) -> None:
+                self.url = url
+                self.body_text = body_text
+
+            def locator(self, selector: str) -> FakeLocator:
+                return FakeLocator(self)
+
+        class FakeContext:
+            def __init__(self, pages: list[FakePage]) -> None:
+                self.pages = pages
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=None,
+                portal_browser_backend="chrome_cdp",
+                portal_chrome_cdp_url="http://127.0.0.1:9222",
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+            wrong_area_home_page = FakePage(
+                "https://etax.xiamen.chinatax.gov.cn:8443/loginb/",
+                "首页 我要办税 厦门市思明区浮几创意餐厅",
+            )
+            store = StoreConfig(
+                store_key="fuzzy_qz",
+                store_name="FuzzyQZ",
+                survey_id="1",
+                output_xlsx_path=tmp_path / "output.xlsx",
+                initial_last_processed_id=1,
+                portal_enabled=True,
+                portal_company_switch_name="泉州市鲤城区浮几餐饮店（个体工商户）",
+                portal_company_verify_name="泉州市鲤城区浮几餐饮店（个体工商户）",
+                portal_area="quanzhou",
+                portal_area_name="泉州",
+            )
+
+            resolved_page = runner._find_attached_portal_page(  # noqa: SLF001
+                FakeContext([wrong_area_home_page]),
+                store,
+            )
+
+            self.assertIsNone(resolved_page)
+
     def test_run_with_attached_chrome_uses_existing_browser_context(self) -> None:
         class FakePage:
             def __init__(self, url: str, body_text: str) -> None:
@@ -836,6 +909,99 @@ class PortalRunnerUrlTests(unittest.TestCase):
 
             self.assertIs(home_page, authenticated_page)
 
+    def test_ensure_logged_in_ignores_authenticated_page_from_other_portal_area(self) -> None:
+        class FakeLocator:
+            def __init__(self, page: "FakePage") -> None:
+                self.page = page
+
+            def inner_text(self) -> str:
+                return self.page.body_text
+
+        class FakePage:
+            def __init__(self, url: str, body_text: str) -> None:
+                self.url = url
+                self.body_text = body_text
+                self.context = None
+
+            def locator(self, selector: str) -> FakeLocator:
+                return FakeLocator(self)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=tmp_path / "profile",
+                portal_browser_backend="chrome_cdp",
+                portal_login_timeout_minutes=1,
+                portal_etax_app_username="demo-user",
+                portal_etax_app_password="demo-pass",
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+            login_page = FakePage(
+                "https://tpass.fujian.chinatax.gov.cn:8443/#/login",
+                "打开电子税务局APP扫一扫",
+            )
+            other_area_home_page = FakePage(
+                "https://etax.xiamen.chinatax.gov.cn:8443/workbench/home",
+                "首页 我要办税 我要查询",
+            )
+            context = SimpleNamespace(pages=[login_page, other_area_home_page])
+            login_page.context = context
+            other_area_home_page.context = context
+            result = type("FakeResult", (), {"artifacts_dir": None, "store_key": "fuzzy_qz", "portal_company_role": "legal_representative"})()
+            store = StoreConfig(
+                store_key="fuzzy_qz",
+                store_name="FuzzyQZ",
+                survey_id="1",
+                output_xlsx_path=tmp_path / "output.xlsx",
+                initial_last_processed_id=1,
+                portal_enabled=True,
+                portal_company_switch_name="泉州市鲤城区浮几餐饮店（个体工商户）（待确认）",
+                portal_company_verify_name="泉州市鲤城区浮几餐饮店（个体工商户）",
+                portal_area="fujian",
+                portal_area_name="福建省",
+            )
+
+            monotonic_values = iter([0.0, 1.0, 2.0, 3.0])
+            authenticated_page = object()
+
+            with patch("app.portal_runner.monotonic", side_effect=lambda: next(monotonic_values)):
+                with patch("app.portal_runner.sleep", lambda _: None):
+                    with patch.object(runner, "_is_public_landing_page", return_value=False):
+                        with patch.object(runner, "_page_requires_reauth", return_value=True):
+                            with patch.object(runner, "_is_login_page", return_value=True):
+                                with patch.object(runner, "_refresh_attached_authenticated_page", return_value=None):
+                                    with patch.object(runner, "_attempt_local_app_login", return_value=True) as mocked_attempt:
+                                        with patch.object(
+                                            runner,
+                                            "_confirmed_authenticated_page",
+                                            side_effect=[None, None, None, authenticated_page],
+                                        ):
+                                            returned = runner._ensure_logged_in(login_page, result, store)  # noqa: SLF001
+
+            self.assertIs(authenticated_page, returned)
+            mocked_attempt.assert_called_once_with(login_page, result, store)
+
     def test_confirmed_authenticated_page_rechecks_load_redirect_to_login(self) -> None:
         class FakeLocator:
             def __init__(self, page: "FakePage") -> None:
@@ -1000,7 +1166,7 @@ class PortalRunnerUrlTests(unittest.TestCase):
                                             authenticated_page = runner._ensure_logged_in(page, result)  # noqa: SLF001
 
             self.assertIs(home_page, authenticated_page)
-            mocked_attempt.assert_called_once_with(page, result)
+            mocked_attempt.assert_called_once_with(page, result, None)
 
     def test_ensure_authenticated_home_page_normalizes_authenticated_shell_page(self) -> None:
         class FakeLocator:
@@ -1060,6 +1226,7 @@ class PortalRunnerUrlTests(unittest.TestCase):
                 shell_page,
                 config.portal_home_url,
                 result,
+                store=None,
                 expected_text="我要办税",
                 step_name="open authenticated portal home",
             )
@@ -1208,6 +1375,7 @@ class PortalRunnerUrlTests(unittest.TestCase):
                 page,
                 config.portal_batch_issue_url,
                 result,
+                store=store,
                 expected_text=None,
                 step_name="open batch issue page",
             )
@@ -2076,6 +2244,7 @@ class PortalRunnerUrlTests(unittest.TestCase):
                 home_page,
                 config.portal_identity_switch_url,
                 result,
+                store=store,
                 expected_text="企业办税",
                 step_name="switch company",
             )
@@ -2083,6 +2252,7 @@ class PortalRunnerUrlTests(unittest.TestCase):
                 switch_page,
                 config.portal_home_url,
                 result,
+                store=store,
                 expected_text="我要办税",
                 step_name="return home with active company 厦门市思明区浮几创意餐厅",
             )
@@ -2300,7 +2470,7 @@ class PortalRunnerUrlTests(unittest.TestCase):
             self.assertIs(page, returned_page)
             mocked_nav.assert_called_once()
 
-    def test_ensure_company_reopens_target_area_home_when_store_area_changes(self) -> None:
+    def test_ensure_company_reopens_target_area_home_when_portal_area_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
             config = AppConfig(
@@ -2326,9 +2496,9 @@ class PortalRunnerUrlTests(unittest.TestCase):
                 stores_config_path=tmp_path / "stores.yaml",
                 backups_root=tmp_path / "backups",
                 portal_user_data_dir=tmp_path / "profile",
-                portal_home_url="https://etax.{store_area}.chinatax.gov.cn:8443/loginb/",
+                portal_home_url="https://etax.{portal_area}.chinatax.gov.cn:8443/loginb/",
                 portal_identity_switch_url=(
-                    "https://tpass.{store_area}.chinatax.gov.cn:8443/#/identitySwitch/enterprise"
+                    "https://tpass.{portal_area}.chinatax.gov.cn:8443/#/identitySwitch/enterprise"
                     "?client_id=y56b7aay5brf48f8aa7bf24dd54d775r"
                 ),
             )
@@ -2342,8 +2512,8 @@ class PortalRunnerUrlTests(unittest.TestCase):
                 portal_enabled=True,
                 portal_company_switch_name="泉州市鲤城区浮几餐饮店（个体工商户）（待确认）",
                 portal_company_verify_name="泉州市鲤城区浮几餐饮店（个体工商户）",
-                store_area="quanzhou",
-                store_area_name="泉州",
+                portal_area="quanzhou",
+                portal_area_name="泉州",
             )
             result = SimpleNamespace(workbook_sha256="abc123")
             current_home_page = SimpleNamespace(url="https://etax.xiamen.chinatax.gov.cn:8443/loginb/")
@@ -2371,6 +2541,7 @@ class PortalRunnerUrlTests(unittest.TestCase):
                 current_home_page,
                 "https://etax.quanzhou.chinatax.gov.cn:8443/loginb/",
                 result,
+                store=store,
                 expected_text="我要办税",
                 step_name="open 泉州 portal home",
             )
@@ -2378,6 +2549,7 @@ class PortalRunnerUrlTests(unittest.TestCase):
                 target_home_page,
                 "https://tpass.quanzhou.chinatax.gov.cn:8443/#/identitySwitch/enterprise?client_id=y56b7aay5brf48f8aa7bf24dd54d775r",
                 result,
+                store=store,
                 expected_text="企业办税",
                 step_name="switch company",
             )
@@ -2385,6 +2557,7 @@ class PortalRunnerUrlTests(unittest.TestCase):
                 switch_page,
                 "https://etax.quanzhou.chinatax.gov.cn:8443/loginb/",
                 result,
+                store=store,
                 expected_text="我要办税",
                 step_name="return home with active company 泉州市鲤城区浮几餐饮店（个体工商户）",
             )
@@ -2528,8 +2701,9 @@ class PortalRunnerUrlTests(unittest.TestCase):
                 self.events.append("close_batch_page")
 
         class FakeContext:
-            def __init__(self, events: list[str]) -> None:
+            def __init__(self, events: list[str], home_page: FakeHomePage) -> None:
                 self.events = events
+                self.pages = [home_page]
 
             def new_page(self) -> FakeBatchPage:
                 self.events.append("new_page")
@@ -2617,7 +2791,7 @@ class PortalRunnerUrlTests(unittest.TestCase):
                                                             ):
                                                                 with patch.object(runner, "_log"):
                                                                     result = runner._run_store(  # noqa: SLF001
-                                                                        FakeContext(events),
+                                                                        FakeContext(events, home_page),
                                                                         home_page,
                                                                         store,
                                                                     )
@@ -2656,8 +2830,9 @@ class PortalRunnerUrlTests(unittest.TestCase):
                 return FakeLocator()
 
         class FakeContext:
-            def __init__(self, events: list[str]) -> None:
+            def __init__(self, events: list[str], home_page: FakeHomePage) -> None:
                 self.events = events
+                self.pages = [home_page]
 
             def new_page(self) -> FakeBatchPage:
                 self.events.append("new_page")
@@ -2726,7 +2901,7 @@ class PortalRunnerUrlTests(unittest.TestCase):
                                                             ):
                                                                 with patch.object(runner, "_log"):
                                                                     result = runner._run_store(  # noqa: SLF001
-                                                                        FakeContext(events),
+                                                                        FakeContext(events, home_page),
                                                                         home_page,
                                                                         store,
                                                                     )

@@ -70,6 +70,19 @@ class PortalLocalLoginTests(unittest.TestCase):
 
         self.assertEqual("839952", code)
 
+    def test_extract_first_sms_code_prefers_expected_tax_issuer(self) -> None:
+        texts = [
+            "【厦门税务】您的验证码是：111111（有效期为5分钟）",
+            "【泉州税务】您的验证码是：222222（有效期为5分钟）",
+        ]
+
+        code = PortalMacLoginAutomator._extract_first_sms_code(  # noqa: SLF001
+            texts,
+            expected_issuer="泉州税务",
+        )
+
+        self.assertEqual("222222", code)
+
     def test_request_sms_code_retries_until_countdown_visible(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
@@ -125,6 +138,47 @@ class PortalLocalLoginTests(unittest.TestCase):
                     automator._dismiss_fingerprint_prompt("cn.gov.chinatax.gt4.app")  # noqa: SLF001
 
         self.assertEqual([(109.0, 365.0)], clicks)
+
+    def test_dismiss_startup_reminder_falls_back_to_relative_click(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = self._build_config(tmp_path)
+            automator = PortalMacLoginAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
+            clicks: list[tuple[float, float]] = []
+            visible_states = iter([True, False])
+
+            class FakeAX:
+                def click_at(self, x: float, y: float) -> None:
+                    clicks.append((x, y))
+
+            automator._ax = FakeAX()  # type: ignore[assignment]
+
+            with patch.object(automator, "_startup_reminder_visible", side_effect=lambda *args: next(visible_states)):
+                with patch.object(automator, "_window_bounds_for_bundle", return_value=(10.0, 20.0, 300.0, 500.0)):
+                    with patch("app.portal_local_login.sleep", return_value=None):
+                        automator._dismiss_startup_reminder_if_present("cn.gov.chinatax.gt4.app")  # noqa: SLF001
+
+        self.assertEqual([(160.0, 460.0)], clicks)
+
+    def test_dismiss_startup_reminder_runs_only_once_per_automation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = self._build_config(tmp_path)
+            automator = PortalMacLoginAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
+            events: list[str] = []
+            visible_states = iter([True, False])
+
+            with patch.object(automator, "_startup_reminder_visible", side_effect=lambda *args: next(visible_states)):
+                with patch.object(
+                    automator,
+                    "_click_startup_reminder_close",
+                    side_effect=lambda *args: events.append("click_close"),
+                ):
+                    with patch("app.portal_local_login.sleep", return_value=None):
+                        automator._dismiss_startup_reminder_if_present("cn.gov.chinatax.gt4.app")  # noqa: SLF001
+                        automator._dismiss_startup_reminder_if_present("cn.gov.chinatax.gt4.app")  # noqa: SLF001
+
+        self.assertEqual(["click_close"], events)
 
     def test_open_album_from_scan_page_retries_until_scan_page_disappears(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -405,8 +459,18 @@ class PortalLocalLoginTests(unittest.TestCase):
             def _wait_for_process(self, bundle_id: str, *, timeout_seconds: float) -> None:
                 events.append(f"wait:{bundle_id}")
 
+            def _home_page_is_logged_in(self, bundle_id: str) -> bool:
+                events.append(f"home_logged_in:{bundle_id}")
+                return False
+
             def _ensure_etax_session(self, bundle_id: str) -> None:
                 events.append(f"session:{bundle_id}")
+
+            def _open_home_tab(self, bundle_id: str) -> None:
+                events.append(f"home_tab:{bundle_id}")
+
+            def _ensure_home_portal_area(self, bundle_id: str) -> None:
+                events.append(f"home_area:{bundle_id}")
 
             def _open_scan_flow(self, bundle_id: str) -> None:
                 events.append(f"scan:{bundle_id}")
@@ -434,13 +498,392 @@ class PortalLocalLoginTests(unittest.TestCase):
                 "resolve_bundle",
                 "launch",
                 "wait:cn.gov.chinatax.gt4.app",
+                "home_logged_in:cn.gov.chinatax.gt4.app",
                 "session:cn.gov.chinatax.gt4.app",
+                "home_tab:cn.gov.chinatax.gt4.app",
+                "home_area:cn.gov.chinatax.gt4.app",
                 "scan:cn.gov.chinatax.gt4.app",
                 "album:cn.gov.chinatax.gt4.app",
                 "confirm:cn.gov.chinatax.gt4.app",
             ],
             events,
         )
+
+    def test_automate_skips_my_page_session_check_when_home_already_logged_in(self) -> None:
+        events: list[str] = []
+
+        class FakeAutomator(PortalMacLoginAutomator):
+            def _require_supported_environment(self) -> None:
+                events.append("require")
+
+            def _verify_gui_automation_prerequisites(self) -> None:
+                events.append("verify_gui")
+
+            def _capture_qr_code(self, page: object, artifacts_dir: Path | None) -> Path:
+                events.append("capture_qr")
+                return Path("/tmp/login-qr.png")
+
+            def _import_qr_into_photos(self, qr_path: Path) -> None:
+                events.append(f"import:{qr_path}")
+
+            def _resolve_app_bundle_identifier(self) -> str:
+                events.append("resolve_bundle")
+                return "cn.gov.chinatax.gt4.app"
+
+            def _launch_etax_app(self) -> None:
+                events.append("launch")
+
+            def _wait_for_process(self, bundle_id: str, *, timeout_seconds: float) -> None:
+                events.append(f"wait:{bundle_id}")
+
+            def _home_page_is_logged_in(self, bundle_id: str) -> bool:
+                events.append(f"home_logged_in:{bundle_id}")
+                return True
+
+            def _ensure_etax_session(self, bundle_id: str) -> None:
+                events.append(f"session:{bundle_id}")
+
+            def _open_home_tab(self, bundle_id: str) -> None:
+                events.append(f"home_tab:{bundle_id}")
+
+            def _ensure_home_portal_area(self, bundle_id: str) -> None:
+                events.append(f"home_area:{bundle_id}")
+
+            def _open_scan_flow(self, bundle_id: str) -> None:
+                events.append(f"scan:{bundle_id}")
+
+            def _select_latest_qr_from_album(self, bundle_id: str) -> None:
+                events.append(f"album:{bundle_id}")
+
+            def _confirm_scan_login(self, bundle_id: str) -> None:
+                events.append(f"confirm:{bundle_id}")
+
+            def _log(self, message: str) -> None:
+                events.append(f"log:{message}")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = self._build_config(tmp_path)
+            automator = FakeAutomator(config, "fuzzy_qz", "法定代表人", lambda *_: None)
+
+            qr_path = automator.automate(object(), tmp_path)
+
+        self.assertEqual(Path("/tmp/login-qr.png"), qr_path)
+        self.assertEqual(
+            [
+                "require",
+                "verify_gui",
+                "capture_qr",
+                "import:/tmp/login-qr.png",
+                "resolve_bundle",
+                "launch",
+                "wait:cn.gov.chinatax.gt4.app",
+                "home_logged_in:cn.gov.chinatax.gt4.app",
+                "log:电子税务局 首页已显示身份切换; 跳过我的页登录态确认",
+                "home_tab:cn.gov.chinatax.gt4.app",
+                "home_area:cn.gov.chinatax.gt4.app",
+                "scan:cn.gov.chinatax.gt4.app",
+                "album:cn.gov.chinatax.gt4.app",
+                "confirm:cn.gov.chinatax.gt4.app",
+            ],
+            events,
+        )
+
+    def test_portal_area_text_matches_target_accepts_subset(self) -> None:
+        self.assertTrue(
+            PortalMacLoginAutomator._portal_area_text_matches_target("福建", "福建省")  # noqa: SLF001
+        )
+        self.assertTrue(
+            PortalMacLoginAutomator._portal_area_text_matches_target("福建省", "福建省")  # noqa: SLF001
+        )
+        self.assertFalse(
+            PortalMacLoginAutomator._portal_area_text_matches_target("厦门", "福建省")  # noqa: SLF001
+        )
+
+    def test_texts_show_logged_in_home_accepts_identity_switch_marker(self) -> None:
+        self.assertTrue(
+            PortalMacLoginAutomator._texts_show_logged_in_home(["身份切换", "首页"])  # noqa: SLF001
+        )
+
+    def test_home_page_is_logged_in_requires_identity_switch_node(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = self._build_config(tmp_path)
+            automator = PortalMacLoginAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
+            nodes_without_identity_switch = [
+                AXNode(
+                    element=1,
+                    role="AXStaticText",
+                    subrole="",
+                    texts=("功能名称",),
+                    position=(10.0, 20.0),
+                    size=(40.0, 20.0),
+                )
+            ]
+            nodes_with_identity_switch = [
+                AXNode(
+                    element=2,
+                    role="AXButton",
+                    subrole="",
+                    texts=("身份切换",),
+                    position=(20.0, 40.0),
+                    size=(60.0, 24.0),
+                )
+            ]
+
+            with patch.object(automator, "_nodes_for_bundle", return_value=nodes_without_identity_switch):
+                self.assertFalse(automator._home_page_is_logged_in("cn.gov.chinatax.gt4.app"))  # noqa: SLF001
+
+            with patch.object(automator, "_nodes_for_bundle", return_value=nodes_with_identity_switch):
+                self.assertTrue(automator._home_page_is_logged_in("cn.gov.chinatax.gt4.app"))  # noqa: SLF001
+
+    def test_current_home_portal_area_text_falls_back_to_ocr_when_ax_candidates_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = self._build_config(tmp_path)
+            automator = PortalMacLoginAutomator(
+                config,
+                "fuzzy",
+                "法定代表人",
+                lambda *_: None,
+                portal_area_name="厦门市",
+            )
+
+            with patch.object(automator, "_nodes_for_bundle", return_value=[]):
+                with patch.object(automator, "_window_bounds_for_bundle", return_value=(0.0, 0.0, 300.0, 500.0)):
+                    with patch.object(automator, "_ocr_home_portal_area_text", return_value="厦门") as mocked_ocr:
+                        area = automator._current_home_portal_area_text("cn.gov.chinatax.gt4.app")  # noqa: SLF001
+
+        self.assertEqual("厦门", area)
+        mocked_ocr.assert_called_once_with("cn.gov.chinatax.gt4.app")
+
+    def test_ocr_home_portal_area_text_normalizes_model_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = self._build_config(tmp_path)
+            automator = PortalMacLoginAutomator(
+                config,
+                "fuzzy",
+                "法定代表人",
+                lambda *_: None,
+                portal_area_name="厦门市",
+            )
+            fake_image = tmp_path / "home-area.png"
+            fake_image.write_bytes(b"png")
+
+            with patch.object(automator, "_capture_home_portal_area_screenshot", return_value=fake_image):
+                with patch.object(
+                    automator,
+                    "_recognize_portal_area_text_from_image",
+                    return_value="厦门\n",
+                ):
+                    area = automator._ocr_home_portal_area_text("cn.gov.chinatax.gt4.app")  # noqa: SLF001
+
+        self.assertEqual("厦门", area)
+
+    def test_ensure_home_portal_area_skips_switch_when_current_area_matches_target_subset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = self._build_config(tmp_path)
+            automator = PortalMacLoginAutomator(
+                config,
+                "fuzzy_qz",
+                "法定代表人",
+                lambda *_: None,
+                portal_area_name="福建省",
+                portal_company_switch_name="泉州市鲤城区浮几餐饮店（个体工商户）（待确认）",
+            )
+
+            with patch.object(automator, "_wait_for_home_portal_area", return_value="福建"):
+                with patch.object(automator, "_switch_home_portal_area") as mocked_switch:
+                    automator._ensure_home_portal_area("cn.gov.chinatax.gt4.app")  # noqa: SLF001
+
+        mocked_switch.assert_not_called()
+
+    def test_ensure_home_portal_area_switches_when_current_area_mismatches_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = self._build_config(tmp_path)
+            automator = PortalMacLoginAutomator(
+                config,
+                "fuzzy_qz",
+                "法定代表人",
+                lambda *_: None,
+                portal_area_name="福建省",
+                portal_company_switch_name="泉州市鲤城区浮几餐饮店（个体工商户）（待确认）",
+            )
+
+            with patch.object(automator, "_wait_for_home_portal_area", return_value="厦门"):
+                with patch.object(automator, "_switch_home_portal_area") as mocked_switch:
+                    automator._ensure_home_portal_area("cn.gov.chinatax.gt4.app")  # noqa: SLF001
+
+        mocked_switch.assert_called_once_with("cn.gov.chinatax.gt4.app")
+
+    def test_switch_home_portal_area_clicks_identity_switch_nation_target_area_and_company(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = self._build_config(tmp_path)
+            automator = PortalMacLoginAutomator(
+                config,
+                "fuzzy_qz",
+                "法定代表人",
+                lambda *_: None,
+                portal_area_name="福建省",
+                portal_company_switch_name="泉州市鲤城区浮几餐饮店（个体工商户）（待确认）",
+            )
+            events: list[tuple[str, tuple[str, ...], bool]] = []
+
+            def fake_click_named_element(
+                bundle_id: str,
+                names: tuple[str, ...],
+                *,
+                timeout_seconds: float,
+                contains: bool = False,
+            ) -> str:
+                _ = bundle_id, timeout_seconds
+                events.append(("click", names, contains))
+                return names[0]
+
+            def fake_wait_for_named_text(
+                bundle_id: str,
+                names: tuple[str, ...],
+                *,
+                timeout_seconds: float,
+                contains: bool = False,
+            ) -> str:
+                _ = bundle_id, timeout_seconds
+                events.append(("wait", names, contains))
+                return names[0]
+
+            with patch.object(automator, "_click_named_element", side_effect=fake_click_named_element):
+                with patch.object(automator, "_wait_for_named_text", side_effect=fake_wait_for_named_text):
+                    with patch.object(
+                        automator,
+                        "_click_company_switch_button",
+                        side_effect=lambda bundle_id, company_name: events.append(("switch", (company_name,), False)),
+                    ):
+                        with patch.object(
+                            automator,
+                            "_complete_area_switch_role_selection",
+                            side_effect=lambda bundle_id: events.append(("role_flow", (bundle_id,), False)),
+                        ):
+                            with patch("app.portal_local_login.sleep", return_value=None):
+                                automator._switch_home_portal_area("cn.gov.chinatax.gt4.app")  # noqa: SLF001
+
+        self.assertEqual(
+            [
+                ("click", ("身份切换",), False),
+                ("wait", ("全国",), False),
+                ("click", ("全国",), False),
+                ("wait", ("福建省",), False),
+                ("click", ("福建省",), False),
+                ("wait", ("泉州市鲤城区浮几餐饮店（个体工商户）（待确认）",), True),
+                ("switch", ("泉州市鲤城区浮几餐饮店（个体工商户）（待确认）",), False),
+                ("role_flow", ("cn.gov.chinatax.gt4.app",), False),
+            ],
+            events,
+        )
+
+    def test_complete_area_switch_role_selection_confirms_role_dialog_and_returns_home(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = self._build_config(tmp_path)
+            automator = PortalMacLoginAutomator(config, "fuzzy_qz", "法定代表人", lambda *_: None)
+            events: list[str] = []
+            states = iter(["role_dialog", "home"])
+
+            with patch.object(
+                automator,
+                "_wait_for_post_login_state",
+                side_effect=lambda bundle_id, *, timeout_seconds: next(states),
+            ):
+                with patch.object(
+                    automator,
+                    "_confirm_role_selection",
+                    side_effect=lambda bundle_id, role_already_selected=False: events.append("confirm_role") or "home",
+                ):
+                    with patch.object(automator, "_log", side_effect=lambda message: events.append(f"log:{message}")):
+                        automator._complete_area_switch_role_selection("cn.gov.chinatax.gt4.app")  # noqa: SLF001
+
+        self.assertEqual(
+            [
+                "confirm_role",
+                "log:area/company switch role selection entered logged-in home directly",
+            ],
+            events,
+        )
+
+    def test_complete_area_switch_role_selection_confirms_switch_success_dialog_after_role_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = self._build_config(tmp_path)
+            automator = PortalMacLoginAutomator(config, "fuzzy_qz", "法定代表人", lambda *_: None)
+            events: list[str] = []
+
+            with patch.object(
+                automator,
+                "_wait_for_post_login_state",
+                return_value="role_dialog",
+            ):
+                with patch.object(
+                    automator,
+                    "_confirm_role_selection",
+                    side_effect=lambda bundle_id, role_already_selected=False: events.append("confirm_role") or "switch_success_dialog",
+                ):
+                    with patch.object(
+                        automator,
+                        "_confirm_switch_success_dialog",
+                        side_effect=lambda bundle_id: events.append("confirm_success_dialog"),
+                    ):
+                        with patch.object(automator, "_log", side_effect=lambda message: events.append(f"log:{message}")):
+                            automator._complete_area_switch_role_selection("cn.gov.chinatax.gt4.app")  # noqa: SLF001
+
+        self.assertEqual(
+            [
+                "confirm_role",
+                "confirm_success_dialog",
+                "log:confirmed switch success dialog after area/company switch role selection",
+            ],
+            events,
+        )
+
+    def test_wait_for_post_login_state_prefers_switch_success_dialog_over_background_role_dialog(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = self._build_config(tmp_path)
+            automator = PortalMacLoginAutomator(config, "fuzzy_qz", "法定代表人", lambda *_: None)
+
+            with patch.object(
+                automator,
+                "_collect_visible_texts",
+                return_value=["请选择身份类型", "切换成功", "法定代表人"],
+            ):
+                state = automator._wait_for_post_login_state("cn.gov.chinatax.gt4.app", timeout_seconds=1.0)  # noqa: SLF001
+
+        self.assertEqual("switch_success_dialog", state)
+
+    def test_confirm_switch_success_dialog_uses_relative_click(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = self._build_config(tmp_path)
+            automator = PortalMacLoginAutomator(config, "fuzzy_qz", "法定代表人", lambda *_: None)
+            events: list[str] = []
+            visible_texts = iter([["切换成功"], []])
+
+            with patch.object(
+                automator,
+                "_click_switch_success_dialog_confirm_relative",
+                side_effect=lambda bundle_id: events.append("relative_click"),
+            ):
+                with patch.object(
+                    automator,
+                    "_collect_visible_texts",
+                    side_effect=lambda bundle_id, *, timeout_seconds: next(visible_texts),
+                ):
+                    with patch("app.portal_local_login.sleep", return_value=None):
+                        automator._confirm_switch_success_dialog("cn.gov.chinatax.gt4.app")  # noqa: SLF001
+
+        self.assertEqual(["relative_click"], events)
 
     def test_wait_for_process_waits_for_accessibility_nodes_after_pid_detected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -518,6 +961,10 @@ class PortalLocalLoginTests(unittest.TestCase):
                 events.append(f"post_login:{state}")
                 return state
 
+            def _wait_for_etax_session_entry_state(self, bundle_id: str, *, timeout_seconds: float) -> str:
+                events.append(f"entry_state:{timeout_seconds}")
+                return "login_button"
+
             def _click_named_element(
                 self,
                 bundle_id: str,
@@ -583,6 +1030,102 @@ class PortalLocalLoginTests(unittest.TestCase):
         self.assertIn("messages:read", events)
         self.assertIn("set:2:False:('短信验证码',):839952", events)
 
+    def test_ensure_etax_session_dismisses_startup_reminder_before_tab_click(self) -> None:
+        events: list[str] = []
+
+        class FakeAutomator(PortalMacLoginAutomator):
+            def _dismiss_startup_reminder_if_present(self, bundle_id: str) -> None:
+                events.append("dismiss_startup")
+
+            def _click_etax_tabbar_item(self, bundle_id: str, index: int) -> None:
+                events.append(f"tab:{index}")
+
+            def _maybe_click_named_element(
+                self,
+                bundle_id: str,
+                names: tuple[str, ...],
+                *,
+                timeout_seconds: float,
+                contains: bool = False,
+            ) -> bool:
+                events.append(f"maybe:{names[0]}")
+                return False
+
+            def _wait_for_etax_session_entry_state(self, bundle_id: str, *, timeout_seconds: float) -> str:
+                events.append(f"entry_state:{timeout_seconds}")
+                return "home"
+
+            def _log(self, message: str) -> None:
+                events.append(f"log:{message}")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = self._build_config(tmp_path)
+            automator = FakeAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
+
+            automator._ensure_etax_session("cn.gov.chinatax.gt4.app")  # noqa: SLF001
+
+        self.assertEqual(
+            [
+                "log:navigating 电子税务局 app login flow",
+                "dismiss_startup",
+                "tab:4",
+                "maybe:立即登录",
+                "maybe:法定代表人",
+                "entry_state:6.0",
+                "log:电子税务局 我的页入口状态 state=home",
+            ],
+            events,
+        )
+
+    def test_ensure_etax_session_returns_immediately_when_my_page_is_already_logged_in_home(self) -> None:
+        events: list[str] = []
+
+        class FakeAutomator(PortalMacLoginAutomator):
+            def _dismiss_startup_reminder_if_present(self, bundle_id: str) -> None:
+                events.append("dismiss_startup")
+
+            def _click_etax_tabbar_item(self, bundle_id: str, index: int) -> None:
+                events.append(f"tab:{index}")
+
+            def _maybe_click_named_element(
+                self,
+                bundle_id: str,
+                names: tuple[str, ...],
+                *,
+                timeout_seconds: float,
+                contains: bool = False,
+            ) -> bool:
+                events.append(f"maybe:{names[0]}")
+                return False
+
+            def _wait_for_etax_session_entry_state(self, bundle_id: str, *, timeout_seconds: float) -> str:
+                events.append(f"entry_state:{timeout_seconds}")
+                return "home"
+
+            def _log(self, message: str) -> None:
+                events.append(f"log:{message}")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = self._build_config(tmp_path)
+            automator = FakeAutomator(config, "fuzzy_qz", "法定代表人", lambda *_: None)
+
+            automator._ensure_etax_session("cn.gov.chinatax.gt4.app")  # noqa: SLF001
+
+        self.assertEqual(
+            [
+                "log:navigating 电子税务局 app login flow",
+                "dismiss_startup",
+                "tab:4",
+                "maybe:立即登录",
+                "maybe:法定代表人",
+                "entry_state:6.0",
+                "log:电子税务局 我的页入口状态 state=home",
+            ],
+            events,
+        )
+
     def test_ensure_etax_session_skips_messages_fallback_when_prompt_fill_succeeds(self) -> None:
         events: list[str] = []
 
@@ -603,6 +1146,10 @@ class PortalLocalLoginTests(unittest.TestCase):
                 events.append(f"post_login:{state}")
                 return state
 
+            def _wait_for_etax_session_entry_state(self, bundle_id: str, *, timeout_seconds: float) -> str:
+                events.append(f"entry_state:{timeout_seconds}")
+                return "login_button"
+
             def _click_named_element(
                 self,
                 bundle_id: str,
@@ -613,16 +1160,6 @@ class PortalLocalLoginTests(unittest.TestCase):
             ) -> str:
                 events.append(f"click:{names[0]}")
                 return names[0]
-
-            def _maybe_click_named_element(
-                self,
-                bundle_id: str,
-                names: tuple[str, ...],
-                *,
-                timeout_seconds: float,
-                contains: bool = False,
-            ) -> bool:
-                return names[0] == "立即登录"
 
             def _set_text_input_value(
                 self,

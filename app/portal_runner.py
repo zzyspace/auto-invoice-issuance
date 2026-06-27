@@ -139,10 +139,16 @@ class TaxPortalRunner:
             self._attached_cdp_connections = []
         return results
 
-    def _find_attached_portal_page(self, context: object) -> object | None:
+    def _find_attached_portal_page(
+        self,
+        context: object,
+        store: StoreConfig | None = None,
+    ) -> object | None:
         portal_candidate: object | None = None
         for candidate in getattr(context, "pages", []):
             try:
+                if not self._page_matches_portal_area(candidate, store):
+                    continue
                 if self._is_home_page(candidate):
                     return candidate
                 if portal_candidate is None and self._is_portal_related_page(candidate):
@@ -189,6 +195,7 @@ class TaxPortalRunner:
         result = PortalIssueResult(
             store_key=store.store_key,
             store_name=store.store_name,
+            portal_area_name=store.effective_portal_area_name(),
             company_verify_name=store.effective_portal_company_verify_name(),
             portal_company_role=store.portal_company_role,
             workbook_path=store.output_xlsx_path,
@@ -230,17 +237,28 @@ class TaxPortalRunner:
             )
             return self._finalize_result(result)
         try:
+            reusable_home_page: object | None = None
             if self.config.portal_browser_backend == "chrome_cdp":
-                home_page = self._find_attached_portal_page(context) or home_page
-            if self.config.portal_browser_backend == "chrome_cdp" and self._is_home_page(home_page):
+                reusable_home_page = self._find_attached_portal_page(context, store)
+                if reusable_home_page is not None:
+                    home_page = reusable_home_page
+            if (
+                self.config.portal_browser_backend == "chrome_cdp"
+                and reusable_home_page is not None
+                and self._is_home_page(home_page)
+            ):
                 self._log(store.store_key, f"reusing attached Chrome home page: {home_page.url}")
-            elif self.config.portal_browser_backend == "chrome_cdp" and self._is_portal_related_page(home_page):
+            elif (
+                self.config.portal_browser_backend == "chrome_cdp"
+                and reusable_home_page is not None
+                and self._is_portal_related_page(home_page)
+            ):
                 self._log(store.store_key, f"reusing attached Chrome portal page: {home_page.url}")
             else:
                 home_url = self.config.portal_home_url_for_store(store)
                 self._log(store.store_key, f"opening portal home page: {home_url}")
                 self._goto(home_url, home_page)
-            home_page = self._ensure_logged_in(home_page, result)
+            home_page = self._ensure_logged_in(home_page, result, store)
             home_page = self._ensure_authenticated_home_page(home_page, result, store)
             context = getattr(home_page, "context", context)
             home_page = self._ensure_company(home_page, store, result)
@@ -349,8 +367,13 @@ class TaxPortalRunner:
         )
         return result
 
-    def _ensure_logged_in(self, page: object, result: PortalIssueResult) -> object:
-        authenticated_page = self._confirmed_authenticated_page(page)
+    def _ensure_logged_in(
+        self,
+        page: object,
+        result: PortalIssueResult,
+        store: StoreConfig | None = None,
+    ) -> object:
+        authenticated_page = self._confirmed_authenticated_page(page, store)
         if authenticated_page is not None:
             return authenticated_page
         deadline = monotonic() + self.config.portal_login_timeout_minutes * 60
@@ -362,7 +385,7 @@ class TaxPortalRunner:
         last_cdp_refresh_at: float | None = None
         self._log(result.store_key, "login required; waiting for successful login...")
         while monotonic() < deadline:
-            authenticated_page = self._confirmed_authenticated_page(page)
+            authenticated_page = self._confirmed_authenticated_page(page, store)
             if authenticated_page is not None:
                 if authenticated_page is page:
                     self._log(result.store_key, "login confirmed")
@@ -375,7 +398,10 @@ class TaxPortalRunner:
             now = monotonic()
             if self.config.portal_browser_backend == "chrome_cdp":
                 if last_cdp_refresh_at is None or now - last_cdp_refresh_at >= 5.0:
-                    refreshed_page = self._confirmed_authenticated_page(self._refresh_attached_authenticated_page())
+                    refreshed_page = self._confirmed_authenticated_page(
+                        self._refresh_attached_authenticated_page(store),
+                        store,
+                    )
                     last_cdp_refresh_at = now
                     if refreshed_page is not None:
                         if refreshed_page is page:
@@ -401,7 +427,7 @@ class TaxPortalRunner:
                     and self._local_app_login_enabled()
                 ):
                     local_app_login_attempted = True
-                    self._attempt_local_app_login(page, result)
+                    self._attempt_local_app_login(page, result, store)
                 if reauth_seen_at is None:
                     reauth_seen_at = now
                     self._log(
@@ -428,10 +454,28 @@ class TaxPortalRunner:
     def _local_app_login_enabled(self) -> bool:
         return PortalMacLoginAutomator.is_enabled(self.config)
 
-    def _attempt_local_app_login(self, page: object, result: PortalIssueResult) -> bool:
+    def _attempt_local_app_login(
+        self,
+        page: object,
+        result: PortalIssueResult,
+        store: StoreConfig | None = None,
+    ) -> bool:
         role_label = ROLE_LABELS.get(result.portal_company_role, "法定代表人")
         self._log(result.store_key, "starting local app scan-login automation")
-        automator = PortalMacLoginAutomator(self.config, result.store_key, role_label, self._log)
+        portal_area_name = (
+            store.effective_portal_area_name() if store is not None else getattr(result, "portal_area_name", None)
+        )
+        portal_company_switch_name = (
+            store.effective_portal_company_switch_name() if store is not None else None
+        )
+        automator = PortalMacLoginAutomator(
+            self.config,
+            result.store_key,
+            role_label,
+            self._log,
+            portal_area_name=portal_area_name,
+            portal_company_switch_name=portal_company_switch_name,
+        )
         try:
             qr_path = automator.automate(page, result.artifacts_dir)
         except PortalLocalLoginError as exc:
@@ -445,10 +489,10 @@ class TaxPortalRunner:
 
     def _ensure_company(self, home_page: object, store: StoreConfig, result: PortalIssueResult) -> object:
         verify_name = store.effective_portal_company_verify_name()
-        target_area = store.effective_store_area()
+        target_area = store.effective_portal_area()
         current_area = self._portal_area_from_url(getattr(home_page, "url", ""))
         if current_area and current_area != target_area:
-            target_area_name = store.effective_store_area_name()
+            target_area_name = store.effective_portal_area_name()
             self._log(
                 store.store_key,
                 f"portal area changed: {current_area} -> {target_area}; reopening {target_area_name} portal home",
@@ -457,6 +501,7 @@ class TaxPortalRunner:
                 home_page,
                 self.config.portal_home_url_for_store(store),
                 result,
+                store=store,
                 expected_text="我要办税",
                 step_name=f"open {target_area_name} portal home",
             )
@@ -479,6 +524,7 @@ class TaxPortalRunner:
             home_page,
             self.config.portal_identity_switch_url_for_store(store),
             result,
+            store=store,
             expected_text="企业办税",
             step_name="switch company",
         )
@@ -489,6 +535,7 @@ class TaxPortalRunner:
                 home_page,
                 self.config.portal_home_url_for_store(store),
                 result,
+                store=store,
                 expected_text="我要办税",
                 step_name=f"return home with active company {verify_name}",
             )
@@ -517,13 +564,14 @@ class TaxPortalRunner:
         self._click(confirm_button, page=home_page)
         self._wait_for_company_switch_completion(home_page, store.store_key, verify_name)
         if not self._page_contains(home_page, verify_name):
-            home_page = self._navigate_with_reauth(
-                home_page,
-                self.config.portal_home_url_for_store(store),
-                result,
-                expected_text=verify_name,
-                step_name=f"switch company to {verify_name}",
-            )
+                home_page = self._navigate_with_reauth(
+                    home_page,
+                    self.config.portal_home_url_for_store(store),
+                    result,
+                    store=store,
+                    expected_text=verify_name,
+                    step_name=f"switch company to {verify_name}",
+                )
         self._log(store.store_key, f"company switch confirmed: {verify_name} via candidate={selected_name}")
         return home_page
 
@@ -540,6 +588,7 @@ class TaxPortalRunner:
             page,
             self.config.portal_batch_issue_url_for_store(store),
             result,
+            store=store,
             expected_text=None,
             step_name="open batch issue page",
         )
@@ -1300,6 +1349,14 @@ class TaxPortalRunner:
         url = getattr(page, "url", "")
         return self._portal_area_from_url(url) is not None
 
+    def _page_matches_portal_area(self, page: object, store: StoreConfig | None) -> bool:
+        if store is None:
+            return True
+        current_area = self._portal_area_from_url(getattr(page, "url", ""))
+        if current_area is None:
+            return False
+        return current_area == store.effective_portal_area()
+
     def _is_authenticated_portal_shell_page(self, page: object) -> bool:
         if not self._is_portal_related_page(page):
             return False
@@ -1349,6 +1406,7 @@ class TaxPortalRunner:
             page,
             self.config.portal_home_url_for_store(store),
             result,
+            store=store,
             expected_text="我要办税",
             step_name="open authenticated portal home",
         )
@@ -1403,6 +1461,7 @@ class TaxPortalRunner:
         url: str,
         result: PortalIssueResult,
         *,
+        store: StoreConfig | None = None,
         expected_text: str | None,
         step_name: str,
         max_attempts: int = 3,
@@ -1416,7 +1475,7 @@ class TaxPortalRunner:
                 if "interrupted by another navigation" not in str(exc):
                     raise
             if self._page_requires_reauth(page):
-                page = self._ensure_logged_in(page, result)
+                page = self._ensure_logged_in(page, result, store)
                 continue
             if expected_text is None:
                 return page
@@ -1426,17 +1485,23 @@ class TaxPortalRunner:
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
                 if self._page_requires_reauth(page):
-                    page = self._ensure_logged_in(page, result)
+                    page = self._ensure_logged_in(page, result, store)
                     continue
                 raise
         if last_error is not None:
             raise PortalRunnerError(f"Failed to {step_name}: {last_error}") from last_error
         raise PortalRunnerError(f"Failed to {step_name}.")
 
-    def _first_authenticated_page(self, pages: list[object]) -> object | None:
+    def _first_authenticated_page(
+        self,
+        pages: list[object],
+        store: StoreConfig | None = None,
+    ) -> object | None:
         shell_page: object | None = None
         for candidate in pages:
             try:
+                if not self._page_matches_portal_area(candidate, store):
+                    continue
                 if self._is_home_page(candidate):
                     return candidate
                 if shell_page is None and self._is_authenticated_portal_shell_page(candidate):
@@ -1445,13 +1510,17 @@ class TaxPortalRunner:
                 continue
         return shell_page
 
-    def _find_authenticated_page(self, page: object) -> object | None:
-        return self._first_authenticated_page(self._page_candidates(page))
+    def _find_authenticated_page(self, page: object, store: StoreConfig | None = None) -> object | None:
+        return self._first_authenticated_page(self._page_candidates(page), store)
 
-    def _confirmed_authenticated_page(self, page: object | None) -> object | None:
+    def _confirmed_authenticated_page(
+        self,
+        page: object | None,
+        store: StoreConfig | None = None,
+    ) -> object | None:
         if page is None:
             return None
-        authenticated_page = self._find_authenticated_page(page)
+        authenticated_page = self._find_authenticated_page(page, store)
         if authenticated_page is None:
             return None
         wait_for_load_state = getattr(authenticated_page, "wait_for_load_state", None)
@@ -1460,9 +1529,9 @@ class TaxPortalRunner:
                 wait_for_load_state("load", timeout=min(self.config.portal_action_timeout_ms, 5000))
             except Exception:
                 pass
-        return self._find_authenticated_page(authenticated_page)
+        return self._find_authenticated_page(authenticated_page, store)
 
-    def _refresh_attached_authenticated_page(self) -> object | None:
+    def _refresh_attached_authenticated_page(self, store: StoreConfig | None = None) -> object | None:
         if self.config.portal_browser_backend != "chrome_cdp":
             return None
         browser_type = self._attached_cdp_browser_type
@@ -1479,7 +1548,7 @@ class TaxPortalRunner:
                 return None
             context = browser.contexts[0]
             context.set_default_timeout(self.config.portal_action_timeout_ms)
-            authenticated_page = self._first_authenticated_page(list(getattr(context, "pages", [])))
+            authenticated_page = self._first_authenticated_page(list(getattr(context, "pages", [])), store)
             if authenticated_page is None:
                 browser.close()
                 return None

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import base64
 import plistlib
 import re
 import subprocess
@@ -13,6 +14,7 @@ from typing import Callable, Iterable
 
 from app.models import AppConfig
 from app.utils import ensure_parent_dir
+from app.vision_client import OpenAICompatibleVisionClient
 
 DEFAULT_ETAX_APP_PATH = Path("/Applications/电子税务局.app")
 ETAX_APP_BUNDLE_ID_FALLBACK = "cn.gov.chinatax.gt4.app"
@@ -25,7 +27,7 @@ OTP_MESSAGES_FALLBACK_TIMEOUT_SECONDS = 60.0
 PHOTOS_IMPORT_SETTLE_SECONDS = 1.0
 QR_MIN_DIMENSION_PX = 120
 QR_CAPTURE_RETRY_DELAY_SECONDS = 3.0
-OTP_REGEX = re.compile(r"【厦门税务】您的验证码是[:：]\s*(\d{6})")
+OTP_TAX_VERIFICATION_REGEX = re.compile(r"【(?P<issuer>[^】]*税务)】您的验证码是[:：]\s*(?P<code>\d{6})")
 OTP_DIGITS_REGEX = re.compile(r"(?<!\d)(\d{6})(?!\d)")
 SMS_RESEND_COUNTDOWN_REGEX = re.compile(r"\d+秒重新获取")
 SMS_REQUEST_RETRY_ATTEMPTS = 3
@@ -48,6 +50,34 @@ IN_APP_PHOTO_PICKER_CLICK_TARGETS = (
     (0.16, 0.33),
 )
 LOGIN_CONFIRMATION_TIMEOUT_SECONDS = 8.0
+HOME_PORTAL_AREA_TIMEOUT_SECONDS = 8.0
+HOME_PORTAL_AREA_X_MAX_RATIO = 0.45
+HOME_PORTAL_AREA_Y_MAX_RATIO = 0.22
+HOME_PORTAL_AREA_SCREENSHOT_X_RATIO = 0.02
+HOME_PORTAL_AREA_SCREENSHOT_Y_RATIO = 0.06
+HOME_PORTAL_AREA_SCREENSHOT_WIDTH_RATIO = 0.20
+HOME_PORTAL_AREA_SCREENSHOT_HEIGHT_RATIO = 0.11
+PORTAL_AREA_SWITCH_PAGE_TIMEOUT_SECONDS = 10.0
+PORTAL_AREA_SWITCH_SETTLE_SECONDS = 1.0
+SWITCH_SUCCESS_DIALOG_CONFIRM_X_RATIO = 0.50
+SWITCH_SUCCESS_DIALOG_CONFIRM_Y_RATIO = 0.62
+STARTUP_REMINDER_TITLE = "关于电子税务局上线申报智能自检的提醒"
+STARTUP_REMINDER_CLOSE_X_RATIO = 0.50
+STARTUP_REMINDER_CLOSE_Y_RATIO = 0.88
+STARTUP_REMINDER_DISMISS_ATTEMPTS = 3
+STARTUP_REMINDER_DISMISS_SETTLE_SECONDS = 0.8
+ETAX_SESSION_ENTRY_TIMEOUT_SECONDS = 6.0
+PORTAL_AREA_TEXT_REGEX = re.compile(r"^[一-龥]{2,6}(?:省|市)?$")
+PORTAL_AREA_TEXT_IGNORE = {
+    "全国",
+    "首页",
+    "功能名称",
+    "扫一扫",
+    "扫码",
+    "登录",
+    "确认",
+    "身份切换",
+}
 QR_LOCATOR_CANDIDATES = (
     ".qrcode canvas",
     ".qrcode img",
@@ -453,14 +483,20 @@ class PortalMacLoginAutomator:
         store_key: str,
         role_label: str,
         logger: Callable[[str, str], None],
+        portal_area_name: str | None = None,
+        portal_company_switch_name: str | None = None,
     ) -> None:
         self.config = config
         self.store_key = store_key
         self.role_label = role_label
         self._logger = logger
+        self.portal_area_name = (portal_area_name or "").strip()
+        self.portal_company_switch_name = (portal_company_switch_name or "").strip()
         self._etax_app_path = config.portal_etax_app_path or DEFAULT_ETAX_APP_PATH
         self._ax = MacAccessibilityClient()
         self._etax_last_window_size: tuple[float, float] = (288.0, 552.0)
+        self._startup_reminder_handled = False
+        self._vision_client: OpenAICompatibleVisionClient | None = None
 
     @staticmethod
     def is_enabled(config: AppConfig) -> bool:
@@ -479,7 +515,12 @@ class PortalMacLoginAutomator:
         bundle_id = self._resolve_app_bundle_identifier()
         self._launch_etax_app()
         self._wait_for_process(bundle_id, timeout_seconds=UI_ACTION_TIMEOUT_SECONDS)
-        self._ensure_etax_session(bundle_id)
+        if self._home_page_is_logged_in(bundle_id):
+            self._log("电子税务局 首页已显示身份切换; 跳过我的页登录态确认")
+        else:
+            self._ensure_etax_session(bundle_id)
+        self._open_home_tab(bundle_id)
+        self._ensure_home_portal_area(bundle_id)
         self._open_scan_flow(bundle_id)
         self._select_latest_qr_from_album(bundle_id)
         self._confirm_scan_login(bundle_id)
@@ -606,8 +647,10 @@ class PortalMacLoginAutomator:
     def _ensure_etax_session(self, bundle_id: str) -> None:
         self._log("navigating 电子税务局 app login flow")
         self._activate_application(bundle_id)
+        self._dismiss_startup_reminder_if_present(bundle_id)
         self._click_etax_tabbar_item(bundle_id, 4)
         if self._maybe_click_named_element(bundle_id, ("立即登录",), timeout_seconds=4.0):
+            self._log("电子税务局 我的页入口动作 action=login_button")
             self._set_login_account_value(bundle_id, self.config.portal_etax_app_username or "")
             self._set_login_password_value(bundle_id, self.config.portal_etax_app_password or "")
             self._click_named_element(bundle_id, ("登录",), timeout_seconds=UI_ACTION_TIMEOUT_SECONDS)
@@ -627,6 +670,9 @@ class PortalMacLoginAutomator:
                     f"电子税务局 app did not reach role selection after SMS login state={state}"
                 )
             state = self._confirm_role_selection(bundle_id)
+            if state == "home":
+                self._log("identity role selection entered logged-in home directly without fingerprint prompt")
+                return
             if state != "fingerprint_prompt":
                 raise PortalLocalLoginError(
                     "电子税务局 app did not reach fingerprint quick-login prompt after role selection "
@@ -641,8 +687,13 @@ class PortalMacLoginAutomator:
                 raise PortalLocalLoginError(
                     f"电子税务局 app did not reach logged-in home after fingerprint prompt state={state}"
                 )
-        elif self._maybe_click_named_element(bundle_id, (self.role_label,), timeout_seconds=8.0):
+            return
+        if self._maybe_click_named_element(bundle_id, (self.role_label,), timeout_seconds=8.0):
+            self._log("电子税务局 我的页入口动作 action=role_entry")
             state = self._confirm_role_selection(bundle_id, role_already_selected=True)
+            if state == "home":
+                self._log("identity role selection entered logged-in home directly without fingerprint prompt")
+                return
             if state != "fingerprint_prompt":
                 raise PortalLocalLoginError(
                     "电子税务局 app did not reach fingerprint quick-login prompt after role selection "
@@ -657,15 +708,322 @@ class PortalMacLoginAutomator:
                 raise PortalLocalLoginError(
                     f"电子税务局 app did not reach logged-in home after fingerprint prompt state={state}"
                 )
+            return
+        entry_state = self._wait_for_etax_session_entry_state(
+            bundle_id,
+            timeout_seconds=ETAX_SESSION_ENTRY_TIMEOUT_SECONDS,
+        )
+        self._log(f"电子税务局 我的页入口状态 state={entry_state}")
+        if entry_state == "home":
+            return
+        raise PortalLocalLoginError(
+            "电子税务局 app did not show login button, role entry, or logged-in home after opening 我的."
+        )
+
+    def _wait_for_etax_session_entry_state(self, bundle_id: str, *, timeout_seconds: float) -> str:
+        deadline = monotonic() + timeout_seconds
+        while monotonic() < deadline:
+            texts = self._collect_visible_texts(bundle_id, timeout_seconds=1.0)
+            if self._texts_show_logged_in_home(texts):
+                return "home"
+            if any("立即登录" in text for text in texts):
+                return "login_button"
+            if any(self.role_label in text for text in texts):
+                return "role_entry"
+            sleep(VISIBLE_ELEMENT_POLL_SECONDS)
+        return "unknown"
+
+    def _home_page_is_logged_in(self, bundle_id: str) -> bool:
+        for node in self._nodes_for_bundle(bundle_id):
+            if node.center is None:
+                continue
+            if any("身份切换" in self._normalized_text(text) for text in node.texts):
+                return True
+        return False
+
+    def _dismiss_startup_reminder_if_present(self, bundle_id: str) -> None:
+        if self._startup_reminder_handled:
+            return
+        self._startup_reminder_handled = True
+        for attempt in range(1, STARTUP_REMINDER_DISMISS_ATTEMPTS + 1):
+            if not self._startup_reminder_visible(bundle_id):
+                return
+            self._log(f"startup reminder detected; dismissing attempt={attempt}")
+            self._click_startup_reminder_close(bundle_id)
+            sleep(STARTUP_REMINDER_DISMISS_SETTLE_SECONDS)
+        if self._startup_reminder_visible(bundle_id):
+            raise PortalLocalLoginError("Failed to dismiss 电子税务局 startup reminder popup.")
+
+    def _startup_reminder_visible(self, bundle_id: str) -> bool:
+        try:
+            texts = self._collect_visible_texts(bundle_id, timeout_seconds=1.0)
+        except PortalLocalLoginError:
+            return False
+        return any(STARTUP_REMINDER_TITLE in text for text in texts)
+
+    def _click_startup_reminder_close(self, bundle_id: str) -> None:
+        self._activate_application(bundle_id)
+        bounds = self._window_bounds_for_bundle(bundle_id)
+        if bounds is None:
+            window = self._window_node(bundle_id)
+            if window is None or window.position is None or window.size is None:
+                raise PortalLocalLoginError("Unable to determine startup reminder popup position.")
+            left, top, width, height = (
+                window.position[0],
+                window.position[1],
+                window.size[0],
+                window.size[1],
+            )
+        else:
+            left, top, width, height = bounds
+        self._click_at_for_bundle(
+            bundle_id,
+            left + width * STARTUP_REMINDER_CLOSE_X_RATIO,
+            top + height * STARTUP_REMINDER_CLOSE_Y_RATIO,
+        )
 
     def _open_scan_flow(self, bundle_id: str) -> None:
         self._log("opening scan flow in 电子税务局 app")
-        self._activate_application(bundle_id)
-        self._click_etax_tabbar_item(bundle_id, 0)
+        self._open_home_tab(bundle_id)
         if not self._maybe_click_named_element(bundle_id, ("扫一扫", "扫码"), timeout_seconds=3.0):
             self._click_etax_scan_icon(bundle_id)
         self._wait_for_scan_page_ready(bundle_id)
         self._open_album_from_scan_page(bundle_id)
+
+    def _open_home_tab(self, bundle_id: str) -> None:
+        self._log("opening 首页 tab in 电子税务局 app")
+        self._activate_application(bundle_id)
+        self._click_etax_tabbar_item(bundle_id, 0)
+
+    def _ensure_home_portal_area(self, bundle_id: str) -> None:
+        if not self.portal_area_name:
+            return
+        current_area = self._wait_for_home_portal_area(bundle_id, timeout_seconds=HOME_PORTAL_AREA_TIMEOUT_SECONDS)
+        if self._portal_area_text_matches_target(current_area, self.portal_area_name):
+            self._log(
+                f"tax app home area matches target current={current_area} target={self.portal_area_name}"
+            )
+            return
+        if not self.portal_company_switch_name:
+            raise PortalLocalLoginError(
+                "Missing portal company switch name for 电子税务局 app area switching."
+            )
+        self._log(
+            "tax app home area mismatch "
+            f"current={current_area} target={self.portal_area_name}; opening identity switch"
+        )
+        self._switch_home_portal_area(bundle_id)
+
+    def _wait_for_home_portal_area(self, bundle_id: str, *, timeout_seconds: float) -> str:
+        deadline = monotonic() + timeout_seconds
+        while monotonic() < deadline:
+            area_text = self._current_home_portal_area_text(bundle_id)
+            if area_text:
+                return area_text
+            sleep(VISIBLE_ELEMENT_POLL_SECONDS)
+        raise PortalLocalLoginError("Timed out determining current 电子税务局 home area.")
+
+    def _current_home_portal_area_text(self, bundle_id: str) -> str | None:
+        nodes = self._nodes_for_bundle(bundle_id)
+        bounds = self._window_bounds_for_bundle(bundle_id)
+        if bounds is None:
+            window = self._window_node(bundle_id)
+            if window is None or window.position is None or window.size is None:
+                return None
+            left, top, width, height = (
+                window.position[0],
+                window.position[1],
+                window.size[0],
+                window.size[1],
+            )
+        else:
+            left, top, width, height = bounds
+        candidates: list[tuple[int, float, float, str]] = []
+        for node in nodes:
+            center = node.center
+            if center is None:
+                continue
+            center_x, center_y = center
+            if center_x > left + width * HOME_PORTAL_AREA_X_MAX_RATIO:
+                continue
+            if center_y > top + height * HOME_PORTAL_AREA_Y_MAX_RATIO:
+                continue
+            for text in node.texts:
+                candidate = self._candidate_portal_area_text(text)
+                if candidate is None:
+                    continue
+                priority = 0 if self._portal_area_text_matches_target(candidate, self.portal_area_name) else 1
+                candidates.append((priority, center_y, center_x, candidate))
+        if not candidates:
+            return self._ocr_home_portal_area_text(bundle_id)
+        candidates.sort()
+        return candidates[0][3]
+
+    def _ocr_home_portal_area_text(self, bundle_id: str) -> str | None:
+        try:
+            image_path = self._capture_home_portal_area_screenshot(bundle_id)
+        except PortalLocalLoginError as exc:
+            self._log(f"could not capture tax app home area screenshot error={exc}")
+            return None
+        try:
+            raw_text = self._recognize_portal_area_text_from_image(image_path)
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"could not OCR tax app home area screenshot error={exc}")
+            return None
+        candidate = self._candidate_portal_area_text(raw_text)
+        if candidate:
+            self._log(f"read tax app home area via OCR text={candidate}")
+        return candidate
+
+    def _capture_home_portal_area_screenshot(self, bundle_id: str) -> Path:
+        bounds = self._window_bounds_for_bundle(bundle_id)
+        if bounds is None:
+            window = self._window_node(bundle_id)
+            if window is None or window.position is None or window.size is None:
+                raise PortalLocalLoginError("Unable to determine 电子税务局 window bounds for area screenshot.")
+            left, top, width, height = (
+                window.position[0],
+                window.position[1],
+                window.size[0],
+                window.size[1],
+            )
+        else:
+            left, top, width, height = bounds
+        x = int(left + width * HOME_PORTAL_AREA_SCREENSHOT_X_RATIO)
+        y = int(top + height * HOME_PORTAL_AREA_SCREENSHOT_Y_RATIO)
+        screenshot_width = max(int(width * HOME_PORTAL_AREA_SCREENSHOT_WIDTH_RATIO), 40)
+        screenshot_height = max(int(height * HOME_PORTAL_AREA_SCREENSHOT_HEIGHT_RATIO), 30)
+        target_dir = Path(mkdtemp(prefix="portal-home-area-"))
+        target = target_dir / "home-area.png"
+        self._run_command(
+            [
+                "screencapture",
+                "-x",
+                "-R",
+                f"{x},{y},{screenshot_width},{screenshot_height}",
+                str(target),
+            ],
+            timeout_seconds=UI_ACTION_TIMEOUT_SECONDS,
+        )
+        if not target.exists():
+            raise PortalLocalLoginError("Home area screenshot was not created.")
+        return target
+
+    def _recognize_portal_area_text_from_image(self, image_path: Path) -> str:
+        client = self._get_vision_client()
+        prompt = (
+            "读取这张截图中显示的地区名称，只返回纯文本地区名。"
+            "例如：厦门、福建、福建省、泉州。不要输出解释。"
+        )
+        raw = image_path.read_bytes()
+        response = client._chat_completion(
+            base64.b64encode(raw).decode("ascii"),
+            image_path.name,
+            prompt,
+        )
+        return response.strip().splitlines()[0].strip()
+
+    def _get_vision_client(self) -> OpenAICompatibleVisionClient:
+        if self._vision_client is None:
+            self._vision_client = OpenAICompatibleVisionClient(
+                self.config.openai_base_url,
+                self.config.openai_api_key,
+                self.config.openai_model,
+                timeout_seconds=self.config.openai_timeout_seconds,
+                ssl_verify=self.config.openai_ssl_verify,
+                ca_bundle_path=self.config.openai_ca_bundle_path,
+            )
+        return self._vision_client
+
+    def _switch_home_portal_area(self, bundle_id: str) -> None:
+        self._click_named_element(bundle_id, ("身份切换",), timeout_seconds=UI_ACTION_TIMEOUT_SECONDS)
+        self._wait_for_named_text(bundle_id, ("全国",), timeout_seconds=PORTAL_AREA_SWITCH_PAGE_TIMEOUT_SECONDS)
+        self._click_named_element(bundle_id, ("全国",), timeout_seconds=UI_ACTION_TIMEOUT_SECONDS)
+        self._wait_for_named_text(
+            bundle_id,
+            (self.portal_area_name,),
+            timeout_seconds=PORTAL_AREA_SWITCH_PAGE_TIMEOUT_SECONDS,
+        )
+        self._click_named_element(
+            bundle_id,
+            (self.portal_area_name,),
+            timeout_seconds=UI_ACTION_TIMEOUT_SECONDS,
+        )
+        self._wait_for_named_text(
+            bundle_id,
+            (self.portal_company_switch_name,),
+            timeout_seconds=PORTAL_AREA_SWITCH_PAGE_TIMEOUT_SECONDS,
+            contains=True,
+        )
+        self._click_company_switch_button(bundle_id, self.portal_company_switch_name)
+        sleep(PORTAL_AREA_SWITCH_SETTLE_SECONDS)
+        self._complete_area_switch_role_selection(bundle_id)
+
+    def _complete_area_switch_role_selection(self, bundle_id: str) -> None:
+        state = self._wait_for_post_login_state(bundle_id, timeout_seconds=POST_LOGIN_STATE_TIMEOUT_SECONDS)
+        if state == "home":
+            return
+        if state == "switch_success_dialog":
+            self._confirm_switch_success_dialog(bundle_id)
+            self._log("confirmed switch success dialog after area/company switch")
+            return
+        if state != "role_dialog":
+            raise PortalLocalLoginError(
+                "电子税务局 app did not reach role selection after area/company switch "
+                f"state={state}"
+            )
+        state = self._confirm_role_selection(bundle_id)
+        if state == "home":
+            self._log("area/company switch role selection entered logged-in home directly")
+            return
+        if state == "switch_success_dialog":
+            self._confirm_switch_success_dialog(bundle_id)
+            self._log("confirmed switch success dialog after area/company switch role selection")
+            return
+        if state != "fingerprint_prompt":
+            raise PortalLocalLoginError(
+                "电子税务局 app did not reach fingerprint quick-login prompt after area/company switch role selection "
+                f"state={state}"
+            )
+        self._dismiss_fingerprint_prompt(bundle_id)
+        self._log("dismissed fingerprint quick login prompt after area/company switch")
+        state = self._wait_for_post_login_state(bundle_id, timeout_seconds=POST_LOGIN_STATE_TIMEOUT_SECONDS)
+        if state == "switch_success_dialog":
+            self._confirm_switch_success_dialog(bundle_id)
+            self._log("confirmed switch success dialog after area/company switch fingerprint prompt")
+            return
+        if state == "login_page":
+            self._log(
+                "fingerprint prompt dismissed after area/company switch but home markers not yet visible; continuing"
+            )
+            return
+        if state != "home":
+            raise PortalLocalLoginError(
+                "电子税务局 app did not reach logged-in home after area/company switch fingerprint prompt "
+                f"state={state}"
+            )
+
+    @staticmethod
+    def _portal_area_text_matches_target(current_area: str, target_area_name: str) -> bool:
+        normalized_current = PortalMacLoginAutomator._normalized_area_text(current_area)
+        normalized_target = PortalMacLoginAutomator._normalized_area_text(target_area_name)
+        if not normalized_current or not normalized_target:
+            return False
+        return normalized_current in normalized_target or normalized_target in normalized_current
+
+    @staticmethod
+    def _normalized_area_text(text: str) -> str:
+        normalized = PortalMacLoginAutomator._normalized_text(text)
+        normalized = normalized.replace("电子税务局", "").replace("税务局", "")
+        return normalized.strip()
+
+    def _candidate_portal_area_text(self, text: str) -> str | None:
+        candidate = self._normalized_area_text(text)
+        if not candidate or candidate in PORTAL_AREA_TEXT_IGNORE:
+            return None
+        if not PORTAL_AREA_TEXT_REGEX.fullmatch(candidate):
+            return None
+        return candidate
 
     def _select_latest_qr_from_album(self, bundle_id: str) -> None:
         self._log("selecting latest imported QR image from album")
@@ -881,10 +1239,47 @@ class PortalMacLoginAutomator:
             left, top, width, height = bounds
         self._click_at_for_bundle(bundle_id, left + width * 0.33, top + height * 0.69)
 
+    def _confirm_switch_success_dialog(self, bundle_id: str) -> None:
+        self._activate_application(bundle_id)
+        self._click_switch_success_dialog_confirm_relative(bundle_id)
+        deadline = monotonic() + 5.0
+        while monotonic() < deadline:
+            try:
+                texts = self._collect_visible_texts(bundle_id, timeout_seconds=1.0)
+            except PortalLocalLoginError:
+                return
+            if not self._texts_show_switch_success_dialog(texts):
+                return
+            sleep(VISIBLE_ELEMENT_POLL_SECONDS)
+        raise PortalLocalLoginError("Timed out dismissing area/company switch success dialog.")
+
+    def _click_switch_success_dialog_confirm_relative(self, bundle_id: str) -> None:
+        self._activate_application(bundle_id)
+        bounds = self._window_bounds_for_bundle(bundle_id)
+        if bounds is None:
+            window = self._window_node(bundle_id)
+            if window is None or window.position is None or window.size is None:
+                raise PortalLocalLoginError("Unable to determine switch success dialog position.")
+            left, top, width, height = (
+                window.position[0],
+                window.position[1],
+                window.size[0],
+                window.size[1],
+            )
+        else:
+            left, top, width, height = bounds
+        self._click_at_for_bundle(
+            bundle_id,
+            left + width * SWITCH_SUCCESS_DIALOG_CONFIRM_X_RATIO,
+            top + height * SWITCH_SUCCESS_DIALOG_CONFIRM_Y_RATIO,
+        )
+
     def _wait_for_post_login_state(self, bundle_id: str, *, timeout_seconds: float) -> str:
         deadline = monotonic() + timeout_seconds
         while monotonic() < deadline:
             texts = self._collect_visible_texts(bundle_id, timeout_seconds=1.0)
+            if self._texts_show_switch_success_dialog(texts):
+                return "switch_success_dialog"
             if self._texts_show_role_dialog(texts):
                 return "role_dialog"
             if "暂不设置" in texts or any("指纹快捷登录" in text for text in texts):
@@ -902,8 +1297,12 @@ class PortalMacLoginAutomator:
         return has_role and has_confirm
 
     @staticmethod
+    def _texts_show_switch_success_dialog(texts: list[str]) -> bool:
+        return any("切换成功" in text for text in texts)
+
+    @staticmethod
     def _texts_show_logged_in_home(texts: list[str]) -> bool:
-        indicators = ("功能名称", "申报期截止至")
+        indicators = ("功能名称", "申报期截止至", "身份切换")
         return any(any(indicator in text for indicator in indicators) for text in texts) and not any(
             "立即登录" in text for text in texts
         )
@@ -911,11 +1310,12 @@ class PortalMacLoginAutomator:
     def _try_fill_otp_from_system_prompt(self, bundle_id: str) -> bool:
         self._log("waiting for macOS one-time-code prompt")
         deadline = monotonic() + OTP_AUTOFILL_TIMEOUT_SECONDS
+        expected_issuer = self._expected_tax_verification_issuer()
         while monotonic() < deadline:
             if self._otp_field_has_code(bundle_id):
                 return True
             visible_texts = self._collect_visible_texts(bundle_id, timeout_seconds=3.0)
-            code = self._extract_first_sms_code(visible_texts)
+            code = self._extract_first_sms_code(visible_texts, expected_issuer=expected_issuer)
             if code and self._maybe_click_named_element(bundle_id, (code,), timeout_seconds=2.0, contains=True):
                 if self._otp_field_has_code(bundle_id):
                     return True
@@ -923,17 +1323,25 @@ class PortalMacLoginAutomator:
         return False
 
     def _read_latest_sms_code_from_messages(self) -> str:
-        self._log("reading latest 厦门税务 verification code from Messages app")
+        expected_issuer = self._expected_tax_verification_issuer()
+        if expected_issuer:
+            self._log(f"reading latest {expected_issuer} verification code from Messages app")
+        else:
+            self._log("reading latest tax verification code from Messages app")
         self._activate_application(MESSAGES_BUNDLE_ID)
         self._wait_for_process(MESSAGES_BUNDLE_ID, timeout_seconds=UI_ACTION_TIMEOUT_SECONDS)
         deadline = monotonic() + OTP_MESSAGES_FALLBACK_TIMEOUT_SECONDS
         while monotonic() < deadline:
             visible_texts = self._collect_visible_texts(MESSAGES_BUNDLE_ID, timeout_seconds=3.0)
-            code = self._extract_first_sms_code(visible_texts)
+            code = self._extract_first_sms_code(visible_texts, expected_issuer=expected_issuer)
             if code:
                 return code
             sleep(0.5)
-        raise PortalLocalLoginError("Timed out waiting for 厦门税务 verification code in Messages app.")
+        if expected_issuer:
+            raise PortalLocalLoginError(
+                f"Timed out waiting for {expected_issuer} verification code in Messages app."
+            )
+        raise PortalLocalLoginError("Timed out waiting for tax verification code in Messages app.")
 
     def _otp_field_has_code(self, bundle_id: str) -> bool:
         value = self._read_text_input_value(bundle_id, labels=("短信验证码",), field_index=2)
@@ -955,12 +1363,26 @@ class PortalMacLoginAutomator:
             sleep(VISIBLE_ELEMENT_POLL_SECONDS)
         raise PortalLocalLoginError(f"Timed out collecting visible texts from bundle {bundle_id}.")
 
+    def _expected_tax_verification_issuer(self) -> str | None:
+        if not self.portal_area_name:
+            return None
+        return f"{self.portal_area_name}税务"
+
     @staticmethod
-    def _extract_first_sms_code(texts: Iterable[str]) -> str | None:
+    def _extract_first_sms_code(
+        texts: Iterable[str],
+        *,
+        expected_issuer: str | None = None,
+    ) -> str | None:
+        if expected_issuer:
+            for text in texts:
+                match = OTP_TAX_VERIFICATION_REGEX.search(text)
+                if match and match.group("issuer") == expected_issuer:
+                    return match.group("code")
         for text in texts:
-            match = OTP_REGEX.search(text)
+            match = OTP_TAX_VERIFICATION_REGEX.search(text)
             if match:
-                return match.group(1)
+                return match.group("code")
         for text in texts:
             match = OTP_DIGITS_REGEX.search(text)
             if match:
@@ -997,6 +1419,75 @@ class PortalMacLoginAutomator:
         except PortalLocalLoginError:
             return False
         return True
+
+    def _wait_for_named_text(
+        self,
+        bundle_id: str,
+        names: tuple[str, ...],
+        *,
+        timeout_seconds: float,
+        contains: bool = False,
+    ) -> str:
+        normalized_names = [self._normalized_text(name) for name in names if self._normalized_text(name)]
+        deadline = monotonic() + timeout_seconds
+        while monotonic() < deadline:
+            texts = self._collect_visible_texts(bundle_id, timeout_seconds=1.0)
+            for text in texts:
+                normalized_text = self._normalized_text(text)
+                for normalized_name in normalized_names:
+                    if contains:
+                        if normalized_name in normalized_text:
+                            return text
+                    elif normalized_text == normalized_name:
+                        return text
+            sleep(VISIBLE_ELEMENT_POLL_SECONDS)
+        raise PortalLocalLoginError(f"Timed out waiting for text in bundle {bundle_id}: {names!r}")
+
+    def _click_company_switch_button(self, bundle_id: str, company_name: str) -> None:
+        company_node = self._find_named_node(bundle_id, (company_name,), contains=True)
+        if company_node is None:
+            raise PortalLocalLoginError(
+                f"Could not find company row for area switch: {company_name}"
+            )
+        company_center = company_node.center
+        if company_center is None:
+            raise PortalLocalLoginError(
+                f"Could not determine company row position for area switch: {company_name}"
+            )
+        company_x, company_y = company_center
+        company_height = company_node.size[1] if company_node.size is not None else 40.0
+        button_candidates: list[tuple[float, AXNode]] = []
+        for node in self._nodes_for_bundle(bundle_id):
+            if node is company_node or node.center is None:
+                continue
+            if not any(self._normalized_text(text) == "切换" for text in node.texts):
+                continue
+            button_x, button_y = node.center
+            if button_x <= company_x:
+                continue
+            if abs(button_y - company_y) > max(company_height, 40.0):
+                continue
+            button_candidates.append((button_x, node))
+        if button_candidates:
+            button_candidates.sort(key=lambda item: item[0])
+            if self._click_node_for_bundle(bundle_id, button_candidates[0][1]):
+                return
+        bounds = self._window_bounds_for_bundle(bundle_id)
+        if bounds is None:
+            window = self._window_node(bundle_id)
+            if window is None or window.position is None or window.size is None:
+                raise PortalLocalLoginError(
+                    f"Unable to determine switch button position for company: {company_name}"
+                )
+            left, _, width, _ = (
+                window.position[0],
+                window.position[1],
+                window.size[0],
+                window.size[1],
+            )
+        else:
+            left, _, width, _ = bounds
+        self._click_at_for_bundle(bundle_id, left + width * 0.88, company_y)
 
     def _focus_text_input(
         self,
