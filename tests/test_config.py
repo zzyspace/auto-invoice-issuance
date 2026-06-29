@@ -35,12 +35,38 @@ stores:
             stores = load_store_configs(stores_path)
             self.assertEqual(1, len(stores))
             self.assertEqual((tmp_path / "output" / "test.xlsx").resolve(), stores[0].output_xlsx_path)
+            self.assertEqual("tencent_survey", stores[0].effective_data_source())
             self.assertEqual("q-1", stores[0].effective_attachment_question_id("fallback"))
             self.assertTrue(stores[0].portal_enabled)
             self.assertEqual(10, stores[0].portal_priority)
             self.assertEqual("测试门店（个体工商户）（待确认）", stores[0].effective_portal_company_switch_name())
             self.assertEqual("测试门店（个体工商户）", stores[0].effective_portal_company_verify_name())
             self.assertEqual("legal_representative", stores[0].portal_company_role)
+
+    def test_load_store_configs_supports_invoice_submit_source_without_survey_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            stores_path = tmp_path / "stores.yaml"
+            stores_path.write_text(
+                """
+stores:
+  - store_key: peanut_local
+    store_name: Peanut
+    data_source: invoice-submit
+    invoice_submit_store_key: peanut
+    output_xlsx_path: ./output/peanut.xlsx
+    initial_last_processed_id: 0
+    enabled: true
+""".strip(),
+                encoding="utf-8",
+            )
+
+            stores = load_store_configs(stores_path)
+
+            self.assertEqual(1, len(stores))
+            self.assertEqual("invoice_submit", stores[0].effective_data_source())
+            self.assertEqual("peanut", stores[0].effective_invoice_submit_store_key())
+            self.assertEqual("invoice-submit:peanut", stores[0].effective_source_identifier())
 
     def test_store_uses_default_question_id_when_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -170,6 +196,52 @@ stores:
             self.assertTrue(config.portal_sync_from_server)
             self.assertEqual("root@example.com", config.portal_sync_remote_host)
             self.assertEqual("/srv/output", config.portal_sync_remote_output_dir)
+
+    def test_load_app_config_allows_invoice_submit_only_without_tencent_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.dict(os.environ, {}, clear=True):
+            tmp_path = Path(tmp_dir)
+            stores_path = tmp_path / "stores.yaml"
+            env_path = tmp_path / ".env"
+            stores_path.write_text(
+                """
+stores:
+  - store_key: peanut_local
+    store_name: Peanut
+    data_source: invoice_submit
+    invoice_submit_store_key: peanut
+    output_xlsx_path: ./output/peanut.xlsx
+    initial_last_processed_id: 0
+    enabled: true
+""".strip(),
+                encoding="utf-8",
+            )
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "TZ=Asia/Shanghai",
+                        "OPENAI_BASE_URL=https://example.com/v1",
+                        "OPENAI_API_KEY=key",
+                        "SMTP_HOST=smtp.example.com",
+                        "SMTP_USERNAME=user",
+                        "SMTP_PASSWORD=pass",
+                        "SMTP_FROM=from@example.com",
+                        "SMTP_TO=to@example.com",
+                        "TEMPLATE_XLSX_PATH=./template.xlsx",
+                        "STATE_DB_PATH=./state.db",
+                        f"STORES_CONFIG_PATH={stores_path}",
+                        f"INVOICE_SUBMIT_DB_PATH={tmp_path / 'invoice-submit.db'}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_app_config(env_path)
+
+            self.assertEqual("", config.survey_cookie)
+            self.assertEqual(
+                Path(os.path.realpath(tmp_path / "invoice-submit.db")),
+                Path(os.path.realpath(str(config.invoice_submit_db_path))),
+            )
 
     def test_load_app_config_parses_portal_disable_proxy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir, patch.dict(os.environ, {}, clear=True):

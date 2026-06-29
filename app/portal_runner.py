@@ -28,6 +28,8 @@ POST_SUBMIT_SUCCESS_WAIT_SECONDS = 3.0
 BROWSER_CLICK_DELAY_MS = 1000
 BROWSER_CLICK_DELAY_SECONDS = BROWSER_CLICK_DELAY_MS / 1000
 HOME_PAGE_SHELL_MIN_TIMEOUT_MS = 60000
+AUTHENTICATED_PAGE_STABILITY_MS = 1500
+AUTHENTICATED_PAGE_STABILITY_POLL_MS = 250
 BROWSER_SESSION_SYNC_ENTRIES = (
     "Cookies",
     "Cookies-journal",
@@ -1529,7 +1531,29 @@ class TaxPortalRunner:
                 wait_for_load_state("load", timeout=min(self.config.portal_action_timeout_ms, 5000))
             except Exception:
                 pass
-        return self._find_authenticated_page(authenticated_page, store)
+        return self._stabilized_authenticated_page(authenticated_page, store)
+
+    def _stabilized_authenticated_page(
+        self,
+        page: object,
+        store: StoreConfig | None = None,
+    ) -> object | None:
+        deadline = monotonic() + (AUTHENTICATED_PAGE_STABILITY_MS / 1000)
+        current_page = page
+        while True:
+            authenticated_page = self._find_authenticated_page(current_page, store)
+            if authenticated_page is None or self._page_requires_reauth(authenticated_page):
+                return None
+            if monotonic() >= deadline:
+                return authenticated_page
+            current_page = authenticated_page
+            wait_for_timeout = getattr(current_page, "wait_for_timeout", None)
+            if not callable(wait_for_timeout):
+                return authenticated_page
+            try:
+                wait_for_timeout(AUTHENTICATED_PAGE_STABILITY_POLL_MS)
+            except Exception:
+                sleep(AUTHENTICATED_PAGE_STABILITY_POLL_MS / 1000)
 
     def _refresh_attached_authenticated_page(self, store: StoreConfig | None = None) -> object | None:
         if self.config.portal_browser_backend != "chrome_cdp":

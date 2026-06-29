@@ -1,10 +1,14 @@
-# 多门店腾讯问卷开票自动化服务
+# 多门店开票自动化服务
 
-这个项目会在服务端按天批量处理多个腾讯问卷门店的数据，并为每个门店生成独立的开票 Excel。
+这个项目会在服务端按天批量处理多个门店的开票数据，并为每个门店生成独立的开票 Excel。当前支持两种数据源：
+
+- `tencent_survey`：腾讯问卷导出
+- `invoice_submit`：本地 `invoice-submit` 项目的 SQLite 提交记录
 
 ## 功能
 
-- 同一账号 Cookie 复用，顺序处理多个门店问卷
+- 支持按门店切换数据源：腾讯问卷或 `invoice-submit`
+- 同一账号 Cookie 复用，顺序处理多个腾讯问卷门店
 - 每个门店独立维护 `last_processed_id`
 - 只处理新增编号的数据
 - 下载付款截图并调用兼容 OpenAI 的多模态接口识别总金额
@@ -31,7 +35,8 @@ cp stores.example.yaml stores.yaml
 
 2. 编辑 `.env`：
 
-- `TENCENT_SURVEY_*`: 腾讯问卷 Cookie、导出接口和图片下载默认参数
+- `TENCENT_SURVEY_*`: 腾讯问卷 Cookie、导出接口和图片下载默认参数；只有至少一个门店使用 `data_source=tencent_survey` 时才需要
+- `INVOICE_SUBMIT_DB_PATH`: `invoice-submit` 的 SQLite 数据库路径；只有至少一个门店使用 `data_source=invoice_submit` 时才需要，默认可指向 `/var/lib/invoice-submit/data/app.db`
 - `OPENAI_*`: 金额识别模型配置
 - `OPENAI_SSL_VERIFY` / `OPENAI_CA_BUNDLE_PATH`: 模型网关证书配置
 - `SMTP_*`: 邮件发送配置
@@ -63,7 +68,10 @@ TAX_LOOKUP_ALAPI_TOKEN=your_alapi_token_here
 3. 编辑 `stores.yaml`：
 
 - 每个门店一条配置
-- `survey_id`、`output_xlsx_path`、`initial_last_processed_id` 必填
+- `data_source` 可选，支持 `tencent_survey`、`invoice_submit`，默认 `tencent_survey`
+- `output_xlsx_path`、`initial_last_processed_id` 必填
+- `survey_id`：当 `data_source=tencent_survey` 时必填
+- `invoice_submit_store_key`：当 `data_source=invoice_submit` 时推荐填写；不填时默认使用当前门店的 `store_key`
 - `attachment_question_id` 可选，不填时使用 `.env` 中的默认值
 - 税务局 runner 额外字段：
   - `portal_enabled`: 是否允许该门店进入税务局开票 runner
@@ -93,6 +101,8 @@ python3 -m app.main run-once --env-file .env
 ```bash
 python3 -m app.main schedule --env-file .env
 ```
+
+如果某个门店切到 `invoice-submit`，增量游标仍然使用整数 `last_processed_id`，但底层会自动映射到 `invoice-submit` SQLite 的 `rowid`，不需要额外维护第二套状态库。
 
 单独做视觉模型烟雾测试：
 

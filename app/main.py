@@ -18,7 +18,7 @@ from app.excel_writer import InvoiceExcelWriter
 from app.mailer import SummaryMailer
 from app.service import BatchProcessor, Services
 from app.state import StateStore
-from app.survey_client import TencentSurveyClient
+from app.submission_source import build_submission_source_client
 from app.tax_lookup import TaxLookupClient
 from app.utils import next_daily_run
 from app.vision_client import OpenAICompatibleVisionClient
@@ -29,7 +29,7 @@ ETAX_PROCESS_PATTERN = r"cn\.gov\.chinatax\.gt4\.app|GT4\.app|电子税务局"
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Tencent survey invoice automation")
+    parser = argparse.ArgumentParser(description="Invoice automation")
     parser.add_argument(
         "command",
         choices=(
@@ -64,7 +64,7 @@ def build_processor(env_file: Path) -> tuple[BatchProcessor, object, list[object
     stores = load_store_configs(config.stores_config_path)
     state_store = StateStore(config.state_db_path)
     services = Services(
-        survey_client=TencentSurveyClient(config),
+        survey_client=build_submission_source_client(config, stores),
         vision_client=OpenAICompatibleVisionClient(
             config.openai_base_url,
             config.openai_api_key,

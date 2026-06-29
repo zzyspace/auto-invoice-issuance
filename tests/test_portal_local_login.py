@@ -13,6 +13,7 @@ from app.portal_local_login import (
     KEY_DELETE,
     PortalLocalLoginError,
     PortalMacLoginAutomator,
+    STARTUP_REMINDER_TITLE,
 )
 
 
@@ -160,6 +161,21 @@ class PortalLocalLoginTests(unittest.TestCase):
 
         self.assertEqual([(160.0, 460.0)], clicks)
 
+    def test_dismiss_startup_reminder_stops_after_first_click_when_ocr_reports_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = self._build_config(tmp_path)
+            automator = PortalMacLoginAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
+            events: list[str] = []
+            ocr_states = iter([True, False])
+
+            with patch.object(automator, "_ocr_startup_reminder_visible", side_effect=lambda *args: next(ocr_states)):
+                with patch.object(automator, "_click_startup_reminder_close", side_effect=lambda *args: events.append("click_close")):
+                    with patch("app.portal_local_login.sleep", return_value=None):
+                        automator._dismiss_startup_reminder_if_present("cn.gov.chinatax.gt4.app")  # noqa: SLF001
+
+        self.assertEqual(["click_close"], events)
+
     def test_dismiss_startup_reminder_runs_only_once_per_automation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
@@ -179,6 +195,82 @@ class PortalLocalLoginTests(unittest.TestCase):
                         automator._dismiss_startup_reminder_if_present("cn.gov.chinatax.gt4.app")  # noqa: SLF001
 
         self.assertEqual(["click_close"], events)
+
+    def test_startup_reminder_visible_falls_back_to_ax_text_when_ocr_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = self._build_config(tmp_path)
+            automator = PortalMacLoginAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
+
+            with patch.object(automator, "_ocr_startup_reminder_visible", return_value=None):
+                with patch.object(automator, "_collect_visible_texts", return_value=[STARTUP_REMINDER_TITLE]):
+                    visible = automator._startup_reminder_visible("cn.gov.chinatax.gt4.app")  # noqa: SLF001
+
+        self.assertTrue(visible)
+
+    def test_ocr_startup_reminder_visible_returns_false_when_model_says_no(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = self._build_config(tmp_path)
+            automator = PortalMacLoginAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
+            fake_image = tmp_path / "startup-reminder.png"
+            fake_image.write_bytes(b"png")
+
+            with patch.object(automator, "_capture_startup_reminder_screenshot", return_value=fake_image):
+                with patch.object(
+                    automator,
+                    "_recognize_startup_reminder_visibility_from_image",
+                    return_value=(False, "NONE"),
+                ):
+                    visible = automator._ocr_startup_reminder_visible("cn.gov.chinatax.gt4.app")  # noqa: SLF001
+
+        self.assertFalse(visible)
+
+    def test_recognize_startup_reminder_visibility_from_image_returns_true_for_exact_modal_title(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = self._build_config(tmp_path)
+            automator = PortalMacLoginAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
+            fake_image = tmp_path / "startup-reminder.png"
+            fake_image.write_bytes(b"png")
+
+            class FakeVisionClient:
+                def _chat_completion(self, image_base64: str, file_name: str, prompt: str) -> str:
+                    self.image_base64 = image_base64
+                    self.file_name = file_name
+                    self.prompt = prompt
+                    return f"{STARTUP_REMINDER_TITLE}\n"
+
+            fake_client = FakeVisionClient()
+
+            with patch.object(automator, "_get_vision_client", return_value=fake_client):
+                visible, raw_response = automator._recognize_startup_reminder_visibility_from_image(fake_image)  # noqa: SLF001
+
+        self.assertTrue(visible)
+        self.assertEqual(STARTUP_REMINDER_TITLE, raw_response)
+
+    def test_recognize_startup_reminder_visibility_from_image_returns_false_for_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = self._build_config(tmp_path)
+            automator = PortalMacLoginAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
+            fake_image = tmp_path / "startup-reminder.png"
+            fake_image.write_bytes(b"png")
+
+            class FakeVisionClient:
+                def _chat_completion(self, image_base64: str, file_name: str, prompt: str) -> str:
+                    self.image_base64 = image_base64
+                    self.file_name = file_name
+                    self.prompt = prompt
+                    return "NONE"
+
+            fake_client = FakeVisionClient()
+
+            with patch.object(automator, "_get_vision_client", return_value=fake_client):
+                visible, raw_response = automator._recognize_startup_reminder_visibility_from_image(fake_image)  # noqa: SLF001
+
+        self.assertFalse(visible)
+        self.assertEqual("NONE", raw_response)
 
     def test_open_album_from_scan_page_retries_until_scan_page_disappears(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1200,6 +1292,78 @@ class PortalLocalLoginTests(unittest.TestCase):
             automator._ensure_etax_session("cn.gov.chinatax.gt4.app")  # noqa: SLF001
 
         self.assertIn("prompt:true", events)
+
+    def test_ensure_etax_session_continues_when_role_selection_is_skipped_after_sms_login(self) -> None:
+        events: list[str] = []
+
+        class FakeAutomator(PortalMacLoginAutomator):
+            post_login_states = iter(["fingerprint_prompt", "home"])
+
+            def _click_etax_tabbar_item(self, bundle_id: str, index: int) -> None:
+                events.append(f"tab:{index}")
+
+            def _focus_sms_code_input(self, bundle_id: str) -> None:
+                events.append("focus_sms")
+
+            def _request_sms_code(self, bundle_id: str) -> None:
+                events.append("request_sms")
+
+            def _wait_for_post_login_state(self, bundle_id: str, *, timeout_seconds: float) -> str:
+                state = next(self.post_login_states)
+                events.append(f"post_login:{state}")
+                return state
+
+            def _wait_for_etax_session_entry_state(self, bundle_id: str, *, timeout_seconds: float) -> str:
+                events.append(f"entry_state:{timeout_seconds}")
+                return "login_button"
+
+            def _click_named_element(
+                self,
+                bundle_id: str,
+                names: tuple[str, ...],
+                *,
+                timeout_seconds: float,
+                contains: bool = False,
+            ) -> str:
+                events.append(f"click:{names[0]}")
+                return names[0]
+
+            def _set_text_input_value(
+                self,
+                bundle_id: str,
+                value: str,
+                *,
+                field_index: int,
+                labels: tuple[str, ...] = (),
+                secure: bool = False,
+            ) -> None:
+                events.append(f"set:{field_index}:{secure}:{value}")
+
+            def _try_fill_otp_from_system_prompt(self, bundle_id: str) -> bool:
+                events.append("prompt:true")
+                return True
+
+            def _dismiss_fingerprint_prompt(self, bundle_id: str) -> None:
+                events.append("dismiss_fingerprint")
+
+            def _confirm_role_selection(self, bundle_id: str, *, role_already_selected: bool = False) -> str:
+                raise AssertionError("role selection should be skipped when fingerprint prompt appears directly")
+
+            def _log(self, message: str) -> None:
+                events.append(f"log:{message}")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = self._build_config(tmp_path)
+            automator = FakeAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
+
+            automator._ensure_etax_session("cn.gov.chinatax.gt4.app")  # noqa: SLF001
+
+        self.assertIn("dismiss_fingerprint", events)
+        self.assertIn(
+            "log:role selection not shown after SMS login; continuing with fingerprint quick-login prompt",
+            events,
+        )
 
     def test_verify_gui_automation_prerequisites_raises_clear_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

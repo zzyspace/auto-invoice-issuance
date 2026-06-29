@@ -65,7 +65,7 @@ STARTUP_REMINDER_TITLE = "关于电子税务局上线申报智能自检的提醒
 STARTUP_REMINDER_CLOSE_X_RATIO = 0.50
 STARTUP_REMINDER_CLOSE_Y_RATIO = 0.88
 STARTUP_REMINDER_DISMISS_ATTEMPTS = 3
-STARTUP_REMINDER_DISMISS_SETTLE_SECONDS = 0.8
+STARTUP_REMINDER_DISMISS_SETTLE_SECONDS = 2.0
 ETAX_SESSION_ENTRY_TIMEOUT_SECONDS = 6.0
 PORTAL_AREA_TEXT_REGEX = re.compile(r"^[一-龥]{2,6}(?:省|市)?$")
 PORTAL_AREA_TEXT_IGNORE = {
@@ -665,28 +665,7 @@ class PortalMacLoginAutomator:
                 self._log("filled SMS verification code from Messages app fallback")
             self._click_named_element(bundle_id, ("登录",), timeout_seconds=UI_ACTION_TIMEOUT_SECONDS)
             state = self._wait_for_post_login_state(bundle_id, timeout_seconds=POST_LOGIN_STATE_TIMEOUT_SECONDS)
-            if state != "role_dialog":
-                raise PortalLocalLoginError(
-                    f"电子税务局 app did not reach role selection after SMS login state={state}"
-                )
-            state = self._confirm_role_selection(bundle_id)
-            if state == "home":
-                self._log("identity role selection entered logged-in home directly without fingerprint prompt")
-                return
-            if state != "fingerprint_prompt":
-                raise PortalLocalLoginError(
-                    "电子税务局 app did not reach fingerprint quick-login prompt after role selection "
-                    f"state={state}"
-                )
-            self._dismiss_fingerprint_prompt(bundle_id)
-            self._log("dismissed fingerprint quick login prompt")
-            state = self._wait_for_post_login_state(bundle_id, timeout_seconds=POST_LOGIN_STATE_TIMEOUT_SECONDS)
-            if state == "login_page":
-                self._log("fingerprint prompt dismissed but home markers not yet visible; continuing to scan flow")
-            elif state != "home":
-                raise PortalLocalLoginError(
-                    f"电子税务局 app did not reach logged-in home after fingerprint prompt state={state}"
-                )
+            self._handle_post_sms_login_state(bundle_id, state)
             return
         if self._maybe_click_named_element(bundle_id, (self.role_label,), timeout_seconds=8.0):
             self._log("电子税务局 我的页入口动作 action=role_entry")
@@ -718,6 +697,48 @@ class PortalMacLoginAutomator:
             return
         raise PortalLocalLoginError(
             "电子税务局 app did not show login button, role entry, or logged-in home after opening 我的."
+        )
+
+    def _handle_post_sms_login_state(self, bundle_id: str, state: str) -> None:
+        if state == "role_dialog":
+            state = self._confirm_role_selection(bundle_id)
+            if state == "home":
+                self._log("identity role selection entered logged-in home directly without fingerprint prompt")
+                return
+            if state != "fingerprint_prompt":
+                raise PortalLocalLoginError(
+                    "电子税务局 app did not reach fingerprint quick-login prompt after role selection "
+                    f"state={state}"
+                )
+            self._dismiss_fingerprint_prompt(bundle_id)
+            self._log("dismissed fingerprint quick login prompt")
+            state = self._wait_for_post_login_state(bundle_id, timeout_seconds=POST_LOGIN_STATE_TIMEOUT_SECONDS)
+            if state == "login_page":
+                self._log("fingerprint prompt dismissed but home markers not yet visible; continuing to scan flow")
+                return
+            if state != "home":
+                raise PortalLocalLoginError(
+                    f"电子税务局 app did not reach logged-in home after fingerprint prompt state={state}"
+                )
+            return
+        if state == "fingerprint_prompt":
+            self._log("role selection not shown after SMS login; continuing with fingerprint quick-login prompt")
+            self._dismiss_fingerprint_prompt(bundle_id)
+            self._log("dismissed fingerprint quick login prompt")
+            state = self._wait_for_post_login_state(bundle_id, timeout_seconds=POST_LOGIN_STATE_TIMEOUT_SECONDS)
+            if state == "login_page":
+                self._log("fingerprint prompt dismissed but home markers not yet visible; continuing to scan flow")
+                return
+            if state != "home":
+                raise PortalLocalLoginError(
+                    f"电子税务局 app did not reach logged-in home after fingerprint prompt state={state}"
+                )
+            return
+        if state == "home":
+            self._log("role selection not shown after SMS login; home markers already visible")
+            return
+        raise PortalLocalLoginError(
+            f"电子税务局 app did not reach role selection after SMS login state={state}"
         )
 
     def _wait_for_etax_session_entry_state(self, bundle_id: str, *, timeout_seconds: float) -> str:
@@ -755,6 +776,12 @@ class PortalMacLoginAutomator:
             raise PortalLocalLoginError("Failed to dismiss 电子税务局 startup reminder popup.")
 
     def _startup_reminder_visible(self, bundle_id: str) -> bool:
+        ocr_visible = self._ocr_startup_reminder_visible(bundle_id)
+        if ocr_visible is not None:
+            return ocr_visible
+        return self._startup_reminder_visible_from_ax_text(bundle_id)
+
+    def _startup_reminder_visible_from_ax_text(self, bundle_id: str) -> bool:
         try:
             texts = self._collect_visible_texts(bundle_id, timeout_seconds=1.0)
         except PortalLocalLoginError:
@@ -781,6 +808,78 @@ class PortalMacLoginAutomator:
             left + width * STARTUP_REMINDER_CLOSE_X_RATIO,
             top + height * STARTUP_REMINDER_CLOSE_Y_RATIO,
         )
+
+    def _ocr_startup_reminder_visible(self, bundle_id: str) -> bool | None:
+        try:
+            image_path = self._capture_startup_reminder_screenshot(bundle_id)
+        except PortalLocalLoginError as exc:
+            self._log(f"could not capture startup reminder screenshot error={exc}")
+            return None
+        try:
+            visible, raw_response = self._recognize_startup_reminder_visibility_from_image(image_path)
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"could not OCR startup reminder screenshot error={exc}")
+            return None
+        self._log(
+            f"startup reminder OCR path={image_path} visible={visible} raw={raw_response!r}"
+        )
+        return visible
+
+    def _capture_startup_reminder_screenshot(self, bundle_id: str) -> Path:
+        bounds = self._window_bounds_for_bundle(bundle_id)
+        if bounds is None:
+            window = self._window_node(bundle_id)
+            if window is None or window.position is None or window.size is None:
+                raise PortalLocalLoginError("Unable to determine 电子税务局 window bounds for startup reminder screenshot.")
+            left, top, width, height = (
+                window.position[0],
+                window.position[1],
+                window.size[0],
+                window.size[1],
+            )
+        else:
+            left, top, width, height = bounds
+        target_dir = Path(mkdtemp(prefix="portal-startup-reminder-"))
+        target = target_dir / "startup-reminder.png"
+        self._run_command(
+            [
+                "screencapture",
+                "-x",
+                "-R",
+                f"{int(left)},{int(top)},{max(int(width), 40)},{max(int(height), 40)}",
+                str(target),
+            ],
+            timeout_seconds=UI_ACTION_TIMEOUT_SECONDS,
+        )
+        if not target.exists():
+            raise PortalLocalLoginError("Startup reminder screenshot was not created.")
+        return target
+
+    def _recognize_startup_reminder_visibility_from_image(self, image_path: Path) -> tuple[bool, str]:
+        client = self._get_vision_client()
+        prompt = (
+            "请只判断截图中央是否仍然显示一个居中的模态弹窗。"
+            f"如果截图中央存在一个大面积白色内容区、上方蓝色圆角标题栏的模态弹窗，并且该弹窗标题是“{STARTUP_REMINDER_TITLE}”，"
+            "只返回这个居中模态弹窗的标题原文。"
+            "如果不存在这样的居中模态弹窗，则只返回 NONE。"
+            "忽略页面顶部横幅、列表卡片、滚动内容里出现的同名文案。"
+            "不要输出解释或额外文字。"
+        )
+        raw = image_path.read_bytes()
+        response = client._chat_completion(
+            base64.b64encode(raw).decode("ascii"),
+            image_path.name,
+            prompt,
+        )
+        first_line = response.strip().splitlines()[0].strip()
+        normalized = self._normalized_text(first_line)
+        normalized_upper = normalized.upper()
+        if normalized_upper in {"NONE", "NO", "FALSE"} or normalized in {"无", "没有", "不存在"}:
+            return False, first_line
+        normalized = normalized.removeprefix("标题").removeprefix(":").removeprefix("：").strip()
+        if normalized == self._normalized_text(STARTUP_REMINDER_TITLE):
+            return True, first_line
+        raise ValueError(f"Unsupported startup reminder OCR response: {response!r}")
 
     def _open_scan_flow(self, bundle_id: str) -> None:
         self._log("opening scan flow in 电子税务局 app")

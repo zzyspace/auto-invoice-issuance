@@ -1056,6 +1056,69 @@ class PortalRunnerUrlTests(unittest.TestCase):
 
             self.assertIsNone(authenticated_page)
 
+    def test_confirmed_authenticated_page_rejects_transient_authenticated_page_that_redirects_during_stability_window(
+        self,
+    ) -> None:
+        class FakeLocator:
+            def __init__(self, page: "FakePage") -> None:
+                self.page = page
+
+            def inner_text(self) -> str:
+                return self.page.body_text
+
+        class FakePage:
+            def __init__(self) -> None:
+                self.url = "https://etax.xiamen.chinatax.gov.cn:8443/loginb/"
+                self.body_text = "首页 我要办税 我要查询"
+                self.context = SimpleNamespace(pages=[self])
+                self.wait_for_timeout_calls = 0
+
+            def locator(self, selector: str) -> FakeLocator:
+                return FakeLocator(self)
+
+            def wait_for_load_state(self, state: str, timeout: int) -> None:
+                return None
+
+            def wait_for_timeout(self, timeout_ms: int) -> None:
+                self.wait_for_timeout_calls += 1
+                if self.wait_for_timeout_calls == 1:
+                    self.url = "https://tpass.xiamen.chinatax.gov.cn:8443/#/login"
+                    self.body_text = "打开电子税务局APP扫一扫"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=tmp_path / "profile",
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+
+            monotonic_values = iter([0.0, 0.1])
+            with patch("app.portal_runner.monotonic", side_effect=lambda: next(monotonic_values)):
+                authenticated_page = runner._confirmed_authenticated_page(FakePage())  # noqa: SLF001
+
+            self.assertIsNone(authenticated_page)
+
     def test_ensure_logged_in_returns_authenticated_shell_page_from_another_tab(self) -> None:
         class FakeLocator:
             def __init__(self, page: "FakePage") -> None:
@@ -1262,12 +1325,13 @@ class PortalRunnerUrlTests(unittest.TestCase):
             runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
             result = type("FakeResult", (), {"artifacts_dir": None, "store_key": "fuzzy"})()
             page = object()
+            home_page = object()
 
-            monotonic_values = iter([0.0, 1.0, 2.0, 3.0, 4.0])
+            monotonic_values = iter([0.0, 1.0, 2.0, 3.0])
 
             with patch("app.portal_runner.monotonic", side_effect=lambda: next(monotonic_values)):
                 with patch("app.portal_runner.sleep", lambda _: None):
-                    with patch.object(runner, "_is_home_page", side_effect=[False, False, True, True]):
+                    with patch.object(runner, "_confirmed_authenticated_page", side_effect=[None, None, home_page]):
                         with patch.object(runner, "_is_public_landing_page", side_effect=[True, False]):
                             with patch.object(runner, "_page_requires_reauth", return_value=True):
                                 with patch.object(runner, "_open_login_from_public_landing") as mocked_open:
@@ -1308,14 +1372,13 @@ class PortalRunnerUrlTests(unittest.TestCase):
             runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
             result = type("FakeResult", (), {"artifacts_dir": None, "store_key": "fuzzy"})()
             page = object()
+            home_page = object()
 
-            monotonic_values = iter(
-                [0.0, 1.0, 2.0, 2.0 + QR_REFRESH_GRACE_SECONDS + 0.1, 9.0, 10.0, 11.0]
-            )
+            monotonic_values = iter([0.0, 1.0, 2.0, 3.0, 2.0 + QR_REFRESH_GRACE_SECONDS + 0.1, 8.0])
 
             with patch("app.portal_runner.monotonic", side_effect=lambda: next(monotonic_values)):
                 with patch("app.portal_runner.sleep", lambda _: None):
-                    with patch.object(runner, "_is_home_page", side_effect=[False, False, False, True, True]):
+                    with patch.object(runner, "_confirmed_authenticated_page", side_effect=[None, None, None, home_page]):
                         with patch.object(runner, "_is_public_landing_page", return_value=False):
                             with patch.object(runner, "_page_requires_reauth", return_value=True):
                                 with patch.object(runner, "_try_refresh_login_qr") as mocked_refresh:

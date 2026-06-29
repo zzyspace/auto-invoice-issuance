@@ -1,2 +1,1 @@
-"""Tencent survey invoice automation package."""
-
+"""Invoice automation package with switchable submission sources."""

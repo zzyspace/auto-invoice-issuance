@@ -15,6 +15,8 @@ class StoreConfig:
     survey_id: str
     output_xlsx_path: Path
     initial_last_processed_id: int
+    data_source: str = "tencent_survey"
+    invoice_submit_store_key: Optional[str] = None
     enabled: bool = True
     attachment_question_id: Optional[str] = None
     portal_enabled: bool = False
@@ -32,6 +34,44 @@ class StoreConfig:
                 f"Store '{self.store_key}' is missing attachment_question_id and no global default is configured."
             )
         return question_id
+
+    def effective_data_source(self) -> str:
+        normalized = (self.data_source or "").strip().lower().replace("-", "_")
+        if not normalized:
+            return "tencent_survey"
+        aliases = {
+            "survey": "tencent_survey",
+            "tencent": "tencent_survey",
+            "tencent_survey": "tencent_survey",
+            "invoice_submit": "invoice_submit",
+        }
+        resolved = aliases.get(normalized)
+        if resolved:
+            return resolved
+        raise ValueError(
+            f"Store '{self.store_key}' has unsupported data_source={self.data_source!r}; "
+            "expected one of: tencent_survey, invoice_submit."
+        )
+
+    def effective_survey_id(self) -> str:
+        value = (self.survey_id or "").strip()
+        if not value:
+            raise ValueError(f"Store '{self.store_key}' is missing survey_id.")
+        return value
+
+    def effective_invoice_submit_store_key(self) -> str:
+        value = (self.invoice_submit_store_key or "").strip()
+        if value:
+            return value
+        fallback = (self.store_key or "").strip()
+        if fallback:
+            return fallback
+        raise ValueError(f"Store '{self.store_key}' is missing invoice_submit_store_key.")
+
+    def effective_source_identifier(self) -> str:
+        if self.effective_data_source() == "invoice_submit":
+            return f"invoice-submit:{self.effective_invoice_submit_store_key()}"
+        return self.effective_survey_id()
 
     def effective_portal_company_switch_name(self) -> str:
         value = (self.portal_company_switch_name or "").strip()
@@ -86,6 +126,7 @@ class AppConfig:
     state_db_path: Path
     stores_config_path: Path
     backups_root: Path
+    invoice_submit_db_path: Optional[Path] = None
     run_hour: int = 22
     run_minute: int = 30
     openai_timeout_seconds: int = 60
@@ -167,6 +208,9 @@ class RawSurveyRecord:
     phone: str
     remark: str
     raw: dict[str, str]
+    attachment_ref: Optional[str] = None
+    attachment_content_type: Optional[str] = None
+    submission_label: Optional[str] = None
 
 
 @dataclass(frozen=True)

@@ -39,8 +39,9 @@ class TencentSurveyClient:
 
     def export_csv(self, store: StoreConfig) -> str:
         from_datetime, to_datetime = default_export_range()
+        survey_id = store.effective_survey_id()
         context = {
-            "survey_id": store.survey_id,
+            "survey_id": survey_id,
             "store_key": store.store_key,
             "store_name": store.store_name,
             "from_datetime": from_datetime,
@@ -94,7 +95,7 @@ class TencentSurveyClient:
             question_id = store.effective_attachment_question_id(self.config.default_attachment_question_id)
             url = (
                 "https://wj.qq.com/api/files/download"
-                f"?survey_id={store.survey_id}&question_id={question_id}&file_name={file_name}"
+                f"?survey_id={store.effective_survey_id()}&question_id={question_id}&file_name={file_name}"
             )
         response_bytes, _ = self._request(url, "GET", self.base_headers, None)
         return response_bytes

@@ -1,14 +1,22 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
-from app.csv_processing import parse_survey_csv, select_new_records
+from app.csv_processing import select_new_records
 from app.excel_writer import InvoiceExcelWriter
 from app.mailer import SummaryMailer
-from app.models import BatchRunSummary, NormalizedInvoice, StoreConfig, StoreRunResult, TaxLookupResult
+from app.models import (
+    BatchRunSummary,
+    NormalizedInvoice,
+    RawSurveyRecord,
+    StoreConfig,
+    StoreRunResult,
+    TaxLookupResult,
+)
 from app.state import StateStore
-from app.survey_client import TencentSurveyClient
+from app.submission_source import SubmissionSourceClient
 from app.tax_lookup import TaxLookupClient
 from app.utils import (
     format_decimal_text,
@@ -21,7 +29,7 @@ from app.vision_client import OpenAICompatibleVisionClient
 
 @dataclass(frozen=True)
 class Services:
-    survey_client: TencentSurveyClient
+    survey_client: SubmissionSourceClient
     vision_client: OpenAICompatibleVisionClient
     tax_lookup_client: TaxLookupClient
     excel_writer: InvoiceExcelWriter
@@ -60,15 +68,14 @@ class BatchProcessor:
         result = StoreRunResult(
             store_key=store.store_key,
             store_name=store.store_name,
-            survey_id=store.survey_id,
+            survey_id=store.effective_source_identifier(),
             status="failed",
             processed_count=0,
             last_processed_id_before=last_processed_id,
             last_processed_id_after=last_processed_id,
         )
         try:
-            csv_text = self.services.survey_client.export_csv(store)
-            records = parse_survey_csv(csv_text)
+            records = self.services.survey_client.list_records(store)
             new_records = select_new_records(records, last_processed_id)
             if new_records:
                 invoices = self._normalize_records(store, new_records, result)
@@ -90,12 +97,13 @@ class BatchProcessor:
     def _normalize_records(
         self,
         store: StoreConfig,
-        records: list[object],
+        records: list[RawSurveyRecord],
         result: StoreRunResult,
     ) -> list[NormalizedInvoice]:
         invoices: list[NormalizedInvoice] = []
         for index, record in enumerate(records, start=1):
             warnings: list[str] = []
+            submission_ref = self._submission_ref(record)
             natural_person = looks_like_natural_person(record.invoice_title)
             provided_tax_id = normalize_tax_id(record.tax_id_raw)
             tax_id = provided_tax_id
@@ -110,11 +118,11 @@ class BatchProcessor:
                     if invalid_enterprise_tax_id and provided_tax_id:
                         warnings.append(
                             "编号 "
-                            f"{record.submission_id} [tax_lookup:invalid_tax_id] "
+                            f"{submission_ref} [tax_lookup:invalid_tax_id] "
                             f"企业抬头原税号格式异常，未能自动修正: {provided_tax_id}"
                         )
                     warnings.append(
-                        f"编号 {record.submission_id} [tax_lookup:provider_error] 税号查询失败: {exc}"
+                        f"编号 {submission_ref} [tax_lookup:provider_error] 税号查询失败: {exc}"
                     )
                 else:
                     if looked_up.tax_id:
@@ -122,39 +130,41 @@ class BatchProcessor:
                         if invalid_enterprise_tax_id and provided_tax_id:
                             warnings.append(
                                 "编号 "
-                                f"{record.submission_id} [tax_lookup:replaced_invalid_tax_id] "
+                                f"{submission_ref} [tax_lookup:replaced_invalid_tax_id] "
                                 f"企业抬头原税号格式异常，已改用查询结果: {provided_tax_id} -> {tax_id}"
                             )
                     else:
                         if invalid_enterprise_tax_id and provided_tax_id:
                             warnings.append(
                                 "编号 "
-                                f"{record.submission_id} [tax_lookup:invalid_tax_id] "
+                                f"{submission_ref} [tax_lookup:invalid_tax_id] "
                                 f"企业抬头原税号格式异常，且未查询到可替代税号: "
                                 f"{record.invoice_title} ({provided_tax_id})"
                             )
-                        warning = self._build_tax_lookup_warning(record.submission_id, record.invoice_title, looked_up)
+                        warning = self._build_tax_lookup_warning(submission_ref, record.invoice_title, looked_up)
                         if warning:
                             warnings.append(warning)
 
             amount_text: Optional[str] = None
             if record.attachment_name:
-                try:
-                    image_bytes = self.services.survey_client.download_attachment(
-                        store, record.attachment_name
-                    )
-                    amount = self.services.vision_client.extract_total_amount(
-                        image_bytes, record.attachment_name
-                    )
-                    amount_text = format_decimal_text(amount.total_amount)
-                    if amount_text is None:
-                        warnings.append(
-                            f"编号 {record.submission_id} 金额识别失败: {amount.notes or '未返回金额'}"
+                unsupported_reason = self._unsupported_attachment_reason(record)
+                if unsupported_reason:
+                    warnings.append(f"编号 {submission_ref} {unsupported_reason}: {record.attachment_name}")
+                else:
+                    try:
+                        image_bytes = self.services.survey_client.download_attachment(store, record)
+                        amount = self.services.vision_client.extract_total_amount(
+                            image_bytes, record.attachment_name
                         )
-                except Exception as exc:  # noqa: BLE001
-                    warnings.append(f"编号 {record.submission_id} 图片处理失败: {exc}")
+                        amount_text = format_decimal_text(amount.total_amount)
+                        if amount_text is None:
+                            warnings.append(
+                                f"编号 {submission_ref} 金额识别失败: {amount.notes or '未返回金额'}"
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        warnings.append(f"编号 {submission_ref} 图片处理失败: {exc}")
             else:
-                warnings.append(f"编号 {record.submission_id} 未上传付款截图")
+                warnings.append(f"编号 {submission_ref} 未上传付款截图")
 
             invoice = NormalizedInvoice(
                 source_submission_id=record.submission_id,
@@ -173,7 +183,7 @@ class BatchProcessor:
 
     @staticmethod
     def _build_tax_lookup_warning(
-        submission_id: int,
+        submission_id: str,
         invoice_title: str,
         looked_up: TaxLookupResult,
     ) -> Optional[str]:
@@ -193,3 +203,22 @@ class BatchProcessor:
         if looked_up.status == "no_result":
             return f"编号 {submission_id} [tax_lookup:no_result] 企业抬头未查询到税号: {invoice_title}"
         return f"编号 {submission_id} [tax_lookup:{looked_up.status}] 企业抬头未查询到税号: {invoice_title}"
+
+    @staticmethod
+    def _submission_ref(record: RawSurveyRecord) -> str:
+        value = (record.submission_label or "").strip()
+        if value:
+            return value
+        return str(record.submission_id)
+
+    @staticmethod
+    def _unsupported_attachment_reason(record: RawSurveyRecord) -> Optional[str]:
+        content_type = (record.attachment_content_type or "").strip().lower()
+        if content_type and not content_type.startswith("image/"):
+            if content_type == "application/pdf":
+                return "暂不支持 PDF 凭证金额识别"
+            return f"暂不支持 {content_type} 凭证金额识别"
+        suffix = Path(record.attachment_name).suffix.strip().lower()
+        if suffix == ".pdf":
+            return "暂不支持 PDF 凭证金额识别"
+        return None

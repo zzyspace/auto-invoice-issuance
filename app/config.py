@@ -74,6 +74,12 @@ def _resolve_tax_lookup_provider() -> str:
     return "disabled"
 
 
+def _resolve_required_sources(stores_config_path: Path) -> set[str]:
+    if not stores_config_path.exists():
+        return {"tencent_survey"}
+    return {store.effective_data_source() for store in load_store_configs(stores_config_path)}
+
+
 def load_store_configs(path: Path) -> list[StoreConfig]:
     content = path.read_text(encoding="utf-8")
     stores = _parse_stores_yaml(content)
@@ -89,9 +95,13 @@ def load_store_configs(path: Path) -> list[StoreConfig]:
             StoreConfig(
                 store_key=str(item["store_key"]),
                 store_name=str(item["store_name"]),
-                survey_id=str(item["survey_id"]),
+                survey_id=str(item.get("survey_id") or ""),
                 output_xlsx_path=output_path,
                 initial_last_processed_id=int(item["initial_last_processed_id"]),
+                data_source=str(item.get("data_source", "tencent_survey")),
+                invoice_submit_store_key=str(item["invoice_submit_store_key"])
+                if item.get("invoice_submit_store_key")
+                else None,
                 enabled=_parse_bool(item.get("enabled", True)),
                 attachment_question_id=str(item["attachment_question_id"])
                 if item.get("attachment_question_id")
@@ -173,13 +183,29 @@ def load_app_config(env_path: Optional[Path] = None) -> AppConfig:
             return None
         return resolve_path(raw)
 
+    stores_config_path = resolve_path(_require_env("STORES_CONFIG_PATH"))
+    required_sources = _resolve_required_sources(stores_config_path)
+    requires_tencent_survey = "tencent_survey" in required_sources
+    requires_invoice_submit = "invoice_submit" in required_sources
     survey_timeout_seconds = int(os.environ.get("SURVEY_TIMEOUT_SECONDS", "60"))
     tax_lookup_provider = _resolve_tax_lookup_provider()
     config = AppConfig(
         timezone=os.environ.get("TZ", "Asia/Shanghai"),
-        survey_cookie=_require_env("TENCENT_SURVEY_COOKIE"),
-        survey_export_url=_require_env("TENCENT_SURVEY_EXPORT_URL"),
-        survey_export_method=_require_env("TENCENT_SURVEY_EXPORT_METHOD").upper(),
+        survey_cookie=(
+            _require_env("TENCENT_SURVEY_COOKIE")
+            if requires_tencent_survey
+            else os.environ.get("TENCENT_SURVEY_COOKIE", "").strip()
+        ),
+        survey_export_url=(
+            _require_env("TENCENT_SURVEY_EXPORT_URL")
+            if requires_tencent_survey
+            else os.environ.get("TENCENT_SURVEY_EXPORT_URL", "").strip()
+        ),
+        survey_export_method=(
+            _require_env("TENCENT_SURVEY_EXPORT_METHOD").upper()
+            if requires_tencent_survey
+            else os.environ.get("TENCENT_SURVEY_EXPORT_METHOD", "").strip().upper()
+        ),
         survey_export_body_template=os.environ.get("TENCENT_SURVEY_EXPORT_BODY_TEMPLATE", ""),
         survey_export_download_url_path=os.environ.get("TENCENT_SURVEY_EXPORT_DOWNLOAD_URL_PATH") or None,
         survey_extra_headers=parse_json_object(
@@ -197,10 +223,15 @@ def load_app_config(env_path: Optional[Path] = None) -> AppConfig:
         smtp_to=[item.strip() for item in _require_env("SMTP_TO").split(",") if item.strip()],
         template_xlsx_path=resolve_path(_require_env("TEMPLATE_XLSX_PATH")),
         state_db_path=resolve_path(_require_env("STATE_DB_PATH")),
-        stores_config_path=resolve_path(_require_env("STORES_CONFIG_PATH")),
+        stores_config_path=stores_config_path,
         backups_root=(
             _optional_path("BACKUPS_ROOT")
             or base_dir.joinpath("backups").resolve()
+        ),
+        invoice_submit_db_path=(
+            resolve_path(os.environ.get("INVOICE_SUBMIT_DB_PATH", "/var/lib/invoice-submit/data/app.db"))
+            if requires_invoice_submit
+            else resolve_optional_path("INVOICE_SUBMIT_DB_PATH")
         ),
         run_hour=int(os.environ.get("RUN_HOUR", "22")),
         run_minute=int(os.environ.get("RUN_MINUTE", "30")),

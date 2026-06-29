@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
-from app.models import AmountExtraction, AppConfig, BatchRunSummary, StoreConfig, TaxLookupResult
+from app.csv_processing import parse_survey_csv
+from app.models import AmountExtraction, BatchRunSummary, RawSurveyRecord, StoreConfig, TaxLookupResult
 from app.service import BatchProcessor, Services
 from app.state import StateStore
 from app.utils import BackupResult
@@ -21,14 +22,14 @@ CSV_TEMPLATE = """编号,开始答题时间,结束答题时间,答题时长,1.�
 class FakeSurveyClient:
     csv_by_store: dict[str, str]
 
-    def export_csv(self, store: StoreConfig) -> str:
+    def list_records(self, store: StoreConfig) -> list[RawSurveyRecord]:
         payload = self.csv_by_store.get(store.store_key)
         if payload is None:
             raise RuntimeError(f"missing csv for {store.store_key}")
-        return payload
+        return parse_survey_csv(payload)
 
-    def download_attachment(self, store: StoreConfig, file_name: str) -> bytes:
-        return f"{store.store_key}:{file_name}".encode("utf-8")
+    def download_attachment(self, store: StoreConfig, record: RawSurveyRecord) -> bytes:
+        return f"{store.store_key}:{record.attachment_name}".encode("utf-8")
 
 
 class FakeVisionClient:
@@ -269,4 +270,56 @@ class BatchProcessorTests(unittest.TestCase):
             self.assertEqual("91350203769290107U", written_invoices[0].tax_id)
             self.assertTrue(
                 any("已改用查询结果" in warning for warning in summary.succeeded[0].warnings)
+            )
+
+    def test_pdf_attachment_is_skipped_with_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            store = StoreConfig(
+                store_key="store_a",
+                store_name="门店A",
+                survey_id="invoice-submit:store_a",
+                output_xlsx_path=tmp_path / "out_a.xlsx",
+                initial_last_processed_id=0,
+            )
+            record = RawSurveyRecord(
+                submission_id=1,
+                submission_label="submission-preview",
+                start_time="2026-06-30T10:00:00Z",
+                end_time="2026-06-30T10:00:00Z",
+                duration_seconds="",
+                invoice_title="上海示例科技有限公司",
+                tax_id_raw="",
+                email="finance@example.com",
+                attachment_name="receipt.pdf",
+                phone="",
+                remark="",
+                raw={},
+                attachment_ref="/tmp/receipt.pdf",
+                attachment_content_type="application/pdf",
+            )
+
+            class FakeInvoiceSubmitSource:
+                def list_records(self, _store: StoreConfig) -> list[RawSurveyRecord]:
+                    return [record]
+
+                def download_attachment(self, _store: StoreConfig, _record: RawSurveyRecord) -> bytes:
+                    raise AssertionError("PDF attachments should not be downloaded for vision extraction.")
+
+            processor = BatchProcessor(
+                Services(
+                    survey_client=FakeInvoiceSubmitSource(),
+                    vision_client=FakeVisionClient(),
+                    tax_lookup_client=FakeTaxLookupClient(),
+                    excel_writer=FakeExcelWriter(tmp_path / "outputs"),
+                    state_store=StateStore(tmp_path / "state.db"),
+                    mailer=FakeMailer(),
+                )
+            )
+
+            summary = processor.run([store])
+
+            self.assertEqual(1, len(summary.succeeded))
+            self.assertTrue(
+                any("暂不支持 PDF 凭证金额识别" in warning for warning in summary.succeeded[0].warnings)
             )
