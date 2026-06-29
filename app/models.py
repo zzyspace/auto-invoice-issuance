@@ -73,6 +73,9 @@ class StoreConfig:
             return f"invoice-submit:{self.effective_invoice_submit_store_key()}"
         return self.effective_survey_id()
 
+    def effective_progress_key(self) -> str:
+        return f"{self.store_key}::{self.effective_source_identifier()}"
+
     def effective_portal_company_switch_name(self) -> str:
         value = (self.portal_company_switch_name or "").strip()
         if not value:
@@ -239,6 +242,7 @@ class StoreRunResult:
     store_key: str
     store_name: str
     survey_id: str
+    progress_key: str
     status: str
     processed_count: int
     last_processed_id_before: int

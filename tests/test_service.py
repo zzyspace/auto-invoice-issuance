@@ -323,3 +323,43 @@ class BatchProcessorTests(unittest.TestCase):
             self.assertTrue(
                 any("暂不支持 PDF 凭证金额识别" in warning for warning in summary.succeeded[0].warnings)
             )
+
+    def test_switching_source_does_not_reuse_previous_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            state_store = StateStore(tmp_path / "state.db")
+            tencent_store = StoreConfig(
+                store_key="peanut",
+                store_name="Peanut",
+                survey_id="22512014",
+                output_xlsx_path=tmp_path / "peanut.xlsx",
+                initial_last_processed_id=307,
+                data_source="tencent_survey",
+            )
+            invoice_submit_store = StoreConfig(
+                store_key="peanut",
+                store_name="Peanut",
+                survey_id="22512014",
+                output_xlsx_path=tmp_path / "peanut.xlsx",
+                initial_last_processed_id=0,
+                data_source="invoice_submit",
+                invoice_submit_store_key="peanut",
+            )
+            csv_text = CSV_TEMPLATE.format(
+                rows="309,2026/5/26 11:00,2026/5/26 11:01,31,吴翔,,a@example.com,a.png,,"
+            )
+            processor = BatchProcessor(
+                Services(
+                    survey_client=FakeSurveyClient({"peanut": csv_text}),
+                    vision_client=FakeVisionClient(),
+                    tax_lookup_client=FakeTaxLookupClient(),
+                    excel_writer=FakeExcelWriter(tmp_path / "outputs"),
+                    state_store=state_store,
+                    mailer=FakeMailer(),
+                )
+            )
+
+            processor.run([tencent_store])
+
+            self.assertEqual(309, state_store.get_last_processed_id(tencent_store))
+            self.assertEqual(0, state_store.get_last_processed_id(invoice_submit_store))

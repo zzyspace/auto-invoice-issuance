@@ -105,10 +105,11 @@ class StateStore:
             )
 
     def get_last_processed_id(self, store: StoreConfig) -> int:
+        progress_key = store.effective_progress_key()
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT last_processed_id FROM store_state WHERE store_key = ?",
-                (store.store_key,),
+                (progress_key,),
             ).fetchone()
         if row:
             return int(row["last_processed_id"])
@@ -173,7 +174,7 @@ class StateStore:
                         updated_at = excluded.updated_at
                     """,
                     (
-                        result.store_key,
+                        result.progress_key,
                         result.last_processed_id_after,
                         result.status,
                         str(result.output_path) if result.output_path else None,
@@ -182,7 +183,7 @@ class StateStore:
                         result.finished_at.isoformat(),
                     ),
                 )
-            elif not self._store_state_exists(connection, result.store_key):
+            elif not self._store_state_exists(connection, result.progress_key):
                 connection.execute(
                     """
                     INSERT INTO store_state (
@@ -196,7 +197,7 @@ class StateStore:
                     ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        result.store_key,
+                        result.progress_key,
                         result.last_processed_id_before,
                         result.status,
                         str(result.output_path) if result.output_path else None,

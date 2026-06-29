@@ -69,6 +69,7 @@ class BatchProcessor:
             store_key=store.store_key,
             store_name=store.store_name,
             survey_id=store.effective_source_identifier(),
+            progress_key=store.effective_progress_key(),
             status="failed",
             processed_count=0,
             last_processed_id_before=last_processed_id,
