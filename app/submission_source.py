@@ -47,10 +47,11 @@ class InvoiceSubmitSourceClient:
     def list_records(self, store: StoreConfig) -> list[RawSurveyRecord]:
         store_key = store.effective_invoice_submit_store_key()
         with self._connect() as connection:
+            submission_id_expr = self._submission_id_expr(connection)
             rows = connection.execute(
-                """
+                f"""
                 SELECT
-                    rowid AS submission_rowid,
+                    {submission_id_expr} AS submission_sequence,
                     id,
                     invoice_type,
                     invoice_title,
@@ -65,7 +66,7 @@ class InvoiceSubmitSourceClient:
                     created_at
                 FROM submissions
                 WHERE store_key = ?
-                ORDER BY submission_rowid ASC
+                ORDER BY submission_sequence ASC
                 """,
                 (store_key,),
             ).fetchall()
@@ -87,6 +88,7 @@ class InvoiceSubmitSourceClient:
     def _build_record(row: sqlite3.Row) -> RawSurveyRecord:
         created_at = str(row["created_at"] or "")
         raw = {
+            "submission_sequence": str(row["submission_sequence"] or ""),
             "id": str(row["id"] or ""),
             "invoice_type": str(row["invoice_type"] or ""),
             "invoice_title": str(row["invoice_title"] or ""),
@@ -101,7 +103,7 @@ class InvoiceSubmitSourceClient:
             "created_at": created_at,
         }
         return RawSurveyRecord(
-            submission_id=int(row["submission_rowid"]),
+            submission_id=int(row["submission_sequence"]),
             start_time=created_at,
             end_time=created_at,
             duration_seconds="",
@@ -116,6 +118,17 @@ class InvoiceSubmitSourceClient:
             attachment_content_type=str(row["attachment_content_type"] or "").strip(),
             submission_label=str(row["id"] or "").strip() or None,
         )
+
+    @staticmethod
+    def _submission_id_expr(connection: sqlite3.Connection) -> str:
+        columns = {
+            str(row["name"]).strip().lower()
+            for row in connection.execute("PRAGMA table_info(submissions)").fetchall()
+            if row["name"]
+        }
+        if "submit_id" in columns:
+            return "submit_id"
+        return "rowid"
 
 
 class RoutedSubmissionSourceClient:
