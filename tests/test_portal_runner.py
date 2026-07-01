@@ -9,7 +9,13 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.models import AppConfig, PortalIssueDetail, StoreConfig
-from app.portal_runner import BROWSER_CLICK_DELAY_MS, QR_REFRESH_GRACE_SECONDS, TaxPortalRunner
+from app.portal_runner import (
+    BROWSER_CLICK_DELAY_MS,
+    HOME_PAGE_NETWORKIDLE_GRACE_MS,
+    QR_REFRESH_GRACE_SECONDS,
+    PortalRunnerError,
+    TaxPortalRunner,
+)
 from app.state import StateStore
 
 
@@ -2741,7 +2747,7 @@ class PortalRunnerUrlTests(unittest.TestCase):
                 [
                     ("domcontentloaded", 60000),
                     ("load", 60000),
-                    ("networkidle", 60000),
+                    ("networkidle", HOME_PAGE_NETWORKIDLE_GRACE_MS),
                 ],
                 page.load_states,
             )
@@ -2751,6 +2757,121 @@ class PortalRunnerUrlTests(unittest.TestCase):
                 ],
                 mocked_wait_text.call_args_list,
             )
+
+    def test_wait_for_home_page_ready_continues_when_network_stays_busy(self) -> None:
+        class FakePage:
+            def __init__(self) -> None:
+                self.load_states: list[tuple[str, int]] = []
+
+            def wait_for_load_state(self, state: str, timeout: int) -> None:
+                self.load_states.append((state, timeout))
+                if state == "networkidle":
+                    raise RuntimeError("Timeout 4321ms exceeded.")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=tmp_path / "profile",
+                portal_action_timeout_ms=4321,
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+            store = StoreConfig(
+                store_key="fuzzy",
+                store_name="Fuzzy",
+                survey_id="1",
+                output_xlsx_path=tmp_path / "output.xlsx",
+                initial_last_processed_id=1,
+                portal_enabled=True,
+                portal_company_switch_name="厦门市思明区浮几创意餐厅",
+                portal_company_verify_name="厦门市思明区浮几创意餐厅",
+            )
+            page = FakePage()
+
+            with patch.object(runner, "_wait_for_text"):
+                with patch.object(runner, "_body_text", return_value="首页 我要办税 厦门市思明区浮几创意餐厅"):
+                    with patch.object(runner, "_log") as mocked_log:
+                        runner._wait_for_home_page_ready(page, store)  # noqa: SLF001
+
+            self.assertEqual(
+                [
+                    ("domcontentloaded", 4321),
+                    ("load", 4321),
+                    ("networkidle", 4321),
+                ],
+                page.load_states,
+            )
+            self.assertTrue(
+                any(
+                    "authenticated home page network requests did not go idle within 4321ms" in call.args[1]
+                    for call in mocked_log.call_args_list
+                )
+            )
+
+    def test_wait_for_batch_page_ready_still_requires_networkidle(self) -> None:
+        class FakePage:
+            def __init__(self) -> None:
+                self.load_states: list[tuple[str, int]] = []
+
+            def wait_for_load_state(self, state: str, timeout: int) -> None:
+                self.load_states.append((state, timeout))
+                if state == "networkidle":
+                    raise RuntimeError("Timeout 30000ms exceeded.")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=tmp_path / "profile",
+                portal_action_timeout_ms=30000,
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+            page = FakePage()
+
+            with patch.object(runner, "_wait_for_text"):
+                with patch.object(runner, "_body_text", return_value="批量开票"):
+                    with self.assertRaises(PortalRunnerError):
+                        runner._wait_for_batch_page_ready(page, "fuzzy")  # noqa: SLF001
 
     def test_run_store_waits_for_home_page_before_opening_batch_page(self) -> None:
         class FakeBatchPage:

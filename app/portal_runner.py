@@ -28,6 +28,7 @@ POST_SUBMIT_SUCCESS_WAIT_SECONDS = 3.0
 BROWSER_CLICK_DELAY_MS = 1000
 BROWSER_CLICK_DELAY_SECONDS = BROWSER_CLICK_DELAY_MS / 1000
 HOME_PAGE_SHELL_MIN_TIMEOUT_MS = 60000
+HOME_PAGE_NETWORKIDLE_GRACE_MS = 30000
 AUTHENTICATED_PAGE_STABILITY_MS = 1500
 AUTHENTICATED_PAGE_STABILITY_POLL_MS = 250
 BROWSER_SESSION_SYNC_ENTRIES = (
@@ -609,11 +610,18 @@ class TaxPortalRunner:
         content_message: str | None = None,
         wait_for_load_states: bool = True,
         timeout_ms_override: int | None = None,
+        networkidle_timeout_ms: int | None = None,
+        allow_networkidle_timeout: bool = False,
     ) -> None:
         timeout_ms = (
             timeout_ms_override
             if timeout_ms_override is not None
             else self.config.portal_action_timeout_ms
+        )
+        effective_networkidle_timeout_ms = (
+            networkidle_timeout_ms
+            if networkidle_timeout_ms is not None
+            else timeout_ms
         )
         self._log(store_key, f"waiting for {page_name} elements and requests to finish loading")
         if wait_for_load_states:
@@ -627,11 +635,17 @@ class TaxPortalRunner:
         for text in required_texts:
             self._wait_for_text(page, text, timeout_ms=timeout_ms)
         try:
-            page.wait_for_load_state("networkidle", timeout=timeout_ms)
+            page.wait_for_load_state("networkidle", timeout=effective_networkidle_timeout_ms)
         except Exception as exc:  # noqa: BLE001
-            raise PortalRunnerError(
-                f"Timed out waiting for {page_name} network requests to finish: {exc}"
-            ) from exc
+            if not allow_networkidle_timeout:
+                raise PortalRunnerError(
+                    f"Timed out waiting for {page_name} network requests to finish: {exc}"
+                ) from exc
+            self._log(
+                store_key,
+                f"{page_name} network requests did not go idle within "
+                f"{effective_networkidle_timeout_ms}ms; continuing because required content is visible",
+            )
         predicate = content_predicate
         if predicate is None and required_texts:
             predicate = lambda: all(text in self._body_text(page) for text in required_texts)
@@ -650,6 +664,8 @@ class TaxPortalRunner:
             "authenticated home page shell",
             required_texts=("我要办税",),
             timeout_ms_override=max(self.config.portal_action_timeout_ms, HOME_PAGE_SHELL_MIN_TIMEOUT_MS),
+            networkidle_timeout_ms=HOME_PAGE_NETWORKIDLE_GRACE_MS,
+            allow_networkidle_timeout=True,
         )
 
     def _wait_for_home_page_ready(self, page: object, store: StoreConfig) -> None:
@@ -659,6 +675,8 @@ class TaxPortalRunner:
             store.store_key,
             "authenticated home page",
             required_texts=("我要办税", verify_name),
+            networkidle_timeout_ms=min(self.config.portal_action_timeout_ms, HOME_PAGE_NETWORKIDLE_GRACE_MS),
+            allow_networkidle_timeout=True,
         )
         self._log(store.store_key, "authenticated home page is stable")
 
