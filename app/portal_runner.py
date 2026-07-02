@@ -805,12 +805,18 @@ class TaxPortalRunner:
         )
 
     def _wait_for_result_modal_ready(self, page: object, store_key: str) -> None:
-        self._wait_for_page_stable(
-            page,
-            store_key,
-            "portal issue result dialog",
-            required_texts=("批量开具结果",),
-            wait_for_load_states=False,
+        self._wait_until(
+            lambda: "批量开具结果" in self._body_text(page),
+            timeout_seconds=max(self.config.portal_action_timeout_ms / 1000, 10.0),
+            message="show portal issue result dialog",
+            interval_seconds=0.2,
+        )
+        self._wait_until(
+            lambda: self._visible_button_in_dialog(page, "批量开具结果", "确定").is_visible()
+            and self._visible_button_in_dialog(page, "批量开具结果", "确定").is_enabled(),
+            timeout_seconds=10,
+            message="show portal issue result confirm button",
+            interval_seconds=0.2,
         )
 
     def _wait_for_switch_confirmation_ready(self, page: object, store_key: str) -> None:

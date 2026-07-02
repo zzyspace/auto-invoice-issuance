@@ -2092,6 +2092,69 @@ class PortalRunnerUrlTests(unittest.TestCase):
             self.assertEqual(1, len(details))
             self.assertEqual(body_text, modal_text)
 
+    def test_wait_for_result_modal_ready_waits_for_confirm_button(self) -> None:
+        class FakeButton:
+            def __init__(self, events: list[str]) -> None:
+                self.events = events
+
+            def is_visible(self) -> bool:
+                self.events.append("button:is_visible")
+                return True
+
+            def is_enabled(self) -> bool:
+                self.events.append("button:is_enabled")
+                return True
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=tmp_path / "profile",
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+            events: list[str] = []
+            button = FakeButton(events)
+
+            def fake_wait_until(predicate: object, *, timeout_seconds: float, message: str, interval_seconds: float = 0.5) -> None:
+                self.assertTrue(predicate())
+                events.append(f"wait_until:{message}")
+
+            with patch.object(runner, "_wait_until", side_effect=fake_wait_until):
+                with patch.object(
+                    runner,
+                    "_body_text",
+                    return_value="批量开具结果 开具成功发票1份 开具失败发票0份",
+                ):
+                    with patch.object(runner, "_visible_button_in_dialog", return_value=button):
+                        runner._wait_for_result_modal_ready(object(), "fuzzy")  # noqa: SLF001
+
+            self.assertLess(
+                events.index("wait_until:show portal issue result dialog"),
+                events.index("wait_until:show portal issue result confirm button"),
+            )
+            self.assertIn("button:is_visible", events)
+            self.assertIn("button:is_enabled", events)
+
     def test_wait_for_result_modal_parses_failed_row_with_failure_reason(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
