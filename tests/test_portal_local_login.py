@@ -226,7 +226,7 @@ class PortalLocalLoginTests(unittest.TestCase):
 
         self.assertFalse(visible)
 
-    def test_recognize_startup_reminder_visibility_from_image_returns_true_for_exact_modal_title(self) -> None:
+    def test_recognize_startup_reminder_visibility_from_image_returns_true_for_modal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
             config = self._build_config(tmp_path)
@@ -239,7 +239,7 @@ class PortalLocalLoginTests(unittest.TestCase):
                     self.image_base64 = image_base64
                     self.file_name = file_name
                     self.prompt = prompt
-                    return f"{STARTUP_REMINDER_TITLE}\n"
+                    return "YES\n"
 
             fake_client = FakeVisionClient()
 
@@ -247,7 +247,7 @@ class PortalLocalLoginTests(unittest.TestCase):
                 visible, raw_response = automator._recognize_startup_reminder_visibility_from_image(fake_image)  # noqa: SLF001
 
         self.assertTrue(visible)
-        self.assertEqual(STARTUP_REMINDER_TITLE, raw_response)
+        self.assertEqual("YES", raw_response)
 
     def test_recognize_startup_reminder_visibility_from_image_returns_false_for_none(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

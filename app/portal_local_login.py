@@ -859,10 +859,9 @@ class PortalMacLoginAutomator:
         client = self._get_vision_client()
         prompt = (
             "请只判断截图中央是否仍然显示一个居中的模态弹窗。"
-            f"如果截图中央存在一个大面积白色内容区、上方蓝色圆角标题栏的模态弹窗，并且该弹窗标题是“{STARTUP_REMINDER_TITLE}”，"
-            "只返回这个居中模态弹窗的标题原文。"
+            "如果截图中央存在一个大面积白色内容区、上方蓝色圆角标题栏的模态弹窗，只返回 YES。"
             "如果不存在这样的居中模态弹窗，则只返回 NONE。"
-            "忽略页面顶部横幅、列表卡片、滚动内容里出现的同名文案。"
+            "不要判断标题，也不要受页面顶部横幅、列表卡片、滚动内容文案影响。"
             "不要输出解释或额外文字。"
         )
         raw = image_path.read_bytes()
@@ -876,8 +875,7 @@ class PortalMacLoginAutomator:
         normalized_upper = normalized.upper()
         if normalized_upper in {"NONE", "NO", "FALSE"} or normalized in {"无", "没有", "不存在"}:
             return False, first_line
-        normalized = normalized.removeprefix("标题").removeprefix(":").removeprefix("：").strip()
-        if normalized == self._normalized_text(STARTUP_REMINDER_TITLE):
+        if normalized_upper in {"YES", "TRUE"} or normalized in {"有", "存在", "可见"}:
             return True, first_line
         raise ValueError(f"Unsupported startup reminder OCR response: {response!r}")
 
