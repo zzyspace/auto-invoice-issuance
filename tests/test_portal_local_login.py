@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,17 @@ from app.portal_local_login import (
     PortalMacLoginAutomator,
     STARTUP_REMINDER_TITLE,
 )
+
+
+def build_png_data_url(width: int, height: int) -> tuple[bytes, str]:
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        b"\x00\x00\x00\rIHDR"
+        + width.to_bytes(4, "big")
+        + height.to_bytes(4, "big")
+        + b"\x08\x06\x00\x00\x00"
+    )
+    return png, f"data:image/png;base64,{base64.b64encode(png).decode('ascii')}"
 
 
 class PortalLocalLoginTests(unittest.TestCase):
@@ -419,21 +431,24 @@ class PortalLocalLoginTests(unittest.TestCase):
             logs: list[str] = []
             config = self._build_config(tmp_path)
             automator = PortalMacLoginAutomator(config, "fuzzy", "法定代表人", lambda _store, message: logs.append(message))
+            _, small_qr_data_url = build_png_data_url(100, 100)
+            png, qr_data_url = build_png_data_url(180, 180)
 
             class FakeCandidate:
-                def __init__(self, width: int, height: int) -> None:
-                    self.width = width
-                    self.height = height
-                    self.screenshot_paths: list[str] = []
+                def __init__(self, src: str | None = None) -> None:
+                    self.src = src
 
                 def is_visible(self) -> bool:
                     return True
 
-                def bounding_box(self) -> dict[str, int]:
-                    return {"width": self.width, "height": self.height}
+                def bounding_box(self) -> None:
+                    raise AssertionError("bounding_box must not be used")
+
+                def get_attribute(self, name: str) -> str | None:
+                    return self.src if name == "src" else None
 
                 def screenshot(self, *, path: str) -> None:
-                    self.screenshot_paths.append(path)
+                    raise AssertionError(f"element screenshot must not be used: {path}")
 
             class FakeLocator:
                 def __init__(self, candidates: list[FakeCandidate]) -> None:
@@ -457,15 +472,16 @@ class PortalLocalLoginTests(unittest.TestCase):
                         return FakeLocator(self.first_selector_attempts[index])
                     return FakeLocator([])
 
-            first_attempt_candidate = FakeCandidate(width=100, height=100)
-            second_attempt_candidate = FakeCandidate(width=180, height=180)
+            first_attempt_candidate = FakeCandidate(src=small_qr_data_url)
+            second_attempt_candidate = FakeCandidate(src=qr_data_url)
             page = FakePage([[first_attempt_candidate], [second_attempt_candidate]])
 
             with patch("app.portal_local_login.sleep", return_value=None) as mocked_sleep:
                 qr_path = automator._capture_qr_code(page, tmp_path)  # noqa: SLF001
+                saved_png = qr_path.read_bytes()
 
         self.assertEqual(tmp_path / "login-qr.png", qr_path)
-        self.assertEqual([str(tmp_path / "login-qr.png")], second_attempt_candidate.screenshot_paths)
+        self.assertEqual(png, saved_png)
         mocked_sleep.assert_called_once_with(3.0)
         self.assertIn("tax portal login QR not ready; waiting 3s before retry", logs)
 
@@ -474,13 +490,17 @@ class PortalLocalLoginTests(unittest.TestCase):
             tmp_path = Path(tmp_dir)
             config = self._build_config(tmp_path)
             automator = PortalMacLoginAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
+            _, small_qr_data_url = build_png_data_url(80, 80)
 
             class FakeCandidate:
                 def is_visible(self) -> bool:
                     return True
 
-                def bounding_box(self) -> dict[str, int]:
-                    return {"width": 80, "height": 80}
+                def bounding_box(self) -> None:
+                    raise AssertionError("bounding_box must not be used")
+
+                def get_attribute(self, name: str) -> str | None:
+                    return small_qr_data_url if name == "src" else None
 
             class FakeLocator:
                 def __init__(self, candidates: list[FakeCandidate]) -> None:
@@ -508,7 +528,7 @@ class PortalLocalLoginTests(unittest.TestCase):
                 with self.assertRaises(PortalLocalLoginError) as ctx:
                     automator._capture_qr_code(page, tmp_path)  # noqa: SLF001
 
-        self.assertIn("visible QR element", str(ctx.exception))
+        self.assertIn("readable PNG data URL", str(ctx.exception))
         self.assertEqual(2, page.calls)
         mocked_sleep.assert_called_once_with(3.0)
 

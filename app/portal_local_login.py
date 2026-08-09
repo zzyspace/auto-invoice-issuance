@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import ctypes
 import base64
+import binascii
+import ctypes
 import plistlib
 import re
 import subprocess
@@ -27,6 +28,7 @@ OTP_MESSAGES_FALLBACK_TIMEOUT_SECONDS = 60.0
 PHOTOS_IMPORT_SETTLE_SECONDS = 1.0
 QR_MIN_DIMENSION_PX = 120
 QR_CAPTURE_RETRY_DELAY_SECONDS = 3.0
+QR_PNG_DATA_URL_PREFIX = "data:image/png;base64,"
 OTP_TAX_VERIFICATION_REGEX = re.compile(r"【(?P<issuer>[^】]*税务)】您的验证码是[:：]\s*(?P<code>\d{6})")
 OTP_DIGITS_REGEX = re.compile(r"(?<!\d)(\d{6})(?!\d)")
 SMS_RESEND_COUNTDOWN_REGEX = re.compile(r"\d+秒重新获取")
@@ -547,21 +549,23 @@ class PortalMacLoginAutomator:
             )
 
     def _capture_qr_code(self, page: object, artifacts_dir: Path | None) -> Path:
-        self._log("capturing tax portal login QR")
+        self._log("saving tax portal login QR from page data URL")
         target_dir = artifacts_dir or Path(mkdtemp(prefix="portal-local-login-"))
         ensure_parent_dir(target_dir / "placeholder.txt")
         target = target_dir / "login-qr.png"
         if self._try_capture_qr_code(page, target):
-            self._log(f"captured tax portal login QR path={target}")
+            self._log(f"saved tax portal login QR path={target}")
             return target
         self._log(
             f"tax portal login QR not ready; waiting {QR_CAPTURE_RETRY_DELAY_SECONDS:.0f}s before retry"
         )
         sleep(QR_CAPTURE_RETRY_DELAY_SECONDS)
         if self._try_capture_qr_code(page, target):
-            self._log(f"captured tax portal login QR path={target}")
+            self._log(f"saved tax portal login QR path={target}")
             return target
-        raise PortalLocalLoginError("Failed to locate a visible QR element on the tax portal login page.")
+        raise PortalLocalLoginError(
+            "Failed to locate a visible QR image with a readable PNG data URL on the tax portal login page."
+        )
 
     def _try_capture_qr_code(self, page: object, target: Path) -> bool:
         for selector in QR_LOCATOR_CANDIDATES:
@@ -575,12 +579,25 @@ class PortalMacLoginAutomator:
                 try:
                     if not candidate.is_visible():
                         continue
-                    box = candidate.bounding_box()
-                    if box is None:
+                    src = candidate.get_attribute("src")
+                    if not src or not src.startswith(QR_PNG_DATA_URL_PREFIX):
                         continue
-                    if box.get("width", 0) < QR_MIN_DIMENSION_PX or box.get("height", 0) < QR_MIN_DIMENSION_PX:
+                    try:
+                        png = base64.b64decode(src[len(QR_PNG_DATA_URL_PREFIX) :], validate=True)
+                    except (binascii.Error, ValueError):
                         continue
-                    candidate.screenshot(path=str(target))
+                    if (
+                        len(png) < 24
+                        or png[:8] != b"\x89PNG\r\n\x1a\n"
+                        or png[8:12] != b"\x00\x00\x00\r"
+                        or png[12:16] != b"IHDR"
+                    ):
+                        continue
+                    width = int.from_bytes(png[16:20], "big")
+                    height = int.from_bytes(png[20:24], "big")
+                    if width < QR_MIN_DIMENSION_PX or height < QR_MIN_DIMENSION_PX:
+                        continue
+                    target.write_bytes(png)
                     return True
                 except Exception:
                     continue
