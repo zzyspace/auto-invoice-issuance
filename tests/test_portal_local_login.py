@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.models import AppConfig
+from app.photos_qr_cleanup import ImportedPhotosQr
 from app.portal_local_login import (
     AXNode,
     CG_EVENT_FLAG_MASK_COMMAND,
@@ -300,6 +301,25 @@ class PortalLocalLoginTests(unittest.TestCase):
         self.assertIn("opening album from scan page", events)
         self.assertIn("scan-page album entry opened attempt=2", events)
 
+    def test_click_scan_album_region_uses_only_remaining_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = self._build_config(tmp_path)
+            automator = PortalMacLoginAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
+            clicks: list[tuple[float, float]] = []
+
+            with patch.object(automator, "_activate_application"):
+                with patch.object(automator, "_window_bounds_for_bundle", return_value=(10.0, 20.0, 100.0, 200.0)):
+                    with patch.object(
+                        automator,
+                        "_click_at_for_bundle",
+                        side_effect=lambda _bundle_id, x, y: clicks.append((x, y)),
+                    ):
+                        automator._click_scan_album_region("cn.gov.chinatax.gt4.app", 1)  # noqa: SLF001
+                        automator._click_scan_album_region("cn.gov.chinatax.gt4.app", 2)  # noqa: SLF001
+
+        self.assertEqual([(94.0, 168.0), (102.0, 168.0)], clicks)
+
     def test_select_latest_qr_from_album_prefers_photos_picker_branch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
@@ -408,22 +428,54 @@ class PortalLocalLoginTests(unittest.TestCase):
         self.assertTrue(clicked)
         self.assertEqual(["click:照片"], events)
 
-    def test_import_qr_into_photos_uses_launch_services_open_in_background(self) -> None:
+    def test_import_qr_into_photos_uses_hidden_scripted_import(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
             config = self._build_config(tmp_path)
             automator = PortalMacLoginAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
             commands: list[list[str]] = []
+            qr_path = tmp_path / "login-qr.png"
+            png, _ = build_png_data_url(240, 240)
+            qr_path.write_bytes(png)
+
+            def fake_run(command: list[str], *, timeout_seconds: float) -> str:
+                commands.append(command)
+                return "photos-asset-id" if command[0] == "osascript" else ""
 
             with patch.object(
                 automator,
                 "_run_command",
-                side_effect=lambda command, timeout_seconds: commands.append(command) or "",
+                side_effect=fake_run,
             ):
-                with patch("app.portal_local_login.sleep", return_value=None):
-                    automator._import_qr_into_photos(tmp_path / "login-qr.png")  # noqa: SLF001
+                with patch.object(automator, "_hide_photos_application") as mocked_hide:
+                    with patch("app.portal_local_login.sleep", return_value=None):
+                        imported_qr = automator._import_qr_into_photos(qr_path)  # noqa: SLF001
 
-        self.assertEqual([["open", "-g", "-a", "Photos", str(tmp_path / "login-qr.png")]], commands)
+        self.assertEqual(["open", "-g", "-j", "-a", "Photos"], commands[0])
+        self.assertEqual("osascript", commands[1][0])
+        self.assertEqual("-e", commands[1][1])
+        self.assertIn("import {qrFile} skip check duplicates yes", commands[1][2])
+        self.assertIn("return id of item 1 of importedItems", commands[1][2])
+        self.assertEqual(str(qr_path), commands[1][3])
+        self.assertEqual(2, mocked_hide.call_count)
+        self.assertEqual("photos-asset-id", imported_qr.asset_id)
+        self.assertEqual("login-qr.png", imported_qr.original_filename)
+        self.assertEqual((240, 240), (imported_qr.width, imported_qr.height))
+
+    def test_hide_photos_application_is_best_effort(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = self._build_config(tmp_path)
+            automator = PortalMacLoginAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
+
+            with patch.object(
+                automator,
+                "_run_command",
+                side_effect=PortalLocalLoginError("not permitted"),
+            ) as mocked_run:
+                automator._hide_photos_application()  # noqa: SLF001
+
+        mocked_run.assert_called_once()
 
     def test_capture_qr_code_retries_once_after_three_seconds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -480,7 +532,8 @@ class PortalLocalLoginTests(unittest.TestCase):
                 qr_path = automator._capture_qr_code(page, tmp_path)  # noqa: SLF001
                 saved_png = qr_path.read_bytes()
 
-        self.assertEqual(tmp_path / "login-qr.png", qr_path)
+        self.assertEqual(tmp_path, qr_path.parent)
+        self.assertRegex(qr_path.name, r"^login-qr-\d+\.png$")
         self.assertEqual(png, saved_png)
         mocked_sleep.assert_called_once_with(3.0)
         self.assertIn("tax portal login QR not ready; waiting 3s before retry", logs)
@@ -558,8 +611,9 @@ class PortalLocalLoginTests(unittest.TestCase):
                 events.append("capture_qr")
                 return Path("/tmp/login-qr.png")
 
-            def _import_qr_into_photos(self, qr_path: Path) -> None:
+            def _import_qr_into_photos(self, qr_path: Path) -> ImportedPhotosQr:
                 events.append(f"import:{qr_path}")
+                return ImportedPhotosQr(qr_path, "asset-id", qr_path.name, "a" * 64, 240, 240)
 
             def _resolve_app_bundle_identifier(self) -> str:
                 events.append("resolve_bundle")
@@ -598,9 +652,10 @@ class PortalLocalLoginTests(unittest.TestCase):
             config = self._build_config(tmp_path)
             automator = FakeAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
 
-            qr_path = automator.automate(object(), tmp_path)
+            imported_qr = automator.automate(object(), tmp_path)
 
-        self.assertEqual(Path("/tmp/login-qr.png"), qr_path)
+        self.assertEqual(Path("/tmp/login-qr.png"), imported_qr.qr_path)
+        self.assertIs(imported_qr, automator.imported_qr)
         self.assertEqual(
             [
                 "require",
@@ -635,8 +690,9 @@ class PortalLocalLoginTests(unittest.TestCase):
                 events.append("capture_qr")
                 return Path("/tmp/login-qr.png")
 
-            def _import_qr_into_photos(self, qr_path: Path) -> None:
+            def _import_qr_into_photos(self, qr_path: Path) -> ImportedPhotosQr:
                 events.append(f"import:{qr_path}")
+                return ImportedPhotosQr(qr_path, "asset-id", qr_path.name, "a" * 64, 240, 240)
 
             def _resolve_app_bundle_identifier(self) -> str:
                 events.append("resolve_bundle")
@@ -678,9 +734,10 @@ class PortalLocalLoginTests(unittest.TestCase):
             config = self._build_config(tmp_path)
             automator = FakeAutomator(config, "fuzzy_qz", "法定代表人", lambda *_: None)
 
-            qr_path = automator.automate(object(), tmp_path)
+            imported_qr = automator.automate(object(), tmp_path)
 
-        self.assertEqual(Path("/tmp/login-qr.png"), qr_path)
+        self.assertEqual(Path("/tmp/login-qr.png"), imported_qr.qr_path)
+        self.assertIs(imported_qr, automator.imported_qr)
         self.assertEqual(
             [
                 "require",

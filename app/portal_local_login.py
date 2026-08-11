@@ -10,10 +10,11 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import mkdtemp
-from time import monotonic, sleep
+from time import monotonic, sleep, time_ns
 from typing import Callable, Iterable
 
 from app.models import AppConfig
+from app.photos_qr_cleanup import ImportedPhotosQr, PhotosQrCleanupError, describe_imported_qr
 from app.utils import ensure_parent_dir
 from app.vision_client import OpenAICompatibleVisionClient
 
@@ -41,7 +42,7 @@ ROLE_DIALOG_SELECTION_SETTLE_SECONDS = 0.5
 SCAN_ICON_X_RATIO = 0.91
 SCAN_ICON_Y_RATIO = 0.11
 SCAN_PAGE_READY_TIMEOUT_SECONDS = 8.0
-SCAN_ALBUM_OPEN_ATTEMPTS = 4
+SCAN_ALBUM_OPEN_ATTEMPTS = 2
 SCAN_ALBUM_OPEN_SETTLE_SECONDS = 1.0
 PHOTO_PICKER_SELECT_TIMEOUT_SECONDS = 20.0
 PHOTOS_FIRST_ITEM_CLICK_X_RATIO = 0.30
@@ -93,6 +94,23 @@ QR_LOCATOR_CANDIDATES = (
 ETAX_PROCESS_PATTERN = r"cn\.gov\.chinatax\.gt4\.app|GT4\.app|电子税务局"
 MESSAGES_PROCESS_PATTERN = r"Messages|信息"
 PHOTOS_PROCESS_PATTERN = r"Photos|照片"
+PHOTOS_BACKGROUND_IMPORT_SCRIPT = """
+on run argv
+    set qrFile to POSIX file (item 1 of argv)
+    tell application "/System/Applications/Photos.app"
+        set importedItems to import {qrFile} skip check duplicates yes
+        if (count of importedItems) is not 1 then error "Expected one imported Photos media item"
+        return id of item 1 of importedItems
+    end tell
+end run
+""".strip()
+PHOTOS_HIDE_SCRIPT = """
+tell application "System Events"
+    if exists (first application process whose bundle identifier is "com.apple.Photos") then
+        set visible of (first application process whose bundle identifier is "com.apple.Photos") to false
+    end if
+end tell
+""".strip()
 ETAX_CLICK_PRE_DELAY_SECONDS = 1.0
 MOUSE_DOWN = 1
 MOUSE_UP = 2
@@ -334,21 +352,24 @@ class MacAccessibilityClient:
                 self.core.CFRelease(cf_value)
 
     def _collect_nodes(self, element: int, output: list[AXNode], seen: set[int]) -> None:
-        if not element or element in seen:
-            return
-        seen.add(element)
-        output.append(
-            AXNode(
-                element=element,
-                role=self._attribute_text(element, "AXRole"),
-                subrole=self._attribute_text(element, "AXSubrole"),
-                texts=self._texts_for_element(element),
-                position=self._point_attribute(element, "AXPosition"),
-                size=self._size_attribute(element, "AXSize"),
+        stack = [element]
+        while stack:
+            current = stack.pop()
+            if not current or current in seen:
+                continue
+            seen.add(current)
+            output.append(
+                AXNode(
+                    element=current,
+                    role=self._attribute_text(current, "AXRole"),
+                    subrole=self._attribute_text(current, "AXSubrole"),
+                    texts=self._texts_for_element(current),
+                    position=self._point_attribute(current, "AXPosition"),
+                    size=self._size_attribute(current, "AXSize"),
+                )
             )
-        )
-        for child in self._children_from_attribute(element, "AXChildren"):
-            self._collect_nodes(child, output, seen)
+            children = self._children_from_attribute(current, "AXChildren")
+            stack.extend(reversed(children))
 
     def _texts_for_element(self, element: int) -> tuple[str, ...]:
         values: list[str] = []
@@ -499,6 +520,7 @@ class PortalMacLoginAutomator:
         self._etax_last_window_size: tuple[float, float] = (288.0, 552.0)
         self._startup_reminder_handled = False
         self._vision_client: OpenAICompatibleVisionClient | None = None
+        self.imported_qr: ImportedPhotosQr | None = None
 
     @staticmethod
     def is_enabled(config: AppConfig) -> bool:
@@ -509,11 +531,12 @@ class PortalMacLoginAutomator:
             and bool((config.portal_etax_app_password or "").strip())
         )
 
-    def automate(self, page: object, artifacts_dir: Path | None) -> Path:
+    def automate(self, page: object, artifacts_dir: Path | None) -> ImportedPhotosQr:
         self._require_supported_environment()
         self._verify_gui_automation_prerequisites()
         qr_path = self._capture_qr_code(page, artifacts_dir)
-        self._import_qr_into_photos(qr_path)
+        imported_qr = self._import_qr_into_photos(qr_path)
+        self.imported_qr = imported_qr
         bundle_id = self._resolve_app_bundle_identifier()
         self._launch_etax_app()
         self._wait_for_process(bundle_id, timeout_seconds=UI_ACTION_TIMEOUT_SECONDS)
@@ -526,7 +549,7 @@ class PortalMacLoginAutomator:
         self._open_scan_flow(bundle_id)
         self._select_latest_qr_from_album(bundle_id)
         self._confirm_scan_login(bundle_id)
-        return qr_path
+        return imported_qr
 
     def _require_supported_environment(self) -> None:
         if sys.platform != "darwin":
@@ -552,7 +575,7 @@ class PortalMacLoginAutomator:
         self._log("saving tax portal login QR from page data URL")
         target_dir = artifacts_dir or Path(mkdtemp(prefix="portal-local-login-"))
         ensure_parent_dir(target_dir / "placeholder.txt")
-        target = target_dir / "login-qr.png"
+        target = target_dir / f"login-qr-{time_ns()}.png"
         if self._try_capture_qr_code(page, target):
             self._log(f"saved tax portal login QR path={target}")
             return target
@@ -603,20 +626,50 @@ class PortalMacLoginAutomator:
                     continue
         return False
 
-    def _import_qr_into_photos(self, qr_path: Path) -> None:
+    def _import_qr_into_photos(self, qr_path: Path) -> ImportedPhotosQr:
         self._log(f"importing tax portal login QR into Photos path={qr_path}")
         try:
             self._run_command(
-                ["open", "-g", "-a", "Photos", str(qr_path)],
+                ["open", "-g", "-j", "-a", "Photos"],
+                timeout_seconds=UI_ACTION_TIMEOUT_SECONDS,
+            )
+            self._hide_photos_application()
+            asset_id = self._run_command(
+                [
+                    "osascript",
+                    "-e",
+                    PHOTOS_BACKGROUND_IMPORT_SCRIPT,
+                    str(qr_path),
+                ],
                 timeout_seconds=UI_ACTION_TIMEOUT_SECONDS,
             )
         except PortalLocalLoginError as exc:
             raise PortalLocalLoginError(
-                "Failed to hand tax portal QR image to Photos via Launch Services. "
+                "Failed to import tax portal QR image into Photos in the background. "
                 f"Original error: {exc}"
             ) from exc
+        self._hide_photos_application()
         sleep(PHOTOS_IMPORT_SETTLE_SECONDS)
-        self._log("imported tax portal login QR into Photos")
+        try:
+            imported_qr = describe_imported_qr(qr_path, asset_id)
+        except PhotosQrCleanupError as exc:
+            raise PortalLocalLoginError(
+                f"Photos imported the QR image but did not return a safe cleanup identity: {exc}"
+            ) from exc
+        self._log(
+            "imported tax portal login QR into Photos "
+            f"asset_id={imported_qr.asset_id} filename={imported_qr.original_filename}"
+        )
+        return imported_qr
+
+    def _hide_photos_application(self) -> None:
+        try:
+            self._run_command(
+                ["osascript", "-e", PHOTOS_HIDE_SCRIPT],
+                timeout_seconds=5.0,
+            )
+        except PortalLocalLoginError:
+            pass
 
     def _resolve_app_bundle_identifier(self) -> str:
         info_plist = self._etax_app_path / "Contents" / "Info.plist"
@@ -641,6 +694,15 @@ class PortalMacLoginAutomator:
             if pids:
                 saw_process = True
                 for pid in pids:
+                    window_bounds = getattr(self._ax, "window_bounds", None)
+                    bounds = window_bounds(pid) if callable(window_bounds) else None
+                    if bounds is not None:
+                        self._etax_last_window_size = (bounds[2], bounds[3])
+                        self._log(
+                            f"detected candidate process pids bundle_id={bundle_id} "
+                            f"pids={pids} ready_pid={pid}"
+                        )
+                        return
                     nodes = self._ax.find_nodes(pid)
                     if not nodes:
                         continue
@@ -1917,8 +1979,6 @@ class PortalMacLoginAutomator:
         else:
             left, top, width, height = bounds
         targets = (
-            (0.88, 0.70),
-            (0.88, 0.78),
             (0.84, 0.74),
             (0.92, 0.74),
         )

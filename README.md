@@ -182,6 +182,7 @@ env -u http_proxy -u https_proxy PLAYWRIGHT_BROWSERS_PATH=./data/ms-playwright .
 7. 在扫码页点击右下角 `相册`
 8. 打开的不是系统 `照片` app 主窗口，而是税务 app 内部的照片选择器；runner 会在这个内部选择器里优先选择左上第一张二维码图片
 9. 进入 `登录确认` 界面后点击 `登录`
+10. Chrome 确认进入已登录页面后，runner 仅按本次导入返回的 Photos 资产 ID 定位二维码，并在文件名、尺寸和 SHA-256 全部一致时将其移到“最近删除”；清理期间只自动确认包含专用 helper ID 的系统删除提示，任一校验失败都保留图片并继续开票
 
 3. 跑导入校验：
 
@@ -260,7 +261,8 @@ env -u http_proxy -u https_proxy PLAYWRIGHT_BROWSERS_PATH=./data/ms-playwright .
 
 - 允许当前终端 / Python 进程使用“辅助功能”和“自动化”
 - 完成一次 `照片` app 首次初始化
-- 二维码导入现在通过 Launch Services 后台交给 `照片` app 打开/导入，不再依赖 `osascript -> 照片` 的 Automation 授权
+- 允许 `osascript` 自动化控制 `照片`，用于后台导入二维码；runner 会在导入前后隐藏 `照片` 主窗口
+- 首次自动清理二维码时，允许 `Tax Portal Photos QR Cleanup` 完全访问照片图库；没有完整权限或精确校验失败时只记录警告，不会删除任何照片，也不会阻断开票
 - 确保税务验证码会同步到 macOS `信息`
 - 首次使用时，建议先手工确认 `电子税务局` app 的短信登录、身份类型选择、指纹提示、扫码页、内部照片选择器都能正常出现
 

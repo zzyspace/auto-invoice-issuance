@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.models import AppConfig, PortalIssueDetail, StoreConfig
+from app.photos_qr_cleanup import ImportedPhotosQr, PhotosQrCleanupError
 from app.portal_runner import (
     BROWSER_CLICK_DELAY_MS,
     HOME_PAGE_NETWORKIDLE_GRACE_MS,
@@ -20,6 +21,118 @@ from app.state import StateStore
 
 
 class PortalRunnerUrlTests(unittest.TestCase):
+    @staticmethod
+    def _imported_qr_for_test() -> ImportedPhotosQr:
+        return ImportedPhotosQr(
+            qr_path=Path("/tmp/login-qr-123.png"),
+            asset_id="photos-asset-123",
+            original_filename="login-qr-123.png",
+            sha256="a" * 64,
+            width=240,
+            height=240,
+        )
+
+    def test_cleanup_imported_login_qr_deletes_only_recorded_asset(self) -> None:
+        runner = object.__new__(TaxPortalRunner)
+        imported_qr = self._imported_qr_for_test()
+
+        with patch(
+            "app.portal_runner.delete_imported_qr_from_photos",
+            return_value="deleted",
+        ) as mocked_delete:
+            with patch.object(runner, "_log") as mocked_log:
+                runner._cleanup_imported_login_qrs([imported_qr], "fuzzy")  # noqa: SLF001
+
+        mocked_delete.assert_called_once_with(imported_qr)
+        self.assertIn("deleted verified imported login QR", mocked_log.call_args.args[1])
+
+    def test_cleanup_imported_login_qr_is_nonfatal_when_identity_cannot_be_verified(self) -> None:
+        runner = object.__new__(TaxPortalRunner)
+        imported_qr = self._imported_qr_for_test()
+
+        with patch(
+            "app.portal_runner.delete_imported_qr_from_photos",
+            side_effect=PhotosQrCleanupError("checksum mismatch"),
+        ):
+            with patch.object(runner, "_log") as mocked_log:
+                runner._cleanup_imported_login_qrs([imported_qr], "fuzzy")  # noqa: SLF001
+
+        self.assertIn("kept imported login QR", mocked_log.call_args.args[1])
+
+    def test_ensure_logged_in_cleans_recorded_qr_only_after_authentication(self) -> None:
+        runner = object.__new__(TaxPortalRunner)
+        runner.config = SimpleNamespace(
+            portal_login_timeout_minutes=1,
+            portal_browser_backend="playwright",
+        )
+        imported_qr = self._imported_qr_for_test()
+        page = SimpleNamespace(url="https://tpass.example/#/login")
+        authenticated_page = object()
+        result = SimpleNamespace(
+            artifacts_dir=None,
+            store_key="fuzzy",
+            portal_company_role="legal_representative",
+        )
+        monotonic_values = iter([0.0, 1.0, 2.0, 3.0])
+
+        with patch("app.portal_runner.monotonic", side_effect=lambda: next(monotonic_values)):
+            with patch("app.portal_runner.sleep", return_value=None):
+                with patch.object(
+                    runner,
+                    "_confirmed_authenticated_page",
+                    side_effect=[None, None, authenticated_page],
+                ):
+                    with patch.object(runner, "_is_public_landing_page", return_value=False):
+                        with patch.object(runner, "_page_requires_reauth", return_value=True):
+                            with patch.object(runner, "_is_login_page", return_value=True):
+                                with patch.object(runner, "_local_app_login_enabled", return_value=True):
+                                    with patch.object(
+                                        runner,
+                                        "_attempt_local_app_login",
+                                        return_value=imported_qr,
+                                    ):
+                                        with patch.object(runner, "_cleanup_imported_login_qrs") as mocked_cleanup:
+                                            with patch.object(runner, "_log"):
+                                                returned = runner._ensure_logged_in(page, result)  # noqa: SLF001
+
+        self.assertIs(authenticated_page, returned)
+        mocked_cleanup.assert_called_once_with([imported_qr], "fuzzy")
+
+    def test_ensure_logged_in_keeps_recorded_qr_when_login_times_out(self) -> None:
+        runner = object.__new__(TaxPortalRunner)
+        runner.config = SimpleNamespace(
+            portal_login_timeout_minutes=1,
+            portal_browser_backend="playwright",
+        )
+        imported_qr = self._imported_qr_for_test()
+        page = SimpleNamespace(url="https://tpass.example/#/login")
+        result = SimpleNamespace(
+            artifacts_dir=None,
+            store_key="fuzzy",
+            portal_company_role="legal_representative",
+        )
+        monotonic_values = iter([0.0, 1.0, 2.0, 61.0])
+
+        with patch("app.portal_runner.monotonic", side_effect=lambda: next(monotonic_values)):
+            with patch("app.portal_runner.sleep", return_value=None):
+                with patch.object(runner, "_confirmed_authenticated_page", return_value=None):
+                    with patch.object(runner, "_is_public_landing_page", return_value=False):
+                        with patch.object(runner, "_page_requires_reauth", return_value=True):
+                            with patch.object(runner, "_is_login_page", return_value=True):
+                                with patch.object(runner, "_local_app_login_enabled", return_value=True):
+                                    with patch.object(
+                                        runner,
+                                        "_attempt_local_app_login",
+                                        return_value=imported_qr,
+                                    ):
+                                        with patch.object(runner, "_cleanup_imported_login_qrs") as mocked_cleanup:
+                                            with patch.object(runner, "_capture_artifact"):
+                                                with patch.object(runner, "_log"):
+                                                    with self.assertRaisesRegex(PortalRunnerError, "Timed out"):
+                                                        runner._ensure_logged_in(page, result)  # noqa: SLF001
+
+        mocked_cleanup.assert_not_called()
+
     def test_update_store_step_logs_and_persists_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
@@ -1392,7 +1505,168 @@ class PortalRunnerUrlTests(unittest.TestCase):
 
             mocked_refresh.assert_called_once_with(page)
 
-    def test_wait_for_batch_page_uses_batch_issue_text_as_expected_text(self) -> None:
+    def test_ensure_logged_in_suppresses_oauth_restart_during_etax_transition(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=tmp_path / "profile",
+                portal_login_timeout_minutes=1,
+                portal_browser_backend="chrome_cdp",
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+            store = StoreConfig(
+                store_key="fuzzy",
+                store_name="Fuzzy",
+                survey_id="1",
+                output_xlsx_path=tmp_path / "output.xlsx",
+                initial_last_processed_id=1,
+                portal_enabled=True,
+                portal_area="fujian",
+            )
+            result = SimpleNamespace(artifacts_dir=None, store_key="fuzzy")
+            login_url = "https://tpass.fujian.chinatax.gov.cn:8443/#/login?state=original"
+            page = SimpleNamespace(url=login_url)
+            home_page = object()
+
+            monotonic_values = iter(
+                [
+                    0.0,
+                    0.5,
+                    1.0,
+                    1.5,
+                    1.0 + QR_REFRESH_GRACE_SECONDS + 0.1,
+                    12.0,
+                ]
+            )
+            confirmed_pages = [None, None, None, None, None, home_page]
+
+            with patch("app.portal_runner.monotonic", side_effect=lambda: next(monotonic_values)):
+                with patch("app.portal_runner.sleep", lambda _: None):
+                    with patch.object(
+                        runner,
+                        "_confirmed_authenticated_page",
+                        side_effect=confirmed_pages,
+                    ):
+                        with patch.object(runner, "_refresh_attached_authenticated_page", return_value=None):
+                            with patch.object(runner, "_is_public_landing_page", return_value=False):
+                                with patch.object(runner, "_page_requires_reauth", return_value=True):
+                                    with patch.object(runner, "_is_login_page", return_value=True):
+                                        with patch.object(runner, "_local_app_login_enabled", return_value=False):
+                                            with patch.object(
+                                                runner,
+                                                "_chrome_oauth_restart_readiness",
+                                                return_value=(False, "etax-transition-visible"),
+                                            ):
+                                                with patch.object(runner, "_goto") as mocked_goto:
+                                                    with patch.object(runner, "_log") as mocked_log:
+                                                        authenticated_page = runner._ensure_logged_in(  # noqa: SLF001
+                                                            page,
+                                                            result,
+                                                            store,
+                                                        )
+
+            self.assertIs(home_page, authenticated_page)
+            mocked_goto.assert_not_called()
+            self.assertIn(
+                "suppressing automatic OAuth restart while waiting for login completion "
+                "reason=etax-transition-visible",
+                [call.args[1] for call in mocked_log.call_args_list],
+            )
+
+    def test_chrome_oauth_restart_requires_original_expired_qr(self) -> None:
+        runner = object.__new__(TaxPortalRunner)
+        store = SimpleNamespace(effective_portal_area=lambda: "fujian")
+        page = object()
+        original_url = (
+            "https://tpass.fujian.chinatax.gov.cn:8443/#/login?state=original"
+        )
+        original_target = {
+            "type": "page",
+            "url": original_url,
+        }
+
+        with patch.object(
+            runner,
+            "_raw_attached_targets",
+            return_value=[original_target],
+        ), patch.object(
+            runner,
+            "_login_qr_requires_refresh",
+            side_effect=[False, True],
+        ):
+            active_result = runner._chrome_oauth_restart_readiness(  # noqa: SLF001
+                page,
+                store,
+                original_url,
+            )
+            expired_result = runner._chrome_oauth_restart_readiness(  # noqa: SLF001
+                page,
+                store,
+                original_url,
+            )
+
+        self.assertEqual((False, "login-qr-still-active"), active_result)
+        self.assertEqual((True, "original-login-qr-expired"), expired_result)
+
+    def test_chrome_oauth_restart_is_blocked_by_etax_target(self) -> None:
+        runner = object.__new__(TaxPortalRunner)
+        store = SimpleNamespace(effective_portal_area=lambda: "fujian")
+        page = object()
+        original_url = (
+            "https://tpass.fujian.chinatax.gov.cn:8443/#/login?state=original"
+        )
+        targets = [
+            {"type": "page", "url": original_url},
+            {
+                "type": "page",
+                "url": "https://etax.fujian.chinatax.gov.cn:8443/loginb/",
+            },
+        ]
+
+        with patch.object(runner, "_raw_attached_targets", return_value=targets):
+            readiness = runner._chrome_oauth_restart_readiness(  # noqa: SLF001
+                page,
+                store,
+                original_url,
+            )
+
+        self.assertEqual((False, "etax-transition-visible"), readiness)
+
+    def test_wait_for_batch_page_uses_official_dom_navigation(self) -> None:
+        class FakePage:
+            def __init__(self, url: str) -> None:
+                self.url = url
+                self.context: object | None = None
+                self.default_timeout: int | None = None
+
+            def set_default_timeout(self, timeout: int) -> None:
+                self.default_timeout = timeout
+
+        class FakeContext:
+            def __init__(self, home_page: FakePage) -> None:
+                self.pages = [home_page]
+
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
             config = AppConfig(
@@ -1431,43 +1705,596 @@ class PortalRunnerUrlTests(unittest.TestCase):
                 portal_company_verify_name="厦门市思明区浮几创意餐厅",
             )
             result = SimpleNamespace(workbook_sha256="abc123")
-            page = object()
+            home_page = FakePage("https://etax.xiamen.chinatax.gov.cn:8443/loginb/")
+            invoice_page = FakePage("https://dppt.xiamen.chinatax.gov.cn:8443/invoice-business?ruuid=1")
+            context = FakeContext(home_page)
+            home_page.context = context
+            invoice_page.context = context
+            clicks: list[tuple[object, str, str]] = []
+
+            def fake_dom_click(page: object, text: str, *, class_hint: str = "") -> None:
+                clicks.append((page, text, class_hint))
+                if text == "发票业务":
+                    context.pages.append(invoice_page)
+                elif text == "蓝字发票开具":
+                    invoice_page.url = "https://dppt.xiamen.chinatax.gov.cn:8443/blue-invoice-makeout"
+                elif text == "批量开票":
+                    invoice_page.url = "https://dppt.xiamen.chinatax.gov.cn:8443/blue-invoice-makeout/invoice-batch"
 
             with patch.object(runner, "_update_store_step") as mocked_step:
-                with patch.object(runner, "_navigate_with_reauth", return_value=page) as mocked_nav:
-                    with patch.object(runner, "_wait_for_batch_page_ready_with_recovery") as mocked_wait_ready:
-                        with patch.object(runner, "_log"):
-                            runner._wait_for_batch_page(page, store, result)  # noqa: SLF001
+                with patch.object(runner, "_dom_click_exact_text", side_effect=fake_dom_click):
+                    with patch.object(runner, "_wait_for_invoice_business_page_ready") as mocked_wait_business:
+                        with patch.object(runner, "_wait_for_blue_invoice_page_ready") as mocked_wait_blue:
+                            with patch.object(runner, "_wait_for_batch_page_ready") as mocked_wait_batch:
+                                with patch.object(runner, "_log"):
+                                    page = runner._wait_for_batch_page(home_page, store, result)  # noqa: SLF001
 
+            self.assertIs(invoice_page, page)
             mocked_step.assert_called_once()
-            mocked_nav.assert_called_once_with(
-                page,
-                config.portal_batch_issue_url,
-                result,
-                store=store,
-                expected_text=None,
-                step_name="open batch issue page",
+            self.assertEqual(
+                [
+                    (home_page, "发票业务", "item-info"),
+                    (invoice_page, "蓝字发票开具", "app_name"),
+                    (invoice_page, "批量开票", ""),
+                ],
+                clicks,
             )
-            mocked_wait_ready.assert_called_once_with(page, store.store_key)
+            mocked_wait_business.assert_called_once_with(invoice_page, store.store_key)
+            mocked_wait_blue.assert_called_once_with(invoice_page, store.store_key)
+            mocked_wait_batch.assert_called_once_with(invoice_page, store.store_key)
+            self.assertEqual(config.portal_action_timeout_ms, invoice_page.default_timeout)
 
-    def test_wait_for_batch_page_ready_with_recovery_waits_after_session_invalid_prompt(self) -> None:
+    def test_wait_for_batch_page_accepts_reused_invoice_business_tab(self) -> None:
+        class FakePage:
+            def __init__(self, url: str) -> None:
+                self.url = url
+                self.context: object | None = None
+
+            def set_default_timeout(self, timeout: int) -> None:
+                return None
+
+        class FakeContext:
+            def __init__(self, *pages: FakePage) -> None:
+                self.pages = list(pages)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=tmp_path / "profile",
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+            store = StoreConfig(
+                store_key="fuzzy",
+                store_name="Fuzzy",
+                survey_id="1",
+                output_xlsx_path=tmp_path / "output.xlsx",
+                initial_last_processed_id=1,
+                portal_enabled=True,
+                portal_company_switch_name="厦门市思明区浮几创意餐厅",
+                portal_company_verify_name="厦门市思明区浮几创意餐厅",
+            )
+            result = SimpleNamespace(workbook_sha256="abc123")
+            home_page = FakePage("https://etax.xiamen.chinatax.gov.cn:8443/loginb/")
+            reused_page = FakePage("about:blank")
+            context = FakeContext(home_page, reused_page)
+            home_page.context = context
+            reused_page.context = context
+            clicks: list[tuple[object, str]] = []
+
+            def fake_dom_click(page: object, text: str, *, class_hint: str = "") -> None:
+                clicks.append((page, text))
+                if text == "发票业务":
+                    reused_page.url = "https://dppt.xiamen.chinatax.gov.cn:8443/invoice-business?ruuid=1"
+                elif text == "蓝字发票开具":
+                    reused_page.url = "https://dppt.xiamen.chinatax.gov.cn:8443/blue-invoice-makeout"
+                elif text == "批量开票":
+                    reused_page.url = "https://dppt.xiamen.chinatax.gov.cn:8443/blue-invoice-makeout/invoice-batch"
+
+            with patch.object(runner, "_update_store_step"):
+                with patch.object(runner, "_dom_click_exact_text", side_effect=fake_dom_click):
+                    with patch.object(runner, "_wait_for_invoice_business_page_ready"):
+                        with patch.object(runner, "_wait_for_blue_invoice_page_ready"):
+                            with patch.object(runner, "_wait_for_batch_page_ready"):
+                                with patch.object(runner, "_log") as mocked_log:
+                                    page = runner._wait_for_batch_page(home_page, store, result)  # noqa: SLF001
+
+            self.assertIs(reused_page, page)
+            self.assertEqual(
+                [(home_page, "发票业务"), (reused_page, "蓝字发票开具"), (reused_page, "批量开票")],
+                clicks,
+            )
+            self.assertIn(
+                "invoice business page detected from official portal entry via reused page",
+                [call.args[1] for call in mocked_log.call_args_list],
+            )
+
+    def test_wait_for_batch_page_uses_raw_readiness_gate_before_continuing(self) -> None:
+        class FakePage:
+            def __init__(self, url: str) -> None:
+                self.url = url
+                self.context: object | None = None
+
+        class FakeContext:
+            def __init__(self, home_page: FakePage) -> None:
+                self.pages = [home_page]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=tmp_path / "profile",
+                portal_browser_backend="chrome_cdp",
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+            runner._attached_cdp_url = "http://127.0.0.1:9222"  # noqa: SLF001
+            runner._sync_playwright_factory = lambda: None  # noqa: SLF001
+            store = StoreConfig(
+                store_key="fuzzy",
+                store_name="Fuzzy",
+                survey_id="1",
+                output_xlsx_path=tmp_path / "output.xlsx",
+                initial_last_processed_id=1,
+                portal_enabled=True,
+                portal_company_switch_name="厦门市思明区浮几创意餐厅",
+                portal_company_verify_name="厦门市思明区浮几创意餐厅",
+            )
+            result = SimpleNamespace(
+                workbook_sha256="abc123",
+                workbook_path=tmp_path / "output.xlsx",
+                expected_count=2,
+            )
+            home_page = FakePage("https://etax.xiamen.chinatax.gov.cn:8443/loginb/")
+            home_page.context = FakeContext(home_page)
+            invoice_target = {
+                "id": "dppt-1",
+                "type": "page",
+                "url": "https://dppt.xiamen.chinatax.gov.cn:8443/invoice-business?ruuid=1",
+                "title": "发票业务-厦门市思明区浮几创意餐厅",
+                "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/dppt-1",
+            }
+            batch_target = {
+                **invoice_target,
+                "url": "https://dppt.xiamen.chinatax.gov.cn:8443/blue-invoice-makeout/invoice-batch",
+            }
+
+            with patch(
+                "app.portal_runner.DPPT_INVOICE_BUSINESS_POST_READY_DELAY_SECONDS",
+                0,
+            ), patch.object(runner, "_close_raw_attached_dppt_targets", return_value=0), patch.object(
+                runner,
+                "_raw_attached_dppt_targets",
+                side_effect=[[], [invoice_target], [invoice_target]],
+            ), patch.object(
+                runner,
+                "_raw_cdp_invoice_business_readiness",
+                side_effect=[
+                    {"ready": False, "securityInitialized": False},
+                    {
+                        "ready": True,
+                        "pageRendered": True,
+                        "blueInvoiceClickable": True,
+                        "navigationStatus": 200,
+                        "securityPublicKeyStatus": 0,
+                        "securityPermissionStatus": 200,
+                    },
+                ],
+            ) as mocked_readiness, patch.object(
+                runner,
+                "_stop_attached_playwright_transport",
+            ), patch.object(
+                runner,
+                "_raw_cdp_open_batch_page",
+                return_value=batch_target,
+            ) as mocked_open, patch.object(
+                runner,
+                "_raw_cdp_import_workbook",
+            ) as mocked_import, patch.object(
+                runner,
+                "_update_store_step",
+            ), patch.object(
+                runner,
+                "_dom_click_exact_text",
+            ), patch.object(runner, "_log") as mocked_log:
+                page = runner._wait_for_batch_page(home_page, store, result)  # noqa: SLF001
+
+            self.assertEqual(batch_target, page.target)
+            self.assertEqual(2, mocked_readiness.call_count)
+            mocked_open.assert_called_once_with(invoice_target, store.store_key)
+            mocked_import.assert_called_once_with(
+                batch_target,
+                store.store_key,
+                result.workbook_path,
+                result.expected_count,
+            )
+            self.assertIn(
+                "invoice business readiness confirmed page_rendered=true "
+                "blue_invoice_clickable=true invoice_business_http=200 "
+                "security_public_key=preinitialized "
+                "security_getYwqxbz_http=200; waiting 3s before continuing",
+                [call.args[1] for call in mocked_log.call_args_list],
+            )
+
+    def test_raw_cdp_invoice_business_readiness_uses_security_request_status(self) -> None:
+        runner = object.__new__(TaxPortalRunner)
+        expected = {
+            "ready": True,
+            "pageRendered": True,
+            "blueInvoiceClickable": True,
+            "navigationStatus": 200,
+            "securityPublicKeyStatus": 200,
+            "securityPermissionStatus": 200,
+        }
+        with patch.object(runner, "_raw_cdp_evaluate", return_value=expected) as mocked_evaluate:
+            snapshot = runner._raw_cdp_invoice_business_readiness({"id": "dppt-1"})  # noqa: SLF001
+
+        self.assertEqual(expected, snapshot)
+        expression = mocked_evaluate.call_args.args[1]
+        self.assertIn("document.readyState === 'complete'", expression)
+        self.assertIn(".page_app_list", expression)
+        self.assertIn("蓝字发票开具", expression)
+        self.assertIn("/szzhzz/cssSecurity/v1/getPublicKey", expression)
+        self.assertIn("/szzhzz/swszzhCtr/v1/getYwqxbz", expression)
+        self.assertIn("!publicKeyRequest.seen", expression)
+        self.assertIn("permissionRequest.seen", expression)
+        self.assertIn("navigationStatus >= 200", expression)
+
+    def test_wait_for_batch_page_refreshes_cdp_when_original_context_misses_new_target(self) -> None:
+        class FakePage:
+            def __init__(self, url: str) -> None:
+                self.url = url
+                self.context: object | None = None
+
+            def set_default_timeout(self, timeout: int) -> None:
+                return None
+
+        class FakeContext:
+            def __init__(self, home_page: FakePage) -> None:
+                self.pages = [home_page]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=tmp_path / "profile",
+                portal_browser_backend="chrome_cdp",
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+            runner._attached_cdp_url = "http://127.0.0.1:9222"  # noqa: SLF001
+            store = StoreConfig(
+                store_key="fuzzy",
+                store_name="Fuzzy",
+                survey_id="1",
+                output_xlsx_path=tmp_path / "output.xlsx",
+                initial_last_processed_id=1,
+                portal_enabled=True,
+                portal_company_switch_name="厦门市思明区浮几创意餐厅",
+                portal_company_verify_name="厦门市思明区浮几创意餐厅",
+            )
+            result = SimpleNamespace(workbook_sha256="abc123")
+            home_page = FakePage("https://etax.xiamen.chinatax.gov.cn:8443/loginb/")
+            invoice_page = FakePage("https://dppt.xiamen.chinatax.gov.cn:8443/invoice-business?ruuid=1")
+            context = FakeContext(home_page)
+            home_page.context = context
+            invoice_page.context = context
+
+            with patch("app.portal_runner.DPPT_INVOICE_BUSINESS_POST_READY_DELAY_SECONDS", 0), patch(
+                "app.portal_runner.DPPT_SENSITIVE_NAVIGATION_SETTLE_SECONDS",
+                0,
+            ):
+                with patch.object(runner, "_update_store_step"):
+                    with patch.object(runner, "_dom_click_exact_text"):
+                        with patch.object(
+                            runner,
+                            "_raw_attached_dppt_targets",
+                            side_effect=[
+                                [],
+                                [
+                                    {
+                                        "id": "dppt-1",
+                                        "type": "page",
+                                        "url": invoice_page.url,
+                                        "title": "发票业务-厦门市思明区浮几创意餐厅",
+                                    }
+                                ],
+                            ],
+                        ):
+                            with patch.object(
+                                runner,
+                                "_refresh_attached_invoice_business_target",
+                                return_value=invoice_page,
+                            ) as mocked_refresh:
+                                with patch.object(runner, "_wait_for_invoice_business_page_ready"):
+                                    with patch.object(runner, "_wait_for_blue_invoice_page_ready"):
+                                        with patch.object(runner, "_wait_for_batch_page_ready"):
+                                            with patch.object(runner, "_log"):
+                                                page = runner._wait_for_batch_page(home_page, store, result)  # noqa: SLF001
+
+            self.assertIs(invoice_page, page)
+            mocked_refresh.assert_called_once_with(store)
+
+    def test_wait_for_batch_page_retries_official_entry_after_handoff_http_400(self) -> None:
+        class FakePage:
+            def __init__(self, url: str, response_status: int = 0) -> None:
+                self.url = url
+                self.response_status = response_status
+                self.context: object | None = None
+                self.closed = False
+
+            def evaluate(self, script: str) -> int:
+                return self.response_status
+
+            def set_default_timeout(self, timeout: int) -> None:
+                return None
+
+            def close(self) -> None:
+                self.closed = True
+
+        class FakeContext:
+            def __init__(self, home_page: FakePage) -> None:
+                self.pages = [home_page]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=tmp_path / "profile",
+                portal_browser_backend="chrome_cdp",
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+            runner._attached_cdp_url = "http://127.0.0.1:9222"  # noqa: SLF001
+            store = StoreConfig(
+                store_key="fuzzy",
+                store_name="Fuzzy",
+                survey_id="1",
+                output_xlsx_path=tmp_path / "output.xlsx",
+                initial_last_processed_id=1,
+                portal_enabled=True,
+                portal_company_switch_name="厦门市思明区浮几创意餐厅",
+                portal_company_verify_name="厦门市思明区浮几创意餐厅",
+            )
+            result = SimpleNamespace(workbook_sha256="abc123")
+            home_page = FakePage("https://etax.xiamen.chinatax.gov.cn:8443/loginb/")
+            failed_handoff = FakePage(
+                "https://dppt.xiamen.chinatax.gov.cn:8443/szzhzz/spHandler?cdlj=invoice-business",
+                response_status=400,
+            )
+            invoice_page = FakePage("https://dppt.xiamen.chinatax.gov.cn:8443/invoice-business?ruuid=1")
+            context = FakeContext(home_page)
+            home_page.context = context
+            failed_handoff.context = context
+            invoice_page.context = context
+
+            with patch("app.portal_runner.DPPT_INVOICE_BUSINESS_POST_READY_DELAY_SECONDS", 0), patch(
+                "app.portal_runner.DPPT_SENSITIVE_NAVIGATION_SETTLE_SECONDS",
+                0,
+            ):
+                with patch.object(runner, "_update_store_step"):
+                    with patch.object(runner, "_dom_click_exact_text") as mocked_click:
+                        with patch.object(
+                            runner,
+                            "_raw_attached_dppt_targets",
+                            side_effect=[
+                                [],
+                                [
+                                    {
+                                        "id": "handoff-1",
+                                        "type": "page",
+                                        "url": failed_handoff.url,
+                                        "title": "",
+                                    }
+                                ],
+                                [],
+                                [
+                                    {
+                                        "id": "dppt-1",
+                                        "type": "page",
+                                        "url": invoice_page.url,
+                                        "title": "发票业务-厦门市思明区浮几创意餐厅",
+                                    }
+                                ],
+                            ],
+                        ):
+                            with patch.object(
+                                runner,
+                                "_refresh_attached_invoice_business_target",
+                                side_effect=[failed_handoff, invoice_page],
+                            ):
+                                with patch.object(runner, "_wait_for_invoice_business_page_ready"):
+                                    with patch.object(runner, "_wait_for_blue_invoice_page_ready"):
+                                        with patch.object(runner, "_wait_for_batch_page_ready"):
+                                            with patch.object(runner, "_log"):
+                                                page = runner._wait_for_batch_page(home_page, store, result)  # noqa: SLF001
+
+            self.assertIs(invoice_page, page)
+            self.assertTrue(failed_handoff.closed)
+            self.assertEqual(4, mocked_click.call_count)
+
+    def test_reset_attached_dppt_site_data_preserves_home_and_closes_dppt_pages(self) -> None:
+        class FakeSession:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, object]] = []
+                self.detached = False
+
+            def send(self, method: str, params: object) -> None:
+                self.calls.append((method, params))
+
+            def detach(self) -> None:
+                self.detached = True
+
+        class FakePage:
+            def __init__(self, url: str) -> None:
+                self.url = url
+                self.closed = False
+                self.context: object | None = None
+
+            def close(self) -> None:
+                self.closed = True
+
+        class FakeContext:
+            def __init__(self, pages: list[FakePage], session: FakeSession) -> None:
+                self.pages = pages
+                self.session = session
+
+            def new_cdp_session(self, page: object) -> FakeSession:
+                return self.session
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=tmp_path / "profile",
+                portal_browser_backend="chrome_cdp",
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+            store = StoreConfig(
+                store_key="fuzzy",
+                store_name="Fuzzy",
+                survey_id="1",
+                output_xlsx_path=tmp_path / "output.xlsx",
+                initial_last_processed_id=1,
+                portal_enabled=True,
+                portal_company_switch_name="厦门市思明区浮几创意餐厅",
+                portal_company_verify_name="厦门市思明区浮几创意餐厅",
+            )
+            session = FakeSession()
+            home_page = FakePage("https://etax.xiamen.chinatax.gov.cn:8443/loginb/")
+            dppt_page = FakePage("https://dppt.xiamen.chinatax.gov.cn:8443/invoice-business?ruuid=1")
+            context = FakeContext([home_page, dppt_page], session)
+            home_page.context = context
+            dppt_page.context = context
+
+            with patch.object(runner, "_refresh_attached_dppt_pages", return_value=[dppt_page]):
+                reset = runner._reset_attached_dppt_site_data(home_page, store)  # noqa: SLF001
+
+            self.assertTrue(reset)
+            self.assertFalse(home_page.closed)
+            self.assertTrue(dppt_page.closed)
+            self.assertTrue(session.detached)
+            self.assertEqual(
+                [
+                    (
+                        "Storage.clearDataForOrigin",
+                        {
+                            "origin": "https://dppt.xiamen.chinatax.gov.cn:8443",
+                            "storageTypes": "all",
+                        },
+                    )
+                ],
+                session.calls,
+            )
+
+    def test_dom_click_exact_text_uses_page_evaluate_instead_of_locator_click(self) -> None:
         class FakePage:
             def __init__(self) -> None:
-                self.body_text = "系统检测到电票平台会话已失效或电局账号已退出，需刷新重新操作"
-                self.read_count = 0
+                self.arguments: list[object] = []
 
-            def locator(self, selector: str) -> object:
-                class FakeLocator:
-                    def __init__(self, page: "FakePage") -> None:
-                        self.page = page
+            def wait_for_timeout(self, timeout: int) -> None:
+                self.arguments.append(("wait", timeout))
 
-                    def inner_text(self) -> str:
-                        self.page.read_count += 1
-                        if self.page.read_count >= 3:
-                            self.page.body_text = "批量开票 页面已恢复"
-                        return self.page.body_text
-
-                return FakeLocator(self)
+            def evaluate(self, script: str, argument: object) -> object:
+                self.arguments.append((script, argument))
+                return {"clicked": True, "count": 1, "tag": "DIV", "className": "app_name__bold"}
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
@@ -1497,13 +2324,30 @@ class PortalRunnerUrlTests(unittest.TestCase):
             )
             runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
             page = FakePage()
+            runner._dom_click_exact_text(page, "蓝字发票开具", class_hint="app_name")  # noqa: SLF001
 
-            with patch.object(runner, "_wait_for_batch_page_ready") as mocked_wait_ready:
-                with patch.object(runner, "_log"):
-                    runner._wait_for_batch_page_ready_with_recovery(page, "fuzzy")  # noqa: SLF001
+            self.assertEqual(("wait", BROWSER_CLICK_DELAY_MS), page.arguments[0])
+            self.assertEqual(
+                {"text": "蓝字发票开具", "classHint": "app_name"},
+                page.arguments[1][1],
+            )
 
-            self.assertGreaterEqual(page.read_count, 3)
-            mocked_wait_ready.assert_called_once_with(page, "fuzzy")
+    def test_wait_for_text_uses_visible_body_text_instead_of_first_matching_locator(self) -> None:
+        class FakePage:
+            def __init__(self) -> None:
+                self.arguments: tuple[object, ...] | None = None
+
+            def wait_for_function(self, *args: object, **kwargs: object) -> None:
+                self.arguments = (*args, kwargs)
+
+            def get_by_text(self, text: str, exact: bool = False) -> object:
+                raise AssertionError("first matching locator must not be used")
+
+        page = FakePage()
+        TaxPortalRunner._wait_for_text(page, "发票业务", timeout_ms=30000)  # noqa: SLF001
+
+        self.assertIsNotNone(page.arguments)
+        self.assertEqual({"arg": "发票业务", "timeout": 30000}, page.arguments[1])
 
     def test_run_store_waits_five_seconds_after_home_page_before_opening_batch_page(self) -> None:
         class FakeBatchPage:
@@ -1603,11 +2447,11 @@ class PortalRunnerUrlTests(unittest.TestCase):
                                                                     result = runner._run_store(context, home_page, store)  # noqa: SLF001
 
             self.assertEqual("validated", result.status)
-            self.assertEqual(1, context.new_page_count)
+            self.assertEqual(0, context.new_page_count)
             self.assertEqual(1, events.count("wait_for_home_page_ready"))
             self.assertIn("sleep_before_batch", events)
             self.assertLess(events.index("wait_for_home_page_ready"), events.index("sleep_before_batch"))
-            self.assertLess(events.index("sleep_before_batch"), events.index("new_page:attempt1"))
+            self.assertLess(events.index("sleep_before_batch"), events.index("batch_page_ready"))
 
     def test_run_store_skips_empty_workbook_before_opening_batch_page(self) -> None:
         class FakeContext:
@@ -1776,43 +2620,23 @@ class PortalRunnerUrlTests(unittest.TestCase):
             self.assertLess(events.index("wait_query_ready"), events.index("filter:厦门市思明区浮几创意餐厅"))
 
     def test_import_workbook_waits_for_import_page_to_settle_before_validating_rows(self) -> None:
-        class FakeClickable:
+        class FakeFileInput:
             def __init__(self, events: list[str]) -> None:
                 self.events = events
 
-            def click(self) -> None:
-                self.events.append("click_select_file")
+            def count(self) -> int:
+                return 1
 
-        class FakeChooserValue:
-            def __init__(self, events: list[str]) -> None:
-                self.events = events
-
-            def set_files(self, value: str) -> None:
-                self.events.append(f"set_files:{value}")
-
-        class FakeChooserContext:
-            def __init__(self, events: list[str]) -> None:
-                self.events = events
-                self.value = FakeChooserValue(events)
-
-            def __enter__(self) -> "FakeChooserContext":
-                self.events.append("enter_file_chooser")
-                return self
-
-            def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-                self.events.append("exit_file_chooser")
-                return None
+            def set_input_files(self, value: str) -> None:
+                self.events.append(f"set_input_files:{value}")
 
         class FakePage:
             def __init__(self, events: list[str]) -> None:
                 self.events = events
 
-            def expect_file_chooser(self) -> FakeChooserContext:
-                return FakeChooserContext(self.events)
-
-            def get_by_text(self, text: str, exact: bool = False) -> FakeClickable:
-                self.events.append(f"get_by_text:{text}:{exact}")
-                return FakeClickable(self.events)
+            def locator(self, selector: str) -> FakeFileInput:
+                self.events.append(f"locator:{selector}")
+                return FakeFileInput(self.events)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
@@ -1869,32 +2693,19 @@ class PortalRunnerUrlTests(unittest.TestCase):
                             runner._import_workbook(page, "fuzzy", workbook_path, rows, summary)  # noqa: SLF001
 
             self.assertIn("wait_import_ready", events)
+            self.assertIn(f"set_input_files:{workbook_path}", events)
 
     def test_import_workbook_accepts_portal_transformed_amounts(self) -> None:
-        class FakeClickable:
-            def click(self) -> None:
-                return None
+        class FakeFileInput:
+            def count(self) -> int:
+                return 1
 
-        class FakeChooserValue:
-            def set_files(self, value: str) -> None:
+            def set_input_files(self, value: str) -> None:
                 self.last_value = value
 
-        class FakeChooserContext:
-            def __init__(self) -> None:
-                self.value = FakeChooserValue()
-
-            def __enter__(self) -> "FakeChooserContext":
-                return self
-
-            def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-                return None
-
         class FakePage:
-            def expect_file_chooser(self) -> FakeChooserContext:
-                return FakeChooserContext()
-
-            def get_by_text(self, text: str, exact: bool = False) -> FakeClickable:
-                return FakeClickable()
+            def locator(self, selector: str) -> FakeFileInput:
+                return FakeFileInput()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
@@ -1945,6 +2756,89 @@ class PortalRunnerUrlTests(unittest.TestCase):
                     with patch.object(runner, "_wait_for_batch_import_ready"):
                         with patch.object(runner, "_log"):
                             runner._import_workbook(page, "fuzzy", workbook_path, rows, summary)  # noqa: SLF001
+
+    def test_import_workbook_surfaces_dppt_http_error_without_waiting_for_timeout(self) -> None:
+        class FakeResponse:
+            url = "https://dppt.xiamen.chinatax.gov.cn:8443/kpfw/excel/v1/importPlkj?QrkneIXh=value"
+            status = 400
+            headers = {"content-type": "text/html"}
+
+        class FakeFileInput:
+            def __init__(self, page: "FakePage") -> None:
+                self.page = page
+
+            def count(self) -> int:
+                return 1
+
+            def set_input_files(self, value: str) -> None:
+                self.page.response_handler(FakeResponse())
+
+        class FakePage:
+            def __init__(self) -> None:
+                self.response_handler = lambda response: None
+                self.removed_handler: object | None = None
+
+            def on(self, event: str, handler: object) -> None:
+                self.assert_event(event)
+                self.response_handler = handler
+
+            def remove_listener(self, event: str, handler: object) -> None:
+                self.assert_event(event)
+                self.removed_handler = handler
+
+            @staticmethod
+            def assert_event(event: str) -> None:
+                if event != "response":
+                    raise AssertionError(f"unexpected event: {event}")
+
+            def locator(self, selector: str) -> FakeFileInput:
+                return FakeFileInput(self)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=tmp_path / "profile",
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+            page = FakePage()
+            summary = SimpleNamespace(row_count=1, total_amount_including_tax=Decimal("123.45"))
+
+            with patch.object(runner, "_wait_for_text"):
+                with patch.object(runner, "_log"):
+                    with self.assertRaisesRegex(
+                        PortalRunnerError,
+                        "HTTP 400 content_type=text/html",
+                    ):
+                        runner._import_workbook(  # noqa: SLF001
+                            page,
+                            "fuzzy",
+                            tmp_path / "output.xlsx",
+                            [object()],
+                            summary,
+                        )
+
+            self.assertIsNotNone(page.removed_handler)
 
     def test_open_submit_confirmation_waits_for_dialog_to_settle_before_confirm(self) -> None:
         class FakeConfirmButton:
@@ -2142,6 +3036,33 @@ class PortalRunnerUrlTests(unittest.TestCase):
             self.assertIsNone(details[0].digital_invoice_number)
             self.assertEqual("3341663489@qq.com", details[0].buyer_email)
             self.assertEqual("购买方纳税人识别号有误", details[0].failure_reason)
+
+    def test_reconcile_result_counts_prefers_complete_detail_rows(self) -> None:
+        details = [
+            PortalIssueDetail(
+                invoice_serial="2",
+                digital_invoice_number="26352000001889035201",
+                buyer_email="first@example.com",
+                status="成功",
+                failure_reason=None,
+            ),
+            PortalIssueDetail(
+                invoice_serial="1",
+                digital_invoice_number="26352000001889158501",
+                buyer_email="second@example.com",
+                status="成功",
+                failure_reason=None,
+            ),
+        ]
+
+        counts = TaxPortalRunner._reconcile_result_counts_from_details(  # noqa: SLF001
+            details,
+            1,
+            0,
+            expected_count=2,
+        )
+
+        self.assertEqual((2, 0), counts)
 
     def test_capture_submit_result_artifacts_writes_screenshot_and_text(self) -> None:
         class FakePage:
@@ -2944,6 +3865,13 @@ class PortalRunnerUrlTests(unittest.TestCase):
                 self.assertEqual("fuzzy", store_key)
                 events.append("wait_before_open_batch_page")
 
+            def fake_wait_for_batch_page(page: object, current_store: StoreConfig, current_result: object) -> object:
+                self.assertIs(home_page, page)
+                self.assertIs(store, current_store)
+                self.assertIsNotNone(current_result)
+                events.append("wait_for_batch_page")
+                return page
+
             with patch("app.portal_runner.load_portal_issue_rows", return_value=rows):
                 with patch("app.portal_runner.summarize_portal_issue_rows", return_value=summary):
                     with patch("app.portal_runner.sha256_file", return_value="abc123"):
@@ -2964,7 +3892,7 @@ class PortalRunnerUrlTests(unittest.TestCase):
                                                 with patch.object(
                                                     runner,
                                                     "_wait_for_batch_page",
-                                                    side_effect=lambda page, *_: page,
+                                                    side_effect=fake_wait_for_batch_page,
                                                 ):
                                                     with patch.object(runner, "_ensure_batch_page_clean"):
                                                         with patch.object(runner, "_import_workbook"):
@@ -2987,7 +3915,7 @@ class PortalRunnerUrlTests(unittest.TestCase):
             )
             self.assertLess(
                 events.index("wait_before_open_batch_page"),
-                events.index("new_page"),
+                events.index("wait_for_batch_page"),
             )
 
     def test_run_store_reuses_existing_home_page_without_reopening_loginb_in_chrome_cdp_mode(self) -> None:
