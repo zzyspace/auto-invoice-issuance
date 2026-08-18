@@ -5,11 +5,13 @@ import json
 import os
 import re
 import shutil
+import subprocess
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from time import monotonic, sleep
 from typing import Callable
+from urllib.parse import urlparse
 from urllib.request import ProxyHandler, build_opener
 
 from app.models import AppConfig, PortalIssueDetail, PortalIssueResult, PortalIssueRow, StoreConfig
@@ -37,6 +39,7 @@ DPPT_SENSITIVE_NAVIGATION_SETTLE_SECONDS = 3.0
 POST_SUBMIT_SUCCESS_WAIT_SECONDS = 3.0
 BROWSER_CLICK_DELAY_MS = 1000
 BROWSER_CLICK_DELAY_SECONDS = BROWSER_CLICK_DELAY_MS / 1000
+RAW_CDP_SUBMIT_ACTION_DELAY_SECONDS = 1.0
 HOME_PAGE_SHELL_MIN_TIMEOUT_MS = 60000
 HOME_PAGE_NETWORKIDLE_GRACE_MS = 30000
 AUTHENTICATED_PAGE_STABILITY_MS = 1500
@@ -57,6 +60,9 @@ BROWSER_SESSION_SYNC_ENTRIES = (
     "Network",
 )
 PORTAL_TPASS_LOGIN_RE = re.compile(r"^https://tpass\.([a-z0-9-]+)\.chinatax\.gov\.cn:8443/#/login(?:[/?#].*)?$")
+PORTAL_TPASS_OAUTH_API_RE = re.compile(
+    r"^https://tpass\.([a-z0-9-]+)\.chinatax\.gov\.cn:8443/api/v1\.0/auth/oauth2/login(?:\?.*)?$"
+)
 PORTAL_ETAX_HOST_RE = re.compile(r"^https://etax\.([a-z0-9-]+)\.chinatax\.gov\.cn:8443(?:[/?#].*)?$")
 PORTAL_TPASS_HOST_RE = re.compile(r"^https://tpass\.([a-z0-9-]+)\.chinatax\.gov\.cn:8443(?:[/?#].*)?$")
 PORTAL_DPPT_HOST_RE = re.compile(r"^https://dppt\.([a-z0-9-]+)\.chinatax\.gov\.cn:8443(?:[/?#].*)?$")
@@ -134,7 +140,15 @@ class TaxPortalRunner:
         self._install_network_diag(context, home_page, "runner", "home")
         try:
             for store in stores:
-                results.append(self._run_store(context, home_page, store))
+                store_result = self._run_store(context, home_page, store)
+                results.append(store_result)
+                if self._should_abort_remaining_stores(store_result):
+                    self._log(
+                        "runner",
+                        "stopping remaining stores because the previous store did not finish safely "
+                        f"store_key={store_result.store_key} error={store_result.error or '<none>'}",
+                    )
+                    break
         finally:
             context.close()
         return results
@@ -158,16 +172,43 @@ class TaxPortalRunner:
         if callable(on_context_event):
             on_context_event("page", self._record_attached_page)
         home_page = self._resolve_attached_home_page(context)
+        created_home_pages = [home_page] if getattr(home_page, "_codex_created_page", False) else []
         self._install_network_diag(context, home_page, "runner", "home")
         try:
             for store in stores:
-                results.append(self._run_store(context, home_page, store))
+                if not self._attached_cdp_connections:
+                    browser = self._restart_attached_cdp_transport(store)
+                else:
+                    browser = self._attached_cdp_connections[0]
+                if not browser.contexts:
+                    raise PortalRunnerError(
+                        "Connected to Chrome via CDP, but no browser context was available."
+                    )
+                context = browser.contexts[0]
+                context.set_default_timeout(self.config.portal_action_timeout_ms)
+                home_page = self._find_attached_portal_page(context, store)
+                if home_page is None:
+                    home_page = self._resolve_attached_home_page(context)
+                if (
+                    getattr(home_page, "_codex_created_page", False)
+                    and home_page not in created_home_pages
+                ):
+                    created_home_pages.append(home_page)
+                store_result = self._run_store(context, home_page, store)
+                results.append(store_result)
+                if self._should_abort_remaining_stores(store_result):
+                    self._log(
+                        "runner",
+                        "stopping remaining stores because the previous store did not finish safely "
+                        f"store_key={store_result.store_key} error={store_result.error or '<none>'}",
+                    )
+                    break
         finally:
-            try:
-                if getattr(home_page, "_codex_created_page", False):
-                    home_page.close()
-            except Exception:
-                pass
+            for created_home_page in created_home_pages:
+                try:
+                    created_home_page.close()
+                except Exception:
+                    pass
             self._attached_cdp_browser_type = None
             self._attached_cdp_url = None
             self._attached_cdp_connections = []
@@ -320,11 +361,24 @@ class TaxPortalRunner:
                             f"{self._format_money(summary.total_amount_including_tax)}"
                         ),
                     )
+                    self._raw_cdp_select_all_batch_rows(
+                        batch_page.target,
+                        store.store_key,
+                        result.expected_count,
+                    )
                     if not self.submit:
+                        self._log(
+                            store.store_key,
+                            "dry run select-all is ready; waiting "
+                            f"{RAW_CDP_SUBMIT_ACTION_DELAY_SECONDS:.0f}s before closing batch tab",
+                        )
+                        sleep(RAW_CDP_SUBMIT_ACTION_DELAY_SECONDS)
+                        self._close_raw_cdp_target(batch_page.target, store.store_key)
                         result.status = "validated"
                         self._log(
                             store.store_key,
-                            "dry run finished after raw CDP validation; submission skipped",
+                            "dry run finished after raw CDP validation and select-all verification; "
+                            "batch tab closed and submission skipped",
                         )
                         return self._finalize_result(result)
 
@@ -336,6 +390,7 @@ class TaxPortalRunner:
                         f"{self._format_money(summary.total_amount_including_tax)} "
                         "through raw CDP",
                     )
+                    result.step = "submit_result"
                     try:
                         details, success_count, failure_count, _result_modal_text = (
                             self._raw_cdp_submit_batch(
@@ -423,9 +478,13 @@ class TaxPortalRunner:
                         f"total_amount_including_tax={self._format_money(summary.total_amount_including_tax)}"
                     ),
                 )
+                self._select_all_rows(batch_page)
                 if not self.submit:
                     result.status = "validated"
-                    self._log(store.store_key, "dry run finished after validation; submission skipped")
+                    self._log(
+                        store.store_key,
+                        "dry run finished after validation and select-all verification; submission skipped",
+                    )
                     return self._finalize_result(result)
 
                 self._log(
@@ -434,7 +493,6 @@ class TaxPortalRunner:
                     f"submitting rows={summary.row_count} "
                     f"total_amount_including_tax={self._format_money(summary.total_amount_including_tax)}",
                 )
-                self._select_all_rows(batch_page)
                 self._open_submit_confirmation(
                     batch_page,
                     store.store_key,
@@ -492,6 +550,10 @@ class TaxPortalRunner:
             self._capture_artifact(active_page, result.artifacts_dir, f"{store.store_key}-failure")
             return self._finalize_result(result)
 
+    @staticmethod
+    def _should_abort_remaining_stores(result: PortalIssueResult) -> bool:
+        return getattr(result, "status", None) == "failed"
+
     def _finalize_result(self, result: PortalIssueResult) -> PortalIssueResult:
         result.finalize()
         history_id = self.state_store.record_portal_issue_result(result)
@@ -524,8 +586,35 @@ class TaxPortalRunner:
         login_challenge_url: str | None = None
         last_heartbeat_at: float | None = None
         last_cdp_refresh_at: float | None = None
+        gateway_restart_attempted = False
         self._log(result.store_key, "login required; waiting for successful login...")
         while monotonic() < deadline:
+            if self.config.portal_browser_backend == "chrome_cdp" and store is not None:
+                gateway_failure = self._blank_tpass_gateway_failure(store)
+                if gateway_failure is not None:
+                    gateway_target, gateway_snapshot = gateway_failure
+                    gateway_url = str(gateway_target.get("url") or "")
+                    gateway_status = int(gateway_snapshot.get("navigationStatus") or 0)
+                    if gateway_restart_attempted:
+                        raise PortalRunnerError(
+                            "TPass gateway challenge remained on a blank OAuth API page after one "
+                            f"dedicated Chrome restart url={gateway_url} http_status={gateway_status or 'unknown'}."
+                        )
+                    self._log(
+                        result.store_key,
+                        "error: detected blank TPass OAuth API gateway challenge "
+                        f"url={gateway_url} http_status={gateway_status or 'unknown'}; "
+                        "restarting dedicated Chrome once",
+                    )
+                    page = self._restart_dedicated_chrome_after_gateway_error(store)
+                    gateway_restart_attempted = True
+                    refreshed_qr = False
+                    clicked_public_login = False
+                    local_app_login_attempted = False
+                    reauth_seen_at = None
+                    login_challenge_url = None
+                    last_cdp_refresh_at = None
+                    continue
             authenticated_page = self._confirmed_authenticated_page(page, store)
             if authenticated_page is not None:
                 if authenticated_page is page:
@@ -556,6 +645,18 @@ class TaxPortalRunner:
                             )
                         self._cleanup_imported_login_qrs(imported_login_qrs, result.store_key)
                         return refreshed_page
+                refreshed_login_page = self._refresh_attached_login_page(page, store)
+                if refreshed_login_page is not None and refreshed_login_page is not page:
+                    self._log(
+                        result.store_key,
+                        "adopting refreshed attached Chrome login page: "
+                        f"{getattr(refreshed_login_page, 'url', '<unknown>')}",
+                    )
+                    page = refreshed_login_page
+                    refreshed_qr = False
+                    local_app_login_attempted = False
+                    reauth_seen_at = None
+                    login_challenge_url = None
             if self._is_public_landing_page(page):
                 if not clicked_public_login:
                     self._log(result.store_key, "public landing detected; clicking login entry")
@@ -1437,12 +1538,18 @@ class TaxPortalRunner:
         )
         return result if isinstance(result, dict) else {}
 
-    def _raw_cdp_submit_batch(
+    def _raw_cdp_select_all_batch_rows(
         self,
         target: dict[str, object],
         store_key: str,
-        result: PortalIssueResult,
-    ) -> tuple[list[PortalIssueDetail], int, int, str]:
+        expected_count: int,
+    ) -> None:
+        self._log(
+            store_key,
+            "raw CDP import is ready; waiting "
+            f"{RAW_CDP_SUBMIT_ACTION_DELAY_SECONDS:.0f}s before selecting invoices",
+        )
+        sleep(RAW_CDP_SUBMIT_ACTION_DELAY_SECONDS)
         self._wait_until(
             lambda: int(
                 self._raw_cdp_evaluate(
@@ -1458,7 +1565,7 @@ class TaxPortalRunner:
                 )
                 or 0
             )
-            == result.expected_count,
+            == expected_count,
             timeout_seconds=15,
             message="render all imported batch rows for raw CDP selection",
             interval_seconds=0.2,
@@ -1467,32 +1574,25 @@ class TaxPortalRunner:
             target,
             """
             (() => {
-              const labels = [...document.querySelectorAll(
-                'td.t-table__cell-check label.t-checkbox'
+              const headerLabels = [...document.querySelectorAll(
+                'th.t-table__cell-check label.t-checkbox, thead label.t-checkbox'
               )].filter((element) => {
                 const rect = element.getBoundingClientRect();
                 return rect.width > 0 && rect.height > 0;
               });
-              for (const label of labels) {
-                const checkbox = label.querySelector('input[type="checkbox"]');
-                if (checkbox && !checkbox.checked) label.click();
-              }
+              const headerLabel = headerLabels[0] || null;
+              const checkbox = headerLabel?.querySelector('input[type="checkbox"]') || null;
+              if (headerLabel && checkbox && !checkbox.checked) headerLabel.click();
               return {
-                count: labels.length,
-                checkedCount: labels.filter((label) =>
-                  Boolean(label.querySelector('input[type="checkbox"]')?.checked)
-                ).length,
+                found: Boolean(headerLabel && checkbox),
+                checked: Boolean(checkbox?.checked),
+                count: headerLabels.length,
               };
             })()
             """,
         )
-        if (
-            not isinstance(selection, dict)
-            or int(selection.get("count") or 0) != result.expected_count
-        ):
-            raise PortalRunnerError(
-                "Raw CDP visible batch row count does not match the expected import count."
-            )
+        if not isinstance(selection, dict) or not selection.get("found"):
+            raise PortalRunnerError("Raw CDP could not find the visible batch table select-all checkbox.")
         self._wait_until(
             lambda: int(
                 self._raw_cdp_evaluate(
@@ -1509,12 +1609,25 @@ class TaxPortalRunner:
                 )
                 or 0
             )
-            == result.expected_count,
+            == expected_count,
             timeout_seconds=10,
             message="select all imported rows through raw CDP",
             interval_seconds=0.2,
         )
+        self._log(store_key, f"raw CDP select-all verified rows={expected_count}")
 
+    def _raw_cdp_submit_batch(
+        self,
+        target: dict[str, object],
+        store_key: str,
+        result: PortalIssueResult,
+    ) -> tuple[list[PortalIssueDetail], int, int, str]:
+        self._log(
+            store_key,
+            "raw CDP select-all is ready; waiting "
+            f"{RAW_CDP_SUBMIT_ACTION_DELAY_SECONDS:.0f}s before batch issue",
+        )
+        sleep(RAW_CDP_SUBMIT_ACTION_DELAY_SECONDS)
         self._raw_cdp_click_exact_text(target, "批量开具")
         self._wait_until(
             lambda: "本次勾选批量开具发票" in self._raw_cdp_body_text(target),
@@ -1522,6 +1635,7 @@ class TaxPortalRunner:
             message="open raw CDP submit confirmation",
             interval_seconds=0.2,
         )
+        sleep(RAW_CDP_SUBMIT_ACTION_DELAY_SECONDS)
         self._raw_cdp_click_exact_text(target, "确定")
         result.submitted_count = result.expected_count
         self._log(
@@ -1552,6 +1666,15 @@ class TaxPortalRunner:
             failure_count,
             expected_count=result.expected_count,
         )
+        self._raw_cdp_click_dialog_button(target, "批量开具结果", "关闭")
+        self._wait_until(
+            lambda: "批量开具结果" not in self._raw_cdp_body_text(target),
+            timeout_seconds=10,
+            message="close raw CDP portal issue result dialog",
+            interval_seconds=0.2,
+        )
+        self._log(store_key, "raw CDP portal issue result confirmed and closed")
+        self._close_raw_cdp_target(target, store_key)
         return details, success_count, failure_count, result_modal_text
 
     def _raw_cdp_body_text(self, target: dict[str, object]) -> str:
@@ -1698,6 +1821,73 @@ class TaxPortalRunner:
         if not isinstance(result, dict) or not result.get("clicked"):
             raise PortalRunnerError(f"Could not raw-CDP click visible exact text: {text}")
 
+    def _raw_cdp_click_dialog_button(
+        self,
+        target: dict[str, object],
+        dialog_text: str,
+        button_text: str,
+    ) -> None:
+        argument = json.dumps(
+            {"dialogText": dialog_text, "buttonText": button_text},
+            ensure_ascii=False,
+        )
+        expression = f"""
+            (() => {{
+              const {{dialogText, buttonText}} = {argument};
+              const isRendered = (element) => {{
+                if (!element) return false;
+                const style = getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none' &&
+                  style.visibility !== 'hidden' &&
+                  Number(style.opacity || 1) !== 0 &&
+                  element.getClientRects().length > 0 &&
+                  rect.width > 0 && rect.height > 0;
+              }};
+              const dialogs = [...document.querySelectorAll(
+                '[role="dialog"], .t-dialog, .t-dialog__ctx, .el-dialog__wrapper, .el-message-box'
+              )].filter((element) =>
+                isRendered(element) && (element.innerText || '').includes(dialogText)
+              ).sort((left, right) => {{
+                const leftRect = left.getBoundingClientRect();
+                const rightRect = right.getBoundingClientRect();
+                return leftRect.width * leftRect.height - rightRect.width * rightRect.height;
+              }});
+              const dialog = dialogs[0] || null;
+              if (!dialog) return {{clicked: false, reason: 'dialog-not-found'}};
+              const labels = [...dialog.querySelectorAll('button, [role="button"], a, span')]
+                .filter((element) =>
+                  isRendered(element) &&
+                  (element.textContent || '').trim() === buttonText
+                );
+              const label = labels.find((element) =>
+                element.matches('button, [role="button"], a')
+              ) || labels[0] || null;
+              const button = label?.closest('button, [role="button"], a') || label;
+              const disabledContainer = button?.closest(
+                '[disabled], [aria-disabled="true"], .is-disabled, .t-is-disabled'
+              );
+              if (!button || disabledContainer) {{
+                return {{clicked: false, reason: 'button-not-ready'}};
+              }}
+              button.click();
+              return {{clicked: true, tag: button.tagName, className: String(button.className || '')}};
+            }})()
+            """
+        last_result: object = None
+
+        def click_ready_dialog_button() -> bool:
+            nonlocal last_result
+            last_result = self._raw_cdp_evaluate(target, expression)
+            return isinstance(last_result, dict) and bool(last_result.get("clicked"))
+
+        self._wait_until(
+            click_ready_dialog_button,
+            timeout_seconds=10,
+            message=f"enable raw CDP dialog button {dialog_text}/{button_text}",
+            interval_seconds=0.2,
+        )
+
     @staticmethod
     def _raw_cdp_evaluate(target: dict[str, object], expression: str) -> object:
         result = TaxPortalRunner._raw_cdp_command(
@@ -1840,6 +2030,47 @@ class TaxPortalRunner:
             except Exception:
                 continue
         return closed
+
+    def _close_raw_cdp_target(
+        self,
+        target: dict[str, object],
+        store_key: str,
+    ) -> None:
+        cdp_url = self._attached_cdp_url
+        target_id = str(target.get("id") or "")
+        if not cdp_url or not target_id:
+            raise PortalRunnerError("Raw CDP batch target cannot be closed without its CDP URL and target id.")
+        opener = build_opener(ProxyHandler({}))
+        try:
+            with opener.open(
+                f"{cdp_url.rstrip('/')}/json/close/{target_id}",
+                timeout=2.0,
+            ):
+                pass
+        except Exception as exc:
+            raise PortalRunnerError("Could not request closure of the raw CDP batch target.") from exc
+
+        def target_is_closed() -> bool:
+            try:
+                with opener.open(f"{cdp_url.rstrip('/')}/json/list", timeout=2.0) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+            except Exception:
+                return False
+            if not isinstance(payload, list):
+                return False
+            return all(
+                str(item.get("id") or "") != target_id
+                for item in payload
+                if isinstance(item, dict)
+            )
+
+        self._wait_until(
+            target_is_closed,
+            timeout_seconds=10,
+            message="close raw CDP batch issue tab",
+            interval_seconds=0.2,
+        )
+        self._log(store_key, "raw CDP batch issue tab closed")
 
     def _reset_attached_dppt_site_data(self, home_page: object, store: StoreConfig) -> bool:
         if self.config.portal_browser_backend != "chrome_cdp":
@@ -3157,6 +3388,217 @@ class TaxPortalRunner:
         except Exception:
             return None
         return self._authenticated_page_from_attached_browser(browser, store)
+
+    def _refresh_attached_login_page(
+        self,
+        page: object,
+        store: StoreConfig | None = None,
+    ) -> object | None:
+        if self.config.portal_browser_backend != "chrome_cdp":
+            return None
+        candidates = self._page_candidates(page)
+        for browser in self._attached_cdp_connections:
+            try:
+                for context in list(getattr(browser, "contexts", [])):
+                    for candidate in list(getattr(context, "pages", [])):
+                        if candidate not in candidates:
+                            candidates.append(candidate)
+            except Exception:
+                continue
+        login_page = self._first_login_page(candidates, store)
+        if login_page is not None:
+            return login_page
+
+        target_area = store.effective_portal_area() if store is not None else None
+        raw_login_visible = any(
+            (
+                (match := PORTAL_TPASS_HOST_RE.match(str(target.get("url") or "")))
+                is not None
+                and (target_area is None or match.group(1) == target_area)
+            )
+            for target in self._raw_attached_targets()
+            if target.get("type") == "page"
+        )
+        if not raw_login_visible or self._sync_playwright_factory is None:
+            return None
+        try:
+            browser = self._restart_attached_cdp_transport(store)
+        except Exception:
+            return None
+        try:
+            pages = [
+                candidate
+                for context in list(getattr(browser, "contexts", []))
+                for candidate in list(getattr(context, "pages", []))
+            ]
+        except Exception:
+            return None
+        return self._first_login_page(pages, store)
+
+    def _blank_tpass_gateway_failure(
+        self,
+        store: StoreConfig,
+    ) -> tuple[dict[str, object], dict[str, object]] | None:
+        target_area = store.effective_portal_area()
+        try:
+            targets = self._raw_attached_targets()
+        except Exception:
+            return None
+        for target in targets:
+            if target.get("type") != "page":
+                continue
+            target_url = str(target.get("url") or "")
+            match = PORTAL_TPASS_OAUTH_API_RE.match(target_url)
+            if match is None or match.group(1) != target_area:
+                continue
+            try:
+                snapshot = self._raw_cdp_evaluate(
+                    target,
+                    """
+                    (() => {
+                      const navigation = performance.getEntriesByType('navigation')[0] || null;
+                      return {
+                        readyState: document.readyState,
+                        title: document.title,
+                        bodyText: (document.body && document.body.innerText || '').trim(),
+                        navigationStatus: Number(navigation?.responseStatus || 0),
+                      };
+                    })()
+                    """,
+                )
+            except Exception:
+                continue
+            if not isinstance(snapshot, dict):
+                continue
+            body_text = str(snapshot.get("bodyText") or "").strip()
+            ready_state = str(snapshot.get("readyState") or "")
+            navigation_status = int(snapshot.get("navigationStatus") or 0)
+            if ready_state == "complete" and not body_text and navigation_status >= 400:
+                return target, snapshot
+        return None
+
+    def _restart_dedicated_chrome_after_gateway_error(self, store: StoreConfig) -> object:
+        cdp_url = self._attached_cdp_url
+        user_data_dir = self.config.portal_chrome_cdp_user_data_dir
+        sync_playwright = self._sync_playwright_factory
+        if not cdp_url or user_data_dir is None or sync_playwright is None:
+            raise PortalRunnerError(
+                "Dedicated Chrome cannot be restarted because its CDP URL, user data directory, "
+                "or Playwright factory is unavailable."
+            )
+
+        chrome_executable = self._resolve_dedicated_chrome_executable()
+        parsed_cdp_url = urlparse(cdp_url)
+        if parsed_cdp_url.port is None:
+            raise PortalRunnerError(f"Dedicated Chrome CDP URL has no port: {cdp_url}")
+
+        self._stop_attached_playwright_transport()
+        completed = subprocess.run(
+            ["pkill", "-f", "--", f"--user-data-dir={Path(user_data_dir).resolve()}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode not in {0, 1}:
+            detail = (completed.stderr or completed.stdout or "").strip()
+            raise PortalRunnerError(
+                "Could not stop the dedicated Chrome after a TPass gateway challenge error: "
+                f"{detail or f'pkill exit {completed.returncode}'}"
+            )
+
+        shutdown_deadline = monotonic() + 10.0
+        while monotonic() < shutdown_deadline and self._raw_cdp_endpoint_available():
+            sleep(0.2)
+        if self._raw_cdp_endpoint_available():
+            raise PortalRunnerError("Dedicated Chrome did not stop within 10 seconds after gateway failure.")
+
+        user_data_path = Path(user_data_dir).resolve()
+        user_data_path.mkdir(parents=True, exist_ok=True)
+        log_path = user_data_path / "chrome-cdp.log"
+        launch_url = self.config.portal_home_url_for_store(store)
+        with log_path.open("ab") as log_file:
+            process = subprocess.Popen(
+                [
+                    chrome_executable,
+                    f"--remote-debugging-port={parsed_cdp_url.port}",
+                    f"--user-data-dir={user_data_path}",
+                    "--no-first-run",
+                    "--new-window",
+                    launch_url,
+                ],
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+
+        ready_deadline = monotonic() + 30.0
+        while monotonic() < ready_deadline:
+            if self._raw_cdp_endpoint_available() and any(
+                target.get("type") == "page" for target in self._raw_attached_targets()
+            ):
+                break
+            sleep(0.5)
+        else:
+            raise PortalRunnerError(
+                "Dedicated Chrome restarted after a TPass gateway challenge error but CDP did not "
+                f"become ready within 30 seconds. Check {log_path}."
+            )
+
+        self._log(
+            store.store_key,
+            "dedicated Chrome restarted after TPass gateway challenge error "
+            f"pid={process.pid} launch_url={launch_url}",
+        )
+        browser = self._restart_attached_cdp_transport(store)
+        if not browser.contexts:
+            raise PortalRunnerError("Restarted dedicated Chrome has no browser context.")
+        context = browser.contexts[0]
+        context.set_default_timeout(self.config.portal_action_timeout_ms)
+        page = self._find_attached_portal_page(context, store)
+        return page if page is not None else self._resolve_attached_home_page(context)
+
+    def _raw_cdp_endpoint_available(self) -> bool:
+        cdp_url = self._attached_cdp_url
+        if not cdp_url:
+            return False
+        try:
+            opener = build_opener(ProxyHandler({}))
+            with opener.open(f"{cdp_url.rstrip('/')}/json/version", timeout=2.0) as response:
+                return int(getattr(response, "status", 200) or 200) == 200
+        except Exception:
+            return False
+
+    def _resolve_dedicated_chrome_executable(self) -> str:
+        configured = self.config.portal_chrome_executable_path
+        if configured is not None:
+            return str(configured)
+        for candidate in (
+            Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            Path(
+                "/Applications/Google Chrome for Testing.app/Contents/MacOS/"
+                "Google Chrome for Testing"
+            ),
+        ):
+            if candidate.exists():
+                return str(candidate)
+        raise PortalRunnerError(
+            "Could not locate a Chrome executable for automatic dedicated Chrome restart."
+        )
+
+    def _first_login_page(
+        self,
+        pages: list[object],
+        store: StoreConfig | None = None,
+    ) -> object | None:
+        for candidate in pages:
+            try:
+                if not self._page_matches_portal_area(candidate, store):
+                    continue
+                if self._is_login_page(candidate):
+                    return candidate
+            except Exception:
+                continue
+        return None
 
     def _authenticated_page_from_attached_browser(
         self,

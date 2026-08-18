@@ -16,6 +16,7 @@ from app.portal_runner import (
     QR_REFRESH_GRACE_SECONDS,
     PortalRunnerError,
     TaxPortalRunner,
+    _RawBatchSession,
 )
 from app.state import StateStore
 
@@ -396,7 +397,7 @@ class PortalRunnerUrlTests(unittest.TestCase):
 
             self.assertIsNone(resolved_page)
 
-    def test_run_with_attached_chrome_uses_existing_browser_context(self) -> None:
+    def test_run_with_attached_chrome_stops_after_any_store_failure(self) -> None:
         class FakePage:
             def __init__(self, url: str, body_text: str) -> None:
                 self.url = url
@@ -486,15 +487,38 @@ class PortalRunnerUrlTests(unittest.TestCase):
                 portal_company_switch_name="厦门市思明区浮几创意餐厅",
                 portal_company_verify_name="厦门市思明区浮几创意餐厅",
             )
+            next_store = StoreConfig(
+                store_key="peanut",
+                store_name="Peanut",
+                survey_id="2",
+                output_xlsx_path=tmp_path / "peanut.xlsx",
+                initial_last_processed_id=1,
+                portal_enabled=True,
+                portal_company_verify_name="厦门市思明区花生创意餐厅（个体工商户）",
+            )
+            failed_result = SimpleNamespace(
+                status="failed",
+                submitted_count=0,
+                store_key="fuzzy",
+                error="select-all did not finish",
+            )
 
             with patch.object(runner, "_install_network_diag"):
-                with patch.object(runner, "_run_store", return_value=SimpleNamespace(status="validated")) as mocked_run:
-                    results = runner._run_with_attached_chrome(playwright, [store])  # noqa: SLF001
+                with patch.object(runner, "_run_store", return_value=failed_result) as mocked_run:
+                    with patch.object(runner, "_log") as mocked_log:
+                        results = runner._run_with_attached_chrome(  # noqa: SLF001
+                            playwright,
+                            [store, next_store],
+                        )
 
             self.assertEqual("http://127.0.0.1:9333", chromium.received_cdp_url)
             self.assertEqual(config.portal_action_timeout_ms, browser.context.timeout)
             mocked_run.assert_called_once_with(browser.context, existing_home_page, store)
             self.assertEqual(1, len(results))
+            self.assertIn(
+                "stopping remaining stores because the previous store did not finish safely",
+                [call.args[1].split(" store_key=")[0] for call in mocked_log.call_args_list],
+            )
 
     def test_run_with_attached_chrome_prefers_existing_home_page_tab(self) -> None:
         class FakePage:
@@ -587,6 +611,148 @@ class PortalRunnerUrlTests(unittest.TestCase):
                     runner._run_with_attached_chrome(playwright, [store])  # noqa: SLF001
 
             mocked_run.assert_called_once_with(context, existing_home_page, store)
+
+    def test_run_with_attached_chrome_reconnects_before_next_store_after_raw_transport_stop(self) -> None:
+        class FakePage:
+            def __init__(self, url: str, body_text: str) -> None:
+                self.url = url
+                self.body_text = body_text
+
+            def locator(self, selector: str) -> object:
+                class FakeLocator:
+                    def __init__(self, page: "FakePage") -> None:
+                        self.page = page
+
+                    def inner_text(self) -> str:
+                        return self.page.body_text
+
+                return FakeLocator(self)
+
+        class FakeContext:
+            def __init__(self, page: FakePage) -> None:
+                self.pages = [page]
+                self.timeout = None
+
+            def set_default_timeout(self, timeout: int) -> None:
+                self.timeout = timeout
+
+            def new_page(self) -> FakePage:
+                raise AssertionError("a matching portal page should be reused")
+
+        class FakeBrowser:
+            def __init__(self, page: FakePage) -> None:
+                self.contexts = [FakeContext(page)]
+
+        class FakeChromium:
+            def __init__(self, browser: FakeBrowser) -> None:
+                self.browser = browser
+                self.connect_count = 0
+
+            def connect_over_cdp(self, cdp_url: str) -> FakeBrowser:
+                self.connect_count += 1
+                return self.browser
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config = AppConfig(
+                timezone="Asia/Shanghai",
+                survey_cookie="cookie",
+                survey_export_url="https://example.com/export",
+                survey_export_method="POST",
+                survey_export_body_template="",
+                survey_export_download_url_path=None,
+                survey_extra_headers={},
+                default_attachment_question_id=None,
+                openai_base_url="https://example.com/v1",
+                openai_api_key="key",
+                openai_model="model",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                smtp_username="user",
+                smtp_password="pass",
+                smtp_from="from@example.com",
+                smtp_to=["to@example.com"],
+                template_xlsx_path=tmp_path / "template.xlsx",
+                state_db_path=tmp_path / "state.db",
+                stores_config_path=tmp_path / "stores.yaml",
+                backups_root=tmp_path / "backups",
+                portal_user_data_dir=None,
+                portal_browser_backend="chrome_cdp",
+                portal_chrome_cdp_url="http://127.0.0.1:9333",
+            )
+            runner = TaxPortalRunner(config, StateStore(tmp_path / "state.db"), submit=False)
+            xiamen_page = FakePage(
+                "https://etax.xiamen.chinatax.gov.cn:8443/loginb/",
+                "首页 我要办税 厦门市思明区浮几创意餐厅",
+            )
+            fujian_page = FakePage(
+                "https://etax.fujian.chinatax.gov.cn:8443/loginb/",
+                "首页 我要办税 泉州市鲤城区浮几餐饮店（个体工商户）",
+            )
+            initial_chromium = FakeChromium(FakeBrowser(xiamen_page))
+            peanut_chromium = FakeChromium(FakeBrowser(xiamen_page))
+            fujian_chromium = FakeChromium(FakeBrowser(fujian_page))
+            initial_playwright = SimpleNamespace(chromium=initial_chromium)
+            restarted_playwrights = iter(
+                [
+                    SimpleNamespace(chromium=peanut_chromium, stop=lambda: None),
+                    SimpleNamespace(chromium=fujian_chromium, stop=lambda: None),
+                ]
+            )
+            runner._sync_playwright_factory = lambda: SimpleNamespace(  # noqa: SLF001
+                start=lambda: next(restarted_playwrights)
+            )
+            stores = [
+                StoreConfig(
+                    store_key="fuzzy",
+                    store_name="Fuzzy",
+                    survey_id="1",
+                    output_xlsx_path=tmp_path / "fuzzy.xlsx",
+                    initial_last_processed_id=1,
+                    portal_enabled=True,
+                    portal_area="xiamen",
+                    portal_company_verify_name="厦门市思明区浮几创意餐厅",
+                ),
+                StoreConfig(
+                    store_key="peanut",
+                    store_name="Peanut",
+                    survey_id="2",
+                    output_xlsx_path=tmp_path / "peanut.xlsx",
+                    initial_last_processed_id=1,
+                    portal_enabled=True,
+                    portal_area="xiamen",
+                    portal_company_verify_name="厦门市思明区花生创意餐厅（个体工商户）",
+                ),
+                StoreConfig(
+                    store_key="fuzzy_qz",
+                    store_name="FuzzyQZ",
+                    survey_id="3",
+                    output_xlsx_path=tmp_path / "fuzzy_qz.xlsx",
+                    initial_last_processed_id=1,
+                    portal_enabled=True,
+                    portal_area="fujian",
+                    portal_company_verify_name="泉州市鲤城区浮几餐饮店（个体工商户）",
+                ),
+            ]
+
+            def fake_run_store(context: object, page: object, store: StoreConfig) -> object:
+                if store.store_key in {"fuzzy", "peanut"}:
+                    runner._stop_attached_playwright_transport()  # noqa: SLF001
+                return SimpleNamespace(status="validated")
+
+            with patch.object(runner, "_install_network_diag"):
+                with patch.object(runner, "_run_store", side_effect=fake_run_store) as mocked_run:
+                    results = runner._run_with_attached_chrome(initial_playwright, stores)  # noqa: SLF001
+
+            self.assertEqual(3, len(results))
+            self.assertEqual(1, peanut_chromium.connect_count)
+            self.assertEqual(1, fujian_chromium.connect_count)
+            self.assertIs(initial_chromium.browser.contexts[0], mocked_run.call_args_list[0].args[0])
+            self.assertIs(xiamen_page, mocked_run.call_args_list[0].args[1])
+            self.assertIs(peanut_chromium.browser.contexts[0], mocked_run.call_args_list[1].args[0])
+            self.assertIs(xiamen_page, mocked_run.call_args_list[1].args[1])
+            self.assertIs(fujian_chromium.browser.contexts[0], mocked_run.call_args_list[2].args[0])
+            self.assertIs(fujian_page, mocked_run.call_args_list[2].args[1])
 
     def test_run_with_attached_chrome_falls_back_to_new_home_page_tab(self) -> None:
         class FakePage:
@@ -1120,6 +1286,252 @@ class PortalRunnerUrlTests(unittest.TestCase):
 
             self.assertIs(authenticated_page, returned)
             mocked_attempt.assert_called_once_with(login_page, result, store)
+
+    def test_ensure_logged_in_adopts_new_same_area_tpass_page_before_local_scan(self) -> None:
+        class FakePage:
+            def __init__(self, url: str, body_text: str = "") -> None:
+                self.url = url
+                self.body_text = body_text
+                self.context: object | None = None
+
+            def locator(self, selector: str) -> object:
+                return SimpleNamespace(inner_text=lambda: self.body_text)
+
+        runner = object.__new__(TaxPortalRunner)
+        runner.config = SimpleNamespace(
+            portal_browser_backend="chrome_cdp",
+            portal_login_timeout_minutes=1,
+        )
+        runner._observed_attached_pages = []  # noqa: SLF001
+        runner._attached_cdp_connections = []  # noqa: SLF001
+        runner._sync_playwright_factory = None  # noqa: SLF001
+        loginb_page = FakePage("https://etax.fujian.chinatax.gov.cn:8443/loginb/")
+        tpass_page = FakePage(
+            "https://tpass.fujian.chinatax.gov.cn:8443/#/login?state=fujian",
+            "打开电子税务局APP扫一扫",
+        )
+        context = SimpleNamespace(pages=[loginb_page, tpass_page])
+        loginb_page.context = context
+        tpass_page.context = context
+        store = StoreConfig(
+            store_key="fuzzy_qz",
+            store_name="FuzzyQZ",
+            survey_id="1",
+            output_xlsx_path=Path("/tmp/fuzzy_qz.xlsx"),
+            initial_last_processed_id=1,
+            portal_enabled=True,
+            portal_area="fujian",
+        )
+        result = SimpleNamespace(
+            artifacts_dir=None,
+            store_key="fuzzy_qz",
+            portal_company_role="legal_representative",
+        )
+        authenticated_page = object()
+        monotonic_values = iter([0.0, 1.0, 2.0, 3.0])
+
+        with patch("app.portal_runner.monotonic", side_effect=lambda: next(monotonic_values)), patch(
+            "app.portal_runner.sleep",
+        ), patch.object(
+            runner,
+            "_confirmed_authenticated_page",
+            side_effect=[None, None, None, authenticated_page],
+        ), patch.object(
+            runner,
+            "_refresh_attached_authenticated_page",
+            return_value=None,
+        ), patch.object(
+            runner,
+            "_local_app_login_enabled",
+            return_value=True,
+        ), patch.object(
+            runner,
+            "_attempt_local_app_login",
+            return_value=None,
+        ) as mocked_attempt, patch.object(
+            runner,
+            "_cleanup_imported_login_qrs",
+        ), patch.object(
+            runner,
+            "_log",
+        ) as mocked_log:
+            returned = runner._ensure_logged_in(loginb_page, result, store)  # noqa: SLF001
+
+        self.assertIs(authenticated_page, returned)
+        mocked_attempt.assert_called_once_with(tpass_page, result, store)
+        self.assertIn(
+            "adopting refreshed attached Chrome login page: " + tpass_page.url,
+            [call.args[1] for call in mocked_log.call_args_list],
+        )
+
+    def test_blank_tpass_gateway_failure_detects_completed_empty_http_error_page(self) -> None:
+        runner = object.__new__(TaxPortalRunner)
+        target = {
+            "type": "page",
+            "url": (
+                "https://tpass.fujian.chinatax.gov.cn:8443/api/v1.0/auth/oauth2/login"
+                "?client_id=fujian"
+            ),
+        }
+        store = SimpleNamespace(effective_portal_area=lambda: "fujian")
+        snapshot = {
+            "readyState": "complete",
+            "title": target["url"],
+            "bodyText": "",
+            "navigationStatus": 412,
+        }
+
+        with patch.object(runner, "_raw_attached_targets", return_value=[target]), patch.object(
+            runner,
+            "_raw_cdp_evaluate",
+            return_value=snapshot,
+        ):
+            failure = runner._blank_tpass_gateway_failure(store)  # noqa: SLF001
+
+        self.assertEqual((target, snapshot), failure)
+
+    def test_ensure_logged_in_restarts_dedicated_chrome_once_for_blank_gateway_page(self) -> None:
+        runner = object.__new__(TaxPortalRunner)
+        runner.config = SimpleNamespace(
+            portal_browser_backend="chrome_cdp",
+            portal_login_timeout_minutes=1,
+        )
+        store = SimpleNamespace(effective_portal_area=lambda: "fujian")
+        result = SimpleNamespace(store_key="fuzzy_qz")
+        original_page = object()
+        restarted_page = object()
+        authenticated_page = object()
+        gateway_target = {
+            "url": "https://tpass.fujian.chinatax.gov.cn:8443/api/v1.0/auth/oauth2/login"
+        }
+        gateway_snapshot = {"navigationStatus": 412}
+        monotonic_values = iter([0.0, 1.0, 2.0])
+
+        with patch("app.portal_runner.monotonic", side_effect=lambda: next(monotonic_values)), patch.object(
+            runner,
+            "_confirmed_authenticated_page",
+            side_effect=[None, authenticated_page],
+        ), patch.object(
+            runner,
+            "_blank_tpass_gateway_failure",
+            side_effect=[(gateway_target, gateway_snapshot), None],
+        ), patch.object(
+            runner,
+            "_restart_dedicated_chrome_after_gateway_error",
+            return_value=restarted_page,
+        ) as mocked_restart, patch.object(runner, "_log") as mocked_log:
+            returned = runner._ensure_logged_in(original_page, result, store)  # noqa: SLF001
+
+        self.assertIs(authenticated_page, returned)
+        mocked_restart.assert_called_once_with(store)
+        self.assertIn(
+            "error: detected blank TPass OAuth API gateway challenge",
+            [call.args[1].split(" url=")[0] for call in mocked_log.call_args_list],
+        )
+
+    def test_ensure_logged_in_does_not_restart_blank_gateway_page_twice(self) -> None:
+        runner = object.__new__(TaxPortalRunner)
+        runner.config = SimpleNamespace(
+            portal_browser_backend="chrome_cdp",
+            portal_login_timeout_minutes=1,
+        )
+        store = SimpleNamespace(effective_portal_area=lambda: "fujian")
+        result = SimpleNamespace(store_key="fuzzy_qz")
+        gateway_failure = (
+            {"url": "https://tpass.fujian.chinatax.gov.cn:8443/api/v1.0/auth/oauth2/login"},
+            {"navigationStatus": 412},
+        )
+        monotonic_values = iter([0.0, 1.0, 2.0])
+
+        with patch("app.portal_runner.monotonic", side_effect=lambda: next(monotonic_values)), patch.object(
+            runner,
+            "_confirmed_authenticated_page",
+            return_value=None,
+        ), patch.object(
+            runner,
+            "_blank_tpass_gateway_failure",
+            return_value=gateway_failure,
+        ), patch.object(
+            runner,
+            "_restart_dedicated_chrome_after_gateway_error",
+            return_value=object(),
+        ) as mocked_restart, patch.object(runner, "_log"):
+            with self.assertRaisesRegex(PortalRunnerError, "after one dedicated Chrome restart"):
+                runner._ensure_logged_in(object(), result, store)  # noqa: SLF001
+
+        mocked_restart.assert_called_once_with(store)
+
+    def test_restart_dedicated_chrome_after_gateway_error_reuses_profile_and_store_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            runner = object.__new__(TaxPortalRunner)
+            runner.config = SimpleNamespace(
+                portal_chrome_cdp_user_data_dir=tmp_path / "cdp-profile",
+                portal_chrome_executable_path=tmp_path / "Chrome",
+                portal_action_timeout_ms=15000,
+                portal_home_url_for_store=lambda store: (
+                    "https://etax.fujian.chinatax.gov.cn:8443/loginb/"
+                ),
+            )
+            runner._attached_cdp_url = "http://127.0.0.1:9222"  # noqa: SLF001
+            runner._sync_playwright_factory = object()  # noqa: SLF001
+            store = SimpleNamespace(store_key="fuzzy_qz")
+            page = object()
+            context = SimpleNamespace(
+                pages=[page],
+                set_default_timeout=lambda timeout: None,
+            )
+            browser = SimpleNamespace(contexts=[context])
+            process = SimpleNamespace(pid=12345)
+            endpoint_states = iter([True, False, False, True])
+            monotonic_values = iter([0.0, 1.0, 2.0, 3.0, 4.0])
+
+            with patch("app.portal_runner.monotonic", side_effect=lambda: next(monotonic_values)), patch(
+                "app.portal_runner.sleep",
+            ), patch.object(runner, "_stop_attached_playwright_transport"), patch(
+                "app.portal_runner.subprocess.run",
+                return_value=SimpleNamespace(returncode=0, stderr="", stdout=""),
+            ) as mocked_run, patch(
+                "app.portal_runner.subprocess.Popen",
+                return_value=process,
+            ) as mocked_popen, patch.object(
+                runner,
+                "_raw_cdp_endpoint_available",
+                side_effect=lambda: next(endpoint_states),
+            ), patch.object(
+                runner,
+                "_raw_attached_targets",
+                return_value=[{"type": "page"}],
+            ), patch.object(
+                runner,
+                "_restart_attached_cdp_transport",
+                return_value=browser,
+            ), patch.object(
+                runner,
+                "_find_attached_portal_page",
+                return_value=page,
+            ), patch.object(runner, "_log"):
+                returned = runner._restart_dedicated_chrome_after_gateway_error(store)  # noqa: SLF001
+
+            self.assertIs(page, returned)
+            mocked_run.assert_called_once_with(
+                [
+                    "pkill",
+                    "-f",
+                    "--",
+                    f"--user-data-dir={(tmp_path / 'cdp-profile').resolve()}",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            launch_args = mocked_popen.call_args.args[0]
+            self.assertIn("--remote-debugging-port=9222", launch_args)
+            self.assertIn(f"--user-data-dir={(tmp_path / 'cdp-profile').resolve()}", launch_args)
+            self.assertEqual(
+                "https://etax.fujian.chinatax.gov.cn:8443/loginb/",
+                launch_args[-1],
+            )
 
     def test_confirmed_authenticated_page_rechecks_load_redirect_to_login(self) -> None:
         class FakeLocator:
@@ -1979,6 +2391,241 @@ class PortalRunnerUrlTests(unittest.TestCase):
         self.assertIn("permissionRequest.seen", expression)
         self.assertIn("navigationStatus >= 200", expression)
 
+    def test_raw_cdp_submit_confirms_and_closes_result_dialog_before_returning(self) -> None:
+        runner = object.__new__(TaxPortalRunner)
+        target = {"id": "dppt-1"}
+        result = SimpleNamespace(expected_count=1, submitted_count=0)
+        result_text = "批量开具结果 开具成功发票1份 开具失败发票0份"
+        body_texts = iter(
+            [
+                "本次勾选批量开具发票1份",
+                result_text,
+                "批量开票 共 1 条",
+            ]
+        )
+
+        def fake_wait_until(predicate: object, **kwargs: object) -> None:
+            self.assertTrue(predicate())
+
+        with patch.object(runner, "_wait_until", side_effect=fake_wait_until), patch(
+            "app.portal_runner.sleep",
+        ) as mocked_sleep, patch.object(
+            runner,
+            "_raw_cdp_click_exact_text",
+        ) as mocked_click_text, patch.object(
+            runner,
+            "_raw_cdp_body_text",
+            side_effect=lambda target: next(body_texts),
+        ), patch.object(
+            runner,
+            "_raw_cdp_click_dialog_button",
+        ) as mocked_click_dialog, patch.object(
+            runner,
+            "_close_raw_cdp_target",
+        ) as mocked_close_target, patch.object(
+            runner,
+            "_log",
+        ) as mocked_log:
+            details, success_count, failure_count, modal_text = runner._raw_cdp_submit_batch(  # noqa: SLF001
+                target,
+                "fuzzy",
+                result,
+            )
+
+        self.assertEqual([], details)
+        self.assertEqual(1, success_count)
+        self.assertEqual(0, failure_count)
+        self.assertEqual(result_text, modal_text)
+        self.assertEqual(1, result.submitted_count)
+        self.assertEqual(
+            ["批量开具", "确定"],
+            [call.args[1] for call in mocked_click_text.call_args_list],
+        )
+        self.assertEqual(
+            [1.0, 1.0],
+            [call.args[0] for call in mocked_sleep.call_args_list],
+        )
+        mocked_click_dialog.assert_called_once_with(target, "批量开具结果", "关闭")
+        mocked_close_target.assert_called_once_with(target, "fuzzy")
+        self.assertIn(
+            "raw CDP portal issue result confirmed and closed",
+            [call.args[1] for call in mocked_log.call_args_list],
+        )
+
+    def test_raw_cdp_select_all_uses_header_and_verifies_every_imported_row(self) -> None:
+        runner = object.__new__(TaxPortalRunner)
+        target = {"id": "dppt-1"}
+
+        def fake_wait_until(predicate: object, **kwargs: object) -> None:
+            self.assertTrue(predicate())
+
+        with patch.object(runner, "_wait_until", side_effect=fake_wait_until), patch(
+            "app.portal_runner.sleep",
+        ) as mocked_sleep, patch.object(
+            runner,
+            "_raw_cdp_evaluate",
+            side_effect=[2, {"found": True, "checked": True, "count": 1}, 2],
+        ) as mocked_evaluate, patch.object(runner, "_log") as mocked_log:
+            runner._raw_cdp_select_all_batch_rows(target, "fuzzy", 2)  # noqa: SLF001
+
+        self.assertEqual([1.0], [call.args[0] for call in mocked_sleep.call_args_list])
+        select_all_expression = mocked_evaluate.call_args_list[1].args[1]
+        self.assertIn("th.t-table__cell-check", select_all_expression)
+        self.assertIn("thead label.t-checkbox", select_all_expression)
+        self.assertIn("headerLabel.click()", select_all_expression)
+        self.assertIn(
+            "raw CDP select-all verified rows=2",
+            [call.args[1] for call in mocked_log.call_args_list],
+        )
+
+    def test_raw_cdp_dry_run_selects_all_then_closes_batch_tab(self) -> None:
+        runner = object.__new__(TaxPortalRunner)
+        runner.config = SimpleNamespace(
+            portal_sync_from_server=False,
+            portal_block_on_empty_amount=True,
+            portal_browser_backend="chrome_cdp",
+        )
+        runner.submit = False
+        target = {"id": "dppt-1"}
+        events: list[str] = []
+        home_page = SimpleNamespace(
+            url="https://etax.xiamen.chinatax.gov.cn:8443/loginb/",
+        )
+        context = SimpleNamespace(pages=[home_page])
+        home_page.context = context
+        store = StoreConfig(
+            store_key="fuzzy",
+            store_name="Fuzzy",
+            survey_id="1",
+            output_xlsx_path=Path("/tmp/fuzzy.xlsx"),
+            initial_last_processed_id=1,
+            portal_enabled=True,
+            portal_company_verify_name="厦门市思明区浮几创意餐厅",
+        )
+        rows = [object()]
+        summary = SimpleNamespace(row_count=1, total_amount_including_tax=Decimal("123.45"))
+
+        with patch("app.portal_runner.load_portal_issue_rows", return_value=rows), patch(
+            "app.portal_runner.summarize_portal_issue_rows",
+            return_value=summary,
+        ), patch("app.portal_runner.sha256_file", return_value="abc123"), patch.object(
+            runner,
+            "_prepare_artifacts_dir",
+            return_value=Path("/tmp/artifacts"),
+        ), patch.object(runner, "_update_store_step"), patch.object(
+            runner,
+            "_find_attached_portal_page",
+            return_value=home_page,
+        ), patch.object(runner, "_is_home_page", return_value=True), patch.object(
+            runner,
+            "_ensure_logged_in",
+            return_value=home_page,
+        ), patch.object(
+            runner,
+            "_ensure_authenticated_home_page",
+            return_value=home_page,
+        ), patch.object(runner, "_ensure_company", return_value=home_page), patch.object(
+            runner,
+            "_wait_for_home_page_ready",
+        ), patch.object(runner, "_wait_before_open_batch_page"), patch.object(
+            runner,
+            "_wait_for_batch_page",
+            return_value=_RawBatchSession(target),
+        ), patch.object(
+            runner,
+            "_raw_cdp_select_all_batch_rows",
+            side_effect=lambda *_: events.append("select_all"),
+        ), patch(
+            "app.portal_runner.sleep",
+            side_effect=lambda seconds: events.append(f"sleep:{seconds:.0f}s"),
+        ), patch.object(
+            runner,
+            "_close_raw_cdp_target",
+            side_effect=lambda *_: events.append("close_batch_tab"),
+        ), patch.object(
+            runner,
+            "_finalize_result",
+            side_effect=lambda result: result,
+        ), patch.object(runner, "_log"):
+            result = runner._run_store(context, home_page, store)  # noqa: SLF001
+
+        self.assertEqual("validated", result.status)
+        self.assertEqual(["select_all", "sleep:1s", "close_batch_tab"], events)
+
+    def test_raw_cdp_dialog_button_waits_until_scoped_confirm_is_clickable(self) -> None:
+        runner = object.__new__(TaxPortalRunner)
+        target = {"id": "dppt-1"}
+
+        def fake_wait_until(predicate: object, **kwargs: object) -> None:
+            self.assertFalse(predicate())
+            self.assertTrue(predicate())
+
+        with patch.object(runner, "_wait_until", side_effect=fake_wait_until), patch.object(
+            runner,
+            "_raw_cdp_evaluate",
+            side_effect=[
+                {"clicked": False, "reason": "button-not-ready"},
+                {"clicked": True, "tag": "BUTTON"},
+            ],
+        ) as mocked_evaluate:
+            runner._raw_cdp_click_dialog_button(  # noqa: SLF001
+                target,
+                "批量开具结果",
+                "确定",
+            )
+
+        self.assertEqual(2, mocked_evaluate.call_count)
+        expression = mocked_evaluate.call_args.args[1]
+        self.assertIn('[role="dialog"]', expression)
+        self.assertIn("dialog.querySelectorAll", expression)
+        self.assertIn("button-not-ready", expression)
+
+    def test_close_raw_cdp_target_waits_until_batch_tab_disappears(self) -> None:
+        class FakeResponse:
+            def __init__(self, payload: bytes = b"") -> None:
+                self.payload = payload
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return self.payload
+
+        class FakeOpener:
+            def __init__(self) -> None:
+                self.urls: list[str] = []
+                self.responses = iter([FakeResponse(), FakeResponse(b"[]")])
+
+            def open(self, url: str, timeout: float) -> FakeResponse:
+                self.urls.append(url)
+                return next(self.responses)
+
+        runner = object.__new__(TaxPortalRunner)
+        runner._attached_cdp_url = "http://127.0.0.1:9222"  # noqa: SLF001
+        opener = FakeOpener()
+
+        def fake_wait_until(predicate: object, **kwargs: object) -> None:
+            self.assertTrue(predicate())
+
+        with patch("app.portal_runner.build_opener", return_value=opener), patch.object(
+            runner,
+            "_wait_until",
+            side_effect=fake_wait_until,
+        ), patch.object(runner, "_log") as mocked_log:
+            runner._close_raw_cdp_target({"id": "dppt-1"}, "fuzzy")  # noqa: SLF001
+
+        self.assertEqual(
+            [
+                "http://127.0.0.1:9222/json/close/dppt-1",
+                "http://127.0.0.1:9222/json/list",
+            ],
+            opener.urls,
+        )
+        mocked_log.assert_called_once_with("fuzzy", "raw CDP batch issue tab closed")
+
     def test_wait_for_batch_page_refreshes_cdp_when_original_context_misses_new_target(self) -> None:
         class FakePage:
             def __init__(self, url: str) -> None:
@@ -2438,13 +3085,14 @@ class PortalRunnerUrlTests(unittest.TestCase):
                                                 with patch.object(runner, "_wait_for_batch_page", side_effect=fake_wait_for_batch_page):
                                                     with patch.object(runner, "_ensure_batch_page_clean"):
                                                         with patch.object(runner, "_import_workbook"):
-                                                            with patch.object(
-                                                                runner,
-                                                                "_finalize_result",
-                                                                side_effect=lambda result: result,
-                                                            ):
-                                                                with patch.object(runner, "_log"):
-                                                                    result = runner._run_store(context, home_page, store)  # noqa: SLF001
+                                                            with patch.object(runner, "_select_all_rows"):
+                                                                with patch.object(
+                                                                    runner,
+                                                                    "_finalize_result",
+                                                                    side_effect=lambda result: result,
+                                                                ):
+                                                                    with patch.object(runner, "_log"):
+                                                                        result = runner._run_store(context, home_page, store)  # noqa: SLF001
 
             self.assertEqual("validated", result.status)
             self.assertEqual(0, context.new_page_count)
@@ -3896,17 +4544,18 @@ class PortalRunnerUrlTests(unittest.TestCase):
                                                 ):
                                                     with patch.object(runner, "_ensure_batch_page_clean"):
                                                         with patch.object(runner, "_import_workbook"):
-                                                            with patch.object(
-                                                                runner,
-                                                                "_finalize_result",
-                                                                side_effect=lambda result: result,
-                                                            ):
-                                                                with patch.object(runner, "_log"):
-                                                                    result = runner._run_store(  # noqa: SLF001
-                                                                        FakeContext(events, home_page),
-                                                                        home_page,
-                                                                        store,
-                                                                    )
+                                                            with patch.object(runner, "_select_all_rows"):
+                                                                with patch.object(
+                                                                    runner,
+                                                                    "_finalize_result",
+                                                                    side_effect=lambda result: result,
+                                                                ):
+                                                                    with patch.object(runner, "_log"):
+                                                                        result = runner._run_store(  # noqa: SLF001
+                                                                            FakeContext(events, home_page),
+                                                                            home_page,
+                                                                            store,
+                                                                        )
 
             self.assertEqual("validated", result.status)
             self.assertLess(
@@ -4006,17 +4655,18 @@ class PortalRunnerUrlTests(unittest.TestCase):
                                                 with patch.object(runner, "_wait_for_batch_page", side_effect=lambda page, *_: page):
                                                     with patch.object(runner, "_ensure_batch_page_clean"):
                                                         with patch.object(runner, "_import_workbook"):
-                                                            with patch.object(
-                                                                runner,
-                                                                "_finalize_result",
-                                                                side_effect=lambda result: result,
-                                                            ):
-                                                                with patch.object(runner, "_log"):
-                                                                    result = runner._run_store(  # noqa: SLF001
-                                                                        FakeContext(events, home_page),
-                                                                        home_page,
-                                                                        store,
-                                                                    )
+                                                            with patch.object(runner, "_select_all_rows"):
+                                                                with patch.object(
+                                                                    runner,
+                                                                    "_finalize_result",
+                                                                    side_effect=lambda result: result,
+                                                                ):
+                                                                    with patch.object(runner, "_log"):
+                                                                        result = runner._run_store(  # noqa: SLF001
+                                                                            FakeContext(events, home_page),
+                                                                            home_page,
+                                                                            store,
+                                                                        )
 
             self.assertEqual("validated", result.status)
             mocked_goto.assert_not_called()
