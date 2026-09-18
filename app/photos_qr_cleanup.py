@@ -12,6 +12,7 @@ from pathlib import Path
 
 PHOTOS_CLEANUP_TIMEOUT_SECONDS = 45.0
 PHOTOS_CLEANUP_BUNDLE_ID = "com.fuzzy.tax-portal.photos-qr-cleanup"
+PHOTOS_CLEANUP_DISPLAY_NAME = "Tax Portal Photos QR Cleanup"
 PHOTOS_ASSET_EXISTS_SCRIPT = '''
 on run argv
     set assetID to item 1 of argv
@@ -21,8 +22,56 @@ on run argv
 end run
 '''.strip()
 PHOTOS_DELETE_CONFIRM_SCRIPT = f'''
-tell application "System Events"
-    repeat 150 times
+on run argv
+    set deadline to (current date) + (item 1 of argv as real)
+    set clickAttempts to 0
+    set absentPolls to 0
+    set clickMethod to "click"
+    set lastStatus to "watching"
+    log lastStatus
+    repeat while (current date) < deadline
+        try
+            with timeout of 2 seconds
+                set scanResult to my scanDeleteDialog(clickMethod)
+            end timeout
+        on error errorMessage number errorNumber
+            set scanResult to {{"scan-error", errorNumber as text}}
+        end try
+        set scanStatus to item 1 of scanResult
+        set scanDetail to item 2 of scanResult
+        if scanStatus is "clicked" or scanStatus is "click-error" then
+            set clickAttempts to clickAttempts + 1
+            set absentPolls to 0
+            log scanStatus & " attempt=" & clickAttempts & " method=" & clickMethod & " " & scanDetail
+            if clickMethod is "click" then
+                set clickMethod to "AXPress"
+            else
+                set clickMethod to "click"
+            end if
+            -- A successful accessibility call does not prove that the dialog closed.
+            delay 0.6
+        else
+            if scanStatus is "not-found" and clickAttempts > 0 then
+                set absentPolls to absentPolls + 1
+                if absentPolls >= 3 then return "dialog-dismissed attempts=" & clickAttempts
+            else
+                set absentPolls to 0
+            end if
+            if scanStatus is not lastStatus then log scanStatus & " " & scanDetail
+            delay 0.2
+        end if
+        set lastStatus to scanStatus
+    end repeat
+    return "timed-out status=" & lastStatus & " attempts=" & clickAttempts
+end run
+
+on isCleanupDeleteDialog(dialogText, hasDenyButton)
+    return hasDenyButton and (dialogText contains "{PHOTOS_CLEANUP_BUNDLE_ID}" or dialogText contains "photos-qr-cleanup-" or dialogText contains "{PHOTOS_CLEANUP_DISPLAY_NAME}") and (dialogText contains "删除这张照片" or dialogText contains "delete this photo" or dialogText contains "Delete This Photo" or dialogText contains "This photo will be deleted from both iCloud")
+end isCleanupDeleteDialog
+
+on scanDeleteDialog(clickMethod)
+    set hadScanError to false
+    tell application "System Events"
         set candidateProcesses to (application processes whose bundle identifier is "com.apple.UserNotificationCenter")
         set candidateProcesses to candidateProcesses & (application processes whose bundle identifier is "{PHOTOS_CLEANUP_BUNDLE_ID}")
         set candidateProcesses to candidateProcesses & (application processes whose name is "photos-qr-cleanup")
@@ -63,7 +112,7 @@ tell application "System Events"
                             if elementValue is not missing value then set dialogText to dialogText & " " & (elementValue as text)
                         end try
                     end repeat
-                    if hasDenyButton and (dialogText contains "{PHOTOS_CLEANUP_BUNDLE_ID}" or dialogText contains "photos-qr-cleanup-") and (dialogText contains "删除这张照片" or dialogText contains "delete this photo" or dialogText contains "Delete This Photo" or dialogText contains "This photo will be deleted from both iCloud") then
+                    if my isCleanupDeleteDialog(dialogText, hasDenyButton) then
                         repeat with currentElement in dialogElements
                             try
                                 set elementName to name of currentElement as text
@@ -77,19 +126,36 @@ tell application "System Events"
                             end try
                             try
                                 if role of currentElement is "AXButton" and (elementName is "删除" or elementName is "Delete" or elementDescription is "删除" or elementDescription is "Delete") then
-                                    click currentElement
-                                    return "confirmed"
+                                    if not (enabled of currentElement) then return {{"button-disabled", ""}}
+                                    try
+                                        set frontmost of currentProcess to true
+                                    end try
+                                    try
+                                        if clickMethod is "AXPress" then
+                                            perform action "AXPress" of currentElement
+                                        else
+                                            click currentElement
+                                        end if
+                                        return {{"clicked", ""}}
+                                    on error errorMessage number errorNumber
+                                        return {{"click-error", errorNumber as text}}
+                                    end try
                                 end if
+                            on error
+                                set hadScanError to true
                             end try
                         end repeat
+                        return {{"button-not-found", ""}}
                     end if
                 end repeat
+            on error
+                set hadScanError to true
             end try
         end repeat
-        delay 0.2
-    end repeat
-    return "not-found"
-end tell
+    end tell
+    if hadScanError then return {{"scan-error", "unable to read a candidate window"}}
+    return {{"not-found", ""}}
+end scanDeleteDialog
 '''.strip()
 
 
@@ -148,26 +214,31 @@ def delete_imported_qr_from_photos(imported_qr: ImportedPhotosQr) -> str:
         str(imported_qr.height),
     ]
     confirmation_watcher = _start_delete_confirmation_watcher()
+    helper_error: OSError | subprocess.TimeoutExpired | None = None
     try:
-        try:
-            completed = subprocess.run(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=PHOTOS_CLEANUP_TIMEOUT_SECONDS,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise PhotosQrCleanupError(f"Photos QR cleanup helper failed to run: {exc}") from exc
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=PHOTOS_CLEANUP_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        helper_error = exc
     finally:
-        _stop_delete_confirmation_watcher(confirmation_watcher)
+        confirmation_diagnostics = _stop_delete_confirmation_watcher(confirmation_watcher)
+    diagnostic_suffix = f" Confirmation watcher: {confirmation_diagnostics}"
+    if helper_error is not None:
+        raise PhotosQrCleanupError(
+            f"Photos QR cleanup helper failed to run: {helper_error}.{diagnostic_suffix}"
+        ) from helper_error
     error_output = (completed.stderr or "").strip()
     if completed.returncode != 0:
         detail = error_output or f"exit status {completed.returncode}"
-        raise PhotosQrCleanupError(detail)
+        raise PhotosQrCleanupError(detail + diagnostic_suffix)
     if _photos_asset_exists(imported_qr.asset_id):
         raise PhotosQrCleanupError(
-            "Photos QR cleanup app exited but the verified asset is still present."
+            "Photos QR cleanup app exited but the verified asset is still present." + diagnostic_suffix
         )
     return "deleted"
 
@@ -194,28 +265,34 @@ def _photos_asset_exists(asset_id: str) -> bool:
     raise PhotosQrCleanupError(f"Photos asset verification returned unexpected output: {output!r}")
 
 
-def _start_delete_confirmation_watcher() -> subprocess.Popen[str] | None:
+def _start_delete_confirmation_watcher() -> subprocess.Popen[str]:
     try:
         return subprocess.Popen(
-            ["/usr/bin/osascript", "-e", PHOTOS_DELETE_CONFIRM_SCRIPT],
+            [
+                "/usr/bin/osascript", "-e", PHOTOS_DELETE_CONFIRM_SCRIPT,
+                str(PHOTOS_CLEANUP_TIMEOUT_SECONDS),
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
-    except OSError:
-        return None
+    except OSError as exc:
+        raise PhotosQrCleanupError(f"Unable to start Photos delete confirmation watcher: {exc}") from exc
 
 
-def _stop_delete_confirmation_watcher(watcher: subprocess.Popen[str] | None) -> None:
+def _stop_delete_confirmation_watcher(watcher: subprocess.Popen[str] | None) -> str:
     if watcher is None:
-        return
+        return "not-started"
     try:
         if watcher.poll() is None:
             watcher.terminate()
-        watcher.communicate(timeout=2.0)
+        stdout, stderr = watcher.communicate(timeout=2.0)
     except subprocess.TimeoutExpired:
         watcher.kill()
-        watcher.communicate()
+        stdout, stderr = watcher.communicate()
+    # Keep the last attempts and any AppleScript error without flooding runner logs.
+    output = " | ".join((stderr or "").splitlines() + (stdout or "").splitlines())
+    return output[-2000:] or "stopped without diagnostic output"
 
 
 def _ensure_photos_cleanup_helper() -> Path:
@@ -258,7 +335,7 @@ def _ensure_photos_cleanup_helper() -> Path:
             {
                 "CFBundleExecutable": "photos-qr-cleanup",
                 "CFBundleIdentifier": PHOTOS_CLEANUP_BUNDLE_ID,
-                "CFBundleName": "Tax Portal Photos QR Cleanup",
+                "CFBundleName": PHOTOS_CLEANUP_DISPLAY_NAME,
                 "CFBundlePackageType": "APPL",
                 "CFBundleShortVersionString": "1.0",
                 "CFBundleVersion": "1",

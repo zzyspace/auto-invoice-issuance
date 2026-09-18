@@ -263,6 +263,7 @@ env -u http_proxy -u https_proxy PLAYWRIGHT_BROWSERS_PATH=./data/ms-playwright .
 - 完成一次 `照片` app 首次初始化
 - 允许 `osascript` 自动化控制 `照片`，用于后台导入二维码；runner 会在导入前后隐藏 `照片` 主窗口
 - 首次自动清理二维码时，允许 `Tax Portal Photos QR Cleanup` 完全访问照片图库；没有完整权限或精确校验失败时只记录警告，不会删除任何照片，也不会阻断开票
+- 清理时会等待系统删除确认框的按钮可用；首次点击后弹窗仍在时会重新定位并重试，最后按原照片 ID 核验删除结果。失败警告中的 `Confirmation watcher` 会保留弹窗查找、按钮状态和点击错误，便于排查偶发漏点
 - 确保税务验证码会同步到 macOS `信息`
 - 首次使用时，建议先手工确认 `电子税务局` app 的短信登录、身份类型选择、指纹提示、扫码页、内部照片选择器都能正常出现
 
