@@ -14,6 +14,7 @@ from time import monotonic, sleep, time_ns
 from typing import Callable, Iterable
 
 from app.models import AppConfig
+from app.portal_diagnostics import diagnostic_step
 from app.photos_qr_cleanup import ImportedPhotosQr, PhotosQrCleanupError, describe_imported_qr
 from app.utils import ensure_parent_dir
 from app.vision_client import OpenAICompatibleVisionClient
@@ -521,6 +522,7 @@ class PortalMacLoginAutomator:
         self._startup_reminder_handled = False
         self._vision_client: OpenAICompatibleVisionClient | None = None
         self.imported_qr: ImportedPhotosQr | None = None
+        self._diagnostics = None
 
     @staticmethod
     def is_enabled(config: AppConfig) -> bool:
@@ -563,6 +565,7 @@ class PortalMacLoginAutomator:
                 f"电子税务局 app not found at {self._etax_app_path}. Set TAX_PORTAL_ETAX_APP_PATH explicitly."
             )
 
+    @diagnostic_step("app_permissions")
     def _verify_gui_automation_prerequisites(self) -> None:
         self._log("checking macOS GUI automation permissions")
         if not self._ax.is_process_trusted():
@@ -571,6 +574,7 @@ class PortalMacLoginAutomator:
                 "Enable Accessibility for the actual Python executable used by ./tax-portal, then retry."
             )
 
+    @diagnostic_step("capture_login_qr")
     def _capture_qr_code(self, page: object, artifacts_dir: Path | None) -> Path:
         self._log("saving tax portal login QR from page data URL")
         target_dir = artifacts_dir or Path(mkdtemp(prefix="portal-local-login-"))
@@ -626,6 +630,7 @@ class PortalMacLoginAutomator:
                     continue
         return False
 
+    @diagnostic_step("import_qr_into_photos")
     def _import_qr_into_photos(self, qr_path: Path) -> ImportedPhotosQr:
         self._log(f"importing tax portal login QR into Photos path={qr_path}")
         try:
@@ -680,10 +685,12 @@ class PortalMacLoginAutomator:
         bundle_id = str(payload.get("CFBundleIdentifier") or "").strip()
         return bundle_id or ETAX_APP_BUNDLE_ID_FALLBACK
 
+    @diagnostic_step("launch_etax_app")
     def _launch_etax_app(self) -> None:
         self._log(f"launching 电子税务局 app path={self._etax_app_path}")
         self._run_command(["open", "-a", str(self._etax_app_path)], timeout_seconds=10.0)
 
+    @diagnostic_step("wait_etax_app")
     def _wait_for_process(self, bundle_id: str, *, timeout_seconds: float) -> None:
         self._log("waiting for 电子税务局 app process")
         deadline = monotonic() + timeout_seconds
@@ -723,6 +730,7 @@ class PortalMacLoginAutomator:
             raise PortalLocalLoginError(f"Timed out waiting for accessible UI in process {bundle_id}.")
         raise PortalLocalLoginError(f"Timed out waiting for process {bundle_id}.")
 
+    @diagnostic_step("app_login")
     def _ensure_etax_session(self, bundle_id: str) -> None:
         self._log("navigating 电子税务局 app login flow")
         self._activate_application(bundle_id)
@@ -958,6 +966,7 @@ class PortalMacLoginAutomator:
             return True, first_line
         raise ValueError(f"Unsupported startup reminder OCR response: {response!r}")
 
+    @diagnostic_step("app_open_scanner")
     def _open_scan_flow(self, bundle_id: str) -> None:
         self._log("opening scan flow in 电子税务局 app")
         self._open_home_tab(bundle_id)
@@ -966,11 +975,13 @@ class PortalMacLoginAutomator:
         self._wait_for_scan_page_ready(bundle_id)
         self._open_album_from_scan_page(bundle_id)
 
+    @diagnostic_step("app_home")
     def _open_home_tab(self, bundle_id: str) -> None:
         self._log("opening 首页 tab in 电子税务局 app")
         self._activate_application(bundle_id)
         self._click_etax_tabbar_item(bundle_id, 0)
 
+    @diagnostic_step("app_switch_area")
     def _ensure_home_portal_area(self, bundle_id: str) -> None:
         if not self.portal_area_name:
             return
@@ -1201,6 +1212,7 @@ class PortalMacLoginAutomator:
             return None
         return candidate
 
+    @diagnostic_step("app_select_qr")
     def _select_latest_qr_from_album(self, bundle_id: str) -> None:
         self._log("selecting latest imported QR image from album")
         try:
@@ -1222,6 +1234,7 @@ class PortalMacLoginAutomator:
             sleep(VISIBLE_ELEMENT_POLL_SECONDS)
         self._click_etax_latest_photo(bundle_id)
 
+    @diagnostic_step("app_confirm_scan_login")
     def _confirm_scan_login(self, bundle_id: str) -> None:
         self._log("confirming scan login in 电子税务局 app")
         self._activate_application(bundle_id)
@@ -1236,6 +1249,7 @@ class PortalMacLoginAutomator:
             sleep(0.3)
         raise PortalLocalLoginError("Timed out waiting for 电子税务局 scan page.")
 
+    @diagnostic_step("app_open_album")
     def _open_album_from_scan_page(self, bundle_id: str) -> None:
         self._log("opening album from scan page")
         for attempt in range(1, SCAN_ALBUM_OPEN_ATTEMPTS + 1):
@@ -1324,6 +1338,7 @@ class PortalMacLoginAutomator:
         has_confirmation = any("登录确认" in text for text in texts) or any("确认" in text for text in texts)
         return has_login and has_confirmation and not self._is_scan_page_visible(bundle_id)
 
+    @diagnostic_step("app_request_sms")
     def _request_sms_code(self, bundle_id: str) -> None:
         self._log("requesting SMS verification code")
         for attempt in range(1, SMS_REQUEST_RETRY_ATTEMPTS + 1):
@@ -1343,6 +1358,7 @@ class PortalMacLoginAutomator:
             sleep(0.3)
         return False
 
+    @diagnostic_step("app_select_role")
     def _confirm_role_selection(self, bundle_id: str, *, role_already_selected: bool = False) -> str:
         state = "role_dialog"
         for attempt in range(1, ROLE_DIALOG_CONFIRM_ATTEMPTS + 1):
@@ -1393,6 +1409,7 @@ class PortalMacLoginAutomator:
             left, top, width, height = bounds
         self._click_at_for_bundle(bundle_id, left + width * x_ratio, top + height * y_ratio)
 
+    @diagnostic_step("app_dismiss_fingerprint_prompt")
     def _dismiss_fingerprint_prompt(self, bundle_id: str) -> None:
         self._activate_application(bundle_id)
         try:
@@ -1483,6 +1500,7 @@ class PortalMacLoginAutomator:
             "立即登录" in text for text in texts
         )
 
+    @diagnostic_step("app_wait_sms_autofill")
     def _try_fill_otp_from_system_prompt(self, bundle_id: str) -> bool:
         self._log("waiting for macOS one-time-code prompt")
         deadline = monotonic() + OTP_AUTOFILL_TIMEOUT_SECONDS
@@ -1498,6 +1516,7 @@ class PortalMacLoginAutomator:
             sleep(0.5)
         return False
 
+    @diagnostic_step("app_wait_sms_messages")
     def _read_latest_sms_code_from_messages(self) -> str:
         expected_issuer = self._expected_tax_verification_issuer()
         if expected_issuer:
@@ -2078,3 +2097,18 @@ class PortalMacLoginAutomator:
 
     def _log(self, message: str) -> None:
         self._logger(self.store_key, message)
+
+    def _diagnostic_failure(self, exc: BaseException, args: tuple) -> None:
+        diagnostics = self._diagnostics
+        if diagnostics is None:
+            return
+        # Read only this app's AX tree; do not collect text fields or Messages content.
+        bundle_id = self._resolve_app_bundle_identifier()
+        pids = self._find_process_pids(bundle_id)
+        nodes = []
+        for pid in pids:
+            nodes.extend(self._ax.find_nodes(pid))
+        texts = [text for node in nodes if node.role == "AXStaticText" for text in node.texts]
+        markers = ("登录", "验证码", "身份切换", "扫一扫", "登录确认", "选择身份", "暂不设置", "首页", "我的")
+        diagnostics.emit("app.snapshot", error_type=type(exc).__name__, pids=pids, node_count=len(nodes),
+                         markers=[marker for marker in markers if any(marker in text for text in texts)])

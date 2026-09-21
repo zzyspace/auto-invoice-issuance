@@ -230,6 +230,32 @@ env -u http_proxy -u https_proxy PLAYWRIGHT_BROWSERS_PATH=./data/ms-playwright .
 ./tax-portal run --store-key fuzzy --skip-sync
 ```
 
+每次 `run` / `dry-run` 从 runner 启动起默认保存诊断记录，无需额外开关。终端第一条
+`diagnostics directory=...` 指向本次目录，默认位于
+`data/tax-portal-artifacts/runs/<UTC时间-唯一编号>/`：
+
+- `events.jsonl`：带时间、运行编号、门店和步骤的日志；记录步骤开始/结束/耗时、异常堆栈、
+  页面跳转、HTTP 错误、请求失败、页面 JavaScript 错误，以及登录等待状态。
+- `status.json`：运行 PID、最后更新时间、当前步骤、最后日志/异常、最终状态；每 15 秒写一次心跳，
+  即使主流程阻塞在 App 自动化、网络或等待验证码中，也能看到停留步骤。
+- `failure-*.png` / `raw-failure.png`：尽可能在关闭失败页面前保存现场；截图失败本身也会留记录。
+  `<门店>/` 保存原有二维码、提交结果等产物，历史记录中的 `artifacts_dir` 指向该子目录。
+
+步骤覆盖工作簿同步/读取、浏览器连接、网页登录、App 权限、二维码保存/导入照片、短信登录、
+身份/地区选择、相册选图、扫码确认、企业切换、打开批量页、导入校验、勾选、提交和结果关闭。
+Playwright 页面自动记录跳转和网络错误；切换到 raw CDP 后保留步骤日志，失败时采集当前页面
+状态及最近请求状态摘要，不额外建立长期调试连接。
+
+排查时先看 `status.json`，再看同目录的 `events.jsonl`。`Ctrl+C`、`SIGTERM`、`SIGHUP`
+会尽量保存中断堆栈和门店失败状态；强制杀进程（`SIGKILL`）、断电等无法写结束记录，
+此时应结合最后心跳和 PID 是否存活判断，不能仅凭 `running` 认为还在运行。
+如果尚未读完工作簿，没有可记录的开票结果，则只更新门店状态及诊断文件。
+
+新增结构化日志会脱敏已配置的账号密码、密钥、URL 查询值和邮箱；页面摘要仅记录固定状态标记、
+页面状态和请求元数据，不读取表单值、Cookie 值或网络正文。新增 Playwright 现场截图遮罩输入框
+及二维码；原有二维码/业务截图和 raw CDP 截图仍只保存在本机。单次事件日志超过 8 MiB 时轮转，
+保留当前与上一段；诊断写入失败会提示一次并继续原流程。
+
 税务局 runner 相关环境变量：
 
 - `TAX_PORTAL_USER_DATA_DIR`: 本机浏览器持久化 profile 目录，建议使用独立目录

@@ -5,7 +5,10 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
+import threading
+import traceback
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -21,6 +24,7 @@ from app.photos_qr_cleanup import (
     delete_imported_qr_from_photos,
 )
 from app.portal_local_login import PortalLocalLoginError, PortalMacLoginAutomator
+from app.portal_diagnostics import PAGE_SNAPSHOT_JS, PortalDiagnostics, diagnostic_step
 from app.portal_sync import PortalWorkbookSyncer
 from app.portal_workbook import load_portal_issue_rows, sha256_file, summarize_portal_issue_rows
 from app.state import StateStore
@@ -95,6 +99,9 @@ class TaxPortalRunner:
         self._observed_attached_pages: list[object] = []
         self._dialog_inert_context_ids: set[int] = set()
         self._dialog_inert_page_ids: set[int] = set()
+        self._diagnostics: PortalDiagnostics | None = None
+        self._diagnostic_store: StoreConfig | None = None
+        self._diagnostic_result: PortalIssueResult | None = None
         if config.portal_browser_backend not in {"playwright", "chrome_cdp"}:
             raise ValueError(
                 "TAX_PORTAL_BROWSER_BACKEND must be one of: playwright, chrome_cdp."
@@ -103,6 +110,55 @@ class TaxPortalRunner:
             raise ValueError("TAX_PORTAL_USER_DATA_DIR is required for portal runner commands.")
 
     def run(self, stores: list[StoreConfig]) -> list[PortalIssueResult]:
+        root = self.config.portal_artifacts_dir or Path("data/tax-portal-artifacts")
+        diagnostics = PortalDiagnostics(
+            root, mode="submit" if self.submit else "dry_run",
+            backend=self.config.portal_browser_backend, stores=[store.store_key for store in stores],
+            action_timeout_ms=self.config.portal_action_timeout_ms,
+            login_timeout_minutes=self.config.portal_login_timeout_minutes,
+            local_app_login_enabled=self._local_app_login_enabled(),
+            runner_sha256=sha256_file(Path(__file__)),
+            secrets=[getattr(self.config, name, None) for name in (
+                "portal_etax_app_username", "portal_etax_app_password", "openai_api_key",
+                "survey_cookie", "smtp_password",
+            )],
+        )
+        self._diagnostics = diagnostics
+        self._log("runner", f"diagnostics directory={diagnostics.directory}")
+        previous_handlers = {}
+
+        def interrupted(signum, _frame):
+            raise KeyboardInterrupt(f"received {signal.Signals(signum).name}")
+
+        try:
+            if threading.current_thread() is threading.main_thread():
+                for signum in (signal.SIGTERM, signal.SIGHUP):
+                    previous_handlers[signum] = signal.signal(signum, interrupted)
+            results = self._run_browser(stores)
+        except BaseException as exc:
+            diagnostics.emit("run.failed", error_type=type(exc).__name__, error=str(exc),
+                             failure_step=getattr(exc, "portal_diagnostic_step", diagnostics.state["step"]),
+                             traceback=traceback.format_exc())
+            diagnostics.finish(
+                "interrupted" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else "failed",
+                step=getattr(exc, "portal_diagnostic_step", diagnostics.state["step"]),
+                store_key=getattr(exc, "portal_diagnostic_store", None),
+            )
+            raise
+        else:
+            diagnostics.finish(
+                "failed" if any(result.status == "failed" for result in results) else "success",
+                step=results[-1].step if results else "complete",
+                store_key=results[-1].store_key if results else None,
+            )
+            return results
+        finally:
+            for signum, previous in previous_handlers.items():
+                signal.signal(signum, previous)
+            self._diagnostics = None
+
+    @diagnostic_step("browser_session")
+    def _run_browser(self, stores: list[StoreConfig]) -> list[PortalIssueResult]:
         sync_playwright = self._load_sync_playwright()
         if self.config.portal_browser_backend == "chrome_cdp":
             self._sync_playwright_factory = sync_playwright
@@ -249,6 +305,40 @@ class TaxPortalRunner:
         return page
 
     def _run_store(self, context: object, home_page: object, store: StoreConfig) -> PortalIssueResult:
+        diagnostics = getattr(self, "_diagnostics", None)
+        if diagnostics is None:
+            return self._run_store_impl(context, home_page, store)
+        self._diagnostic_store = store
+        self._diagnostic_result = None
+        diagnostics.state["store_key"] = store.store_key
+        diagnostics.observe_context(context)
+        diagnostics.emit("store.started", workbook=store.output_xlsx_path.name)
+        try:
+            result = self._run_store_impl(context, home_page, store)
+            diagnostics.emit("store.finished", status=result.status, result_step=result.step,
+                             expected_count=result.expected_count, submitted_count=result.submitted_count,
+                             success_count=result.success_count, failure_count=result.failure_count,
+                             artifacts_dir=str(result.artifacts_dir), error=result.error)
+            return result
+        except BaseException as exc:
+            exc.portal_diagnostic_store = store.store_key
+            step = getattr(exc, "portal_diagnostic_step", diagnostics.state["step"])
+            diagnostics.emit("store.failed", failure_step=step, error_type=type(exc).__name__,
+                             error=str(exc), traceback=traceback.format_exc())
+            result = self._diagnostic_result
+            if result is not None and result.finished_at is None:
+                result.status, result.step = "failed", step
+                result.error = f"{type(exc).__name__}: {exc}"
+                self._finalize_result(result)
+            else:
+                self._update_store_step(store.store_key, step, "failed", error=f"{type(exc).__name__}: {exc}")
+            raise
+        finally:
+            self._diagnostic_store = None
+            self._diagnostic_result = None
+            diagnostics.state["store_key"] = None
+
+    def _run_store_impl(self, context: object, home_page: object, store: StoreConfig) -> PortalIssueResult:
         active_page = home_page
         if self.config.portal_sync_from_server:
             remote_output_dir = (self.config.portal_sync_remote_output_dir or "").rstrip("/")
@@ -261,17 +351,12 @@ class TaxPortalRunner:
                     f"{self.config.portal_sync_remote_host}:{remote_output_dir}/{store.output_xlsx_path.name}"
                 ),
             )
-            self.syncer.sync_store_workbook(store)
+            self._sync_store_workbook(store)
             self._log(
                 store.store_key,
                 f"step=sync_workbook status=running synced workbook to {store.output_xlsx_path}",
             )
-        rows = load_portal_issue_rows(
-            store.output_xlsx_path,
-            block_on_empty_amount=self.config.portal_block_on_empty_amount,
-        )
-        summary = summarize_portal_issue_rows(rows)
-        workbook_sha = sha256_file(store.output_xlsx_path)
+        rows, summary, workbook_sha = self._prepare_workbook(store)
         result = PortalIssueResult(
             store_key=store.store_key,
             store_name=store.store_name,
@@ -289,6 +374,7 @@ class TaxPortalRunner:
             step="prepare_workbook",
             artifacts_dir=self._prepare_artifacts_dir(store.store_key),
         )
+        self._diagnostic_result = result
         self._update_store_step(
             store.store_key,
             result.step,
@@ -338,10 +424,13 @@ class TaxPortalRunner:
                 home_url = self.config.portal_home_url_for_store(store)
                 self._log(store.store_key, f"opening portal home page: {home_url}")
                 self._goto(home_url, home_page)
+            active_page = home_page
             home_page = self._ensure_logged_in(home_page, result, store)
+            active_page = home_page
             home_page = self._ensure_authenticated_home_page(home_page, result, store)
             context = getattr(home_page, "context", context)
             home_page = self._ensure_company(home_page, store, result)
+            active_page = home_page
             self._wait_for_home_page_ready(home_page, store)
             self._wait_before_open_batch_page(store.store_key)
             batch_page: object | None = None
@@ -536,6 +625,10 @@ class TaxPortalRunner:
                     )
                     sleep(POST_SUBMIT_SUCCESS_WAIT_SECONDS)
                 return self._finalize_result(result)
+            except BaseException as exc:
+                # Capture before the batch tab is closed by finally.
+                self._diagnostic_failure(exc, (batch_page or active_page,))
+                raise
             finally:
                 try:
                     if batch_page is not None:
@@ -544,11 +637,57 @@ class TaxPortalRunner:
                     pass
         except Exception as exc:  # noqa: BLE001
             result.status = "failed"
-            result.step = result.step or "unknown"
+            result.step = getattr(exc, "portal_diagnostic_step", result.step or "unknown")
             result.error = str(exc)
+            self._diagnostic_failure(exc, (active_page,))
             self._log(store.store_key, f"step={result.step} status=failed error={result.error}")
             self._capture_artifact(active_page, result.artifacts_dir, f"{store.store_key}-failure")
             return self._finalize_result(result)
+
+    @diagnostic_step("sync_workbook")
+    def _sync_store_workbook(self, store: StoreConfig) -> None:
+        self.syncer.sync_store_workbook(store)
+
+    @diagnostic_step("prepare_workbook")
+    def _prepare_workbook(self, store: StoreConfig):
+        rows = load_portal_issue_rows(
+            store.output_xlsx_path,
+            block_on_empty_amount=self.config.portal_block_on_empty_amount,
+        )
+        return rows, summarize_portal_issue_rows(rows), sha256_file(store.output_xlsx_path)
+
+    def _diagnostic_step_changed(self, step: str) -> None:
+        store = getattr(self, "_diagnostic_store", None)
+        result = getattr(self, "_diagnostic_result", None)
+        if store is None or (result is not None and result.finished_at is not None):
+            return
+        self.state_store.update_portal_issue_state(
+            store.store_key, current_step=step, last_status="running",
+            workbook_sha256=result.workbook_sha256 if result is not None else None,
+        )
+
+    def _diagnostic_failure(self, exc: BaseException, args: tuple) -> None:
+        diagnostics = getattr(self, "_diagnostics", None)
+        if diagnostics is None or getattr(exc, "portal_diagnostic_captured", False):
+            return
+        exc.portal_diagnostic_captured = True
+        diagnostics.emit("operation.failed", error_type=type(exc).__name__, error=str(exc),
+                         failure_step=getattr(exc, "portal_diagnostic_step", diagnostics.state["step"]),
+                         traceback=traceback.format_exc())
+        for candidate in args:
+            if isinstance(candidate, _RawBatchSession):
+                candidate = candidate.target
+            if isinstance(candidate, dict) and candidate.get("webSocketDebuggerUrl"):
+                try:
+                    snapshot = self._raw_cdp_evaluate(candidate, f"({PAGE_SNAPSHOT_JS})()")
+                    diagnostics.emit("raw_page.snapshot", snapshot=snapshot)
+                except Exception as capture_error:
+                    diagnostics.emit("snapshot.failed", url=candidate.get("url"), error=str(capture_error))
+                self._capture_raw_cdp_artifact(candidate, diagnostics.directory, "raw-failure")
+                break
+            if hasattr(candidate, "url"):
+                diagnostics.snapshot(candidate, reason="failure", screenshot=True)
+                break
 
     @staticmethod
     def _should_abort_remaining_stores(result: PortalIssueResult) -> bool:
@@ -568,6 +707,7 @@ class TaxPortalRunner:
         )
         return result
 
+    @diagnostic_step("wait_login")
     def _ensure_logged_in(
         self,
         page: object,
@@ -585,6 +725,7 @@ class TaxPortalRunner:
         reauth_seen_at: float | None = None
         login_challenge_url: str | None = None
         last_heartbeat_at: float | None = None
+        last_diagnostic_at: float | None = None
         last_cdp_refresh_at: float | None = None
         gateway_restart_attempted = False
         self._log(result.store_key, "login required; waiting for successful login...")
@@ -627,6 +768,14 @@ class TaxPortalRunner:
                 self._cleanup_imported_login_qrs(imported_login_qrs, result.store_key)
                 return authenticated_page
             now = monotonic()
+            diagnostics = getattr(self, "_diagnostics", None)
+            if diagnostics is not None and (last_diagnostic_at is None or now - last_diagnostic_at >= LOGIN_WAIT_HEARTBEAT_SECONDS):
+                diagnostics.observe_context(getattr(page, "context", None))
+                diagnostics.snapshot(page, reason="login_wait")
+                diagnostics.emit("login.wait", remaining_seconds=max(0, round(deadline - now)),
+                                 local_app_attempted=local_app_login_attempted, qr_refreshed=refreshed_qr,
+                                 gateway_restart_attempted=gateway_restart_attempted)
+                last_diagnostic_at = now
             if self.config.portal_browser_backend == "chrome_cdp":
                 if last_cdp_refresh_at is None or now - last_cdp_refresh_at >= 5.0:
                     refreshed_page = self._confirmed_authenticated_page(
@@ -732,11 +881,15 @@ class TaxPortalRunner:
                 reauth_seen_at = None
             sleep(2)
         self._capture_artifact(page, result.artifacts_dir, "login-timeout")
+        diagnostics = getattr(self, "_diagnostics", None)
+        if diagnostics is not None:
+            diagnostics.snapshot(page, reason="login_timeout", screenshot=True)
         raise PortalRunnerError("Timed out waiting for tax portal login.")
 
     def _local_app_login_enabled(self) -> bool:
         return PortalMacLoginAutomator.is_enabled(self.config)
 
+    @diagnostic_step("local_app_login")
     def _attempt_local_app_login(
         self,
         page: object,
@@ -759,6 +912,8 @@ class TaxPortalRunner:
             portal_area_name=portal_area_name,
             portal_company_switch_name=portal_company_switch_name,
         )
+        automator._diagnostics = getattr(self, "_diagnostics", None)
+        automator._diagnostic_step_changed = self._diagnostic_step_changed
         try:
             imported_qr = automator.automate(page, result.artifacts_dir)
         except PortalLocalLoginError as exc:
@@ -775,6 +930,7 @@ class TaxPortalRunner:
         )
         return imported_qr
 
+    @diagnostic_step("cleanup_login_qr")
     def _cleanup_imported_login_qrs(
         self,
         imported_qrs: list[ImportedPhotosQr],
@@ -803,6 +959,7 @@ class TaxPortalRunner:
                     f"asset_id={imported_qr.asset_id} filename={imported_qr.original_filename}",
                 )
 
+    @diagnostic_step("switch_company")
     def _ensure_company(self, home_page: object, store: StoreConfig, result: PortalIssueResult) -> object:
         verify_name = store.effective_portal_company_verify_name()
         target_area = store.effective_portal_area()
@@ -891,6 +1048,7 @@ class TaxPortalRunner:
         self._log(store.store_key, f"company switch confirmed: {verify_name} via candidate={selected_name}")
         return home_page
 
+    @diagnostic_step("open_batch_page")
     def _wait_for_batch_page(
         self,
         home_page: object,
@@ -1400,6 +1558,7 @@ class TaxPortalRunner:
         )
         return result if isinstance(result, dict) else {}
 
+    @diagnostic_step("raw_open_batch_page")
     def _raw_cdp_open_batch_page(
         self,
         target: dict[str, object],
@@ -1425,6 +1584,7 @@ class TaxPortalRunner:
             message="open batch issue page through raw CDP",
         )
 
+    @diagnostic_step("raw_import_workbook")
     def _raw_cdp_import_workbook(
         self,
         target: dict[str, object],
@@ -1538,6 +1698,7 @@ class TaxPortalRunner:
         )
         return result if isinstance(result, dict) else {}
 
+    @diagnostic_step("raw_select_rows")
     def _raw_cdp_select_all_batch_rows(
         self,
         target: dict[str, object],
@@ -1616,12 +1777,30 @@ class TaxPortalRunner:
         )
         self._log(store_key, f"raw CDP select-all verified rows={expected_count}")
 
+    @diagnostic_step("raw_submit_batch")
     def _raw_cdp_submit_batch(
         self,
         target: dict[str, object],
         store_key: str,
         result: PortalIssueResult,
     ) -> tuple[list[PortalIssueDetail], int, int, str]:
+        self._raw_cdp_confirm_submit(target, store_key, result)
+        result_modal_text = self._raw_cdp_wait_submit_result(target)
+        compact_text = re.sub(r"\s+", "", result_modal_text)
+        match = re.search(r"开具成功发票(\d+)份.*?开具失败发票(\d+)份", compact_text)
+        if not match:
+            raise PortalRunnerError("Could not parse raw CDP portal issue result summary.")
+        success_count = int(match.group(1))
+        failure_count = int(match.group(2))
+        details = self._parse_result_modal_details(result_modal_text)
+        success_count, failure_count = self._reconcile_result_counts_from_details(
+            details, success_count, failure_count, expected_count=result.expected_count,
+        )
+        self._raw_cdp_close_submit_result(target, store_key)
+        return details, success_count, failure_count, result_modal_text
+
+    @diagnostic_step("raw_confirm_submit")
+    def _raw_cdp_confirm_submit(self, target: dict[str, object], store_key: str, result: PortalIssueResult) -> None:
         self._log(
             store_key,
             "raw CDP select-all is ready; waiting "
@@ -1643,29 +1822,18 @@ class TaxPortalRunner:
             f"raw CDP submit confirmed rows={result.submitted_count}; waiting for result",
         )
 
-        result_modal_text = ""
+    @diagnostic_step("raw_wait_submit_result")
+    def _raw_cdp_wait_submit_result(self, target: dict[str, object]) -> str:
         deadline = monotonic() + 90.0
         while monotonic() < deadline:
             result_modal_text = self._raw_cdp_body_text(target)
             if "批量开具结果" in result_modal_text:
-                break
+                return result_modal_text
             sleep(0.25)
-        else:
-            raise PortalRunnerError("Timed out waiting for raw CDP portal issue result.")
+        raise PortalRunnerError("Timed out waiting for raw CDP portal issue result.")
 
-        compact_text = re.sub(r"\s+", "", result_modal_text)
-        match = re.search(r"开具成功发票(\d+)份.*?开具失败发票(\d+)份", compact_text)
-        if not match:
-            raise PortalRunnerError("Could not parse raw CDP portal issue result summary.")
-        success_count = int(match.group(1))
-        failure_count = int(match.group(2))
-        details = self._parse_result_modal_details(result_modal_text)
-        success_count, failure_count = self._reconcile_result_counts_from_details(
-            details,
-            success_count,
-            failure_count,
-            expected_count=result.expected_count,
-        )
+    @diagnostic_step("raw_close_submit_result")
+    def _raw_cdp_close_submit_result(self, target: dict[str, object], store_key: str) -> None:
         self._raw_cdp_click_dialog_button(target, "批量开具结果", "关闭")
         self._wait_until(
             lambda: "批量开具结果" not in self._raw_cdp_body_text(target),
@@ -1675,7 +1843,6 @@ class TaxPortalRunner:
         )
         self._log(store_key, "raw CDP portal issue result confirmed and closed")
         self._close_raw_cdp_target(target, store_key)
-        return details, success_count, failure_count, result_modal_text
 
     def _raw_cdp_body_text(self, target: dict[str, object]) -> str:
         value = self._raw_cdp_evaluate(
@@ -1702,12 +1869,17 @@ class TaxPortalRunner:
             )
             encoded = str(payload.get("data") or "")
             if not encoded:
-                return
+                raise PortalRunnerError("Chrome returned an empty screenshot.")
             artifact_path = artifacts_dir / f"{name}.png"
             ensure_parent_dir(artifact_path)
             artifact_path.write_bytes(base64.b64decode(encoded))
-        except Exception:
-            pass
+            diagnostics = getattr(self, "_diagnostics", None)
+            if diagnostics is not None:
+                diagnostics.emit("screenshot.saved", path=str(artifact_path), transport="raw_cdp")
+        except Exception as exc:
+            diagnostics = getattr(self, "_diagnostics", None)
+            if diagnostics is not None:
+                diagnostics.emit("screenshot.failed", error=str(exc), transport="raw_cdp")
 
     @staticmethod
     def _raw_cdp_set_file_input_files(
@@ -2031,6 +2203,7 @@ class TaxPortalRunner:
                 continue
         return closed
 
+    @diagnostic_step("close_batch_tab")
     def _close_raw_cdp_target(
         self,
         target: dict[str, object],
@@ -2293,6 +2466,7 @@ class TaxPortalRunner:
             allow_networkidle_timeout=True,
         )
 
+    @diagnostic_step("wait_home_ready")
     def _wait_for_home_page_ready(self, page: object, store: StoreConfig) -> None:
         verify_name = store.effective_portal_company_verify_name()
         self._wait_for_page_stable(
@@ -2488,6 +2662,7 @@ class TaxPortalRunner:
             interval_seconds=0.2,
         )
 
+    @diagnostic_step("clear_batch_page")
     def _ensure_batch_page_clean(self, page: object, store_key: str) -> None:
         body_text = self._body_text(page)
         if "共 0 条" in body_text and "重新选择" not in body_text:
@@ -2512,6 +2687,7 @@ class TaxPortalRunner:
             interval_seconds=0.2,
         )
 
+    @diagnostic_step("import_workbook")
     def _import_workbook(
         self,
         page: object,
@@ -2571,6 +2747,7 @@ class TaxPortalRunner:
             f"rows={summary.row_count}",
         )
 
+    @diagnostic_step("select_rows")
     def _select_all_rows(self, page: object) -> None:
         try:
             self._check(page.get_by_role("checkbox").first, page=page, force=True)
@@ -2582,6 +2759,7 @@ class TaxPortalRunner:
             message="select all rows",
         )
 
+    @diagnostic_step("submit_confirmation")
     def _open_submit_confirmation(
         self,
         page: object,
@@ -2597,10 +2775,12 @@ class TaxPortalRunner:
             message="enable submit confirmation button",
         )
 
+    @diagnostic_step("confirm_submit")
     def _confirm_submit(self, page: object) -> None:
         confirm_button = self._visible_button_in_dialog(page, "本次勾选批量开具发票", "确定")
         self._click(confirm_button, page=page)
 
+    @diagnostic_step("wait_submit_result")
     def _wait_for_result_modal(self, page: object, store_key: str) -> tuple[list[PortalIssueDetail], int, int, str]:
         self._wait_until(
             lambda: "批量开具结果" in self._body_text(page),
@@ -2761,6 +2941,11 @@ class TaxPortalRunner:
         )
 
     def _prepare_artifacts_dir(self, store_key: str) -> Path:
+        diagnostics = getattr(self, "_diagnostics", None)
+        if diagnostics is not None:
+            path = diagnostics.directory / store_key
+            ensure_parent_dir(path / "placeholder.txt")
+            return path
         timestamp = Path(str(int(monotonic() * 1000)))
         root = (self.config.portal_artifacts_dir or Path("data/tax-portal-artifacts")).resolve()
         path = root / store_key / str(timestamp)
@@ -2799,8 +2984,11 @@ class TaxPortalRunner:
         self._capture_artifact(page, artifacts_dir, stem)
         self._write_artifact_text(artifacts_dir, f"{stem}.txt", modal_text)
 
-    @staticmethod
-    def _log(store_key: str, message: str) -> None:
+    def _log(self, store_key: str, message: str) -> None:
+        diagnostics = getattr(self, "_diagnostics", None)
+        if diagnostics is not None:
+            diagnostics.emit("log", log_store_key=store_key, message=message)
+            message = diagnostics.redact(message)
         print(f"[tax-portal][{store_key}] {message}", flush=True)
 
     def _sync_portal_profile_from_chrome(self) -> None:
@@ -2870,6 +3058,10 @@ class TaxPortalRunner:
         return args
 
     def _install_network_diag(self, context: object, page: object, store_key: str, page_label: str) -> None:
+        diagnostics = getattr(self, "_diagnostics", None)
+        if diagnostics is not None:
+            diagnostics.observe_context(context)
+            diagnostics.observe_page(page)
         if not self.network_diag_enabled:
             return
         try:
@@ -3095,9 +3287,17 @@ class TaxPortalRunner:
             ) from exc
         return sync_playwright
 
-    @staticmethod
-    def _goto(url: str, page: object) -> None:
-        page.goto(url, wait_until="domcontentloaded")
+    @diagnostic_step("navigate")
+    def _goto(self, url: str, page: object) -> None:
+        diagnostics = getattr(self, "_diagnostics", None)
+        if diagnostics is not None:
+            diagnostics.observe_context(getattr(page, "context", None))
+            diagnostics.observe_page(page)
+            diagnostics.emit("navigation.started", from_url=str(getattr(page, "url", "")), target_url=url)
+        response = page.goto(url, wait_until="domcontentloaded")
+        if diagnostics is not None:
+            diagnostics.emit("navigation.finished", url=str(getattr(page, "url", "")),
+                             status=getattr(response, "status", None))
 
     def _is_login_page(self, page: object) -> bool:
         url = getattr(page, "url", "")
@@ -3148,6 +3348,7 @@ class TaxPortalRunner:
         url = getattr(page, "url", "")
         return self._is_etax_url(url) and self._page_contains(page, "我要办税")
 
+    @diagnostic_step("authenticated_home")
     def _ensure_authenticated_home_page(
         self,
         page: object,
@@ -3477,6 +3678,7 @@ class TaxPortalRunner:
                 return target, snapshot
         return None
 
+    @diagnostic_step("recover_chrome_gateway")
     def _restart_dedicated_chrome_after_gateway_error(self, store: StoreConfig) -> object:
         cdp_url = self._attached_cdp_url
         user_data_dir = self.config.portal_chrome_cdp_user_data_dir
@@ -3654,6 +3856,9 @@ class TaxPortalRunner:
         return None
 
     def _record_attached_page(self, page: object) -> None:
+        diagnostics = getattr(self, "_diagnostics", None)
+        if diagnostics is not None:
+            diagnostics.observe_page(page)
         if page not in self._observed_attached_pages:
             self._observed_attached_pages.append(page)
 
