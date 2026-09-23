@@ -6,6 +6,7 @@ import re
 import sys
 import threading
 import traceback
+from collections import deque
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from functools import wraps
@@ -63,15 +64,23 @@ def diagnostic_step(name: str):
 class PortalDiagnostics:
     """Best-effort, local, flushed diagnostics independent of terminal scrollback."""
 
-    def __init__(self, root: Path, *, secrets=(), heartbeat_seconds: float = 15.0, **metadata):
+    def __init__(self, root: Path, *, secrets=(), heartbeat_seconds: float = 15.0,
+                 watchdog_seconds: float = 2.0, **metadata):
         self.run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + "-" + uuid4().hex[:8]
         self.directory = root.resolve() / "runs" / self.run_id
         self._secrets = sorted({str(value) for value in secrets if value}, key=len, reverse=True)
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._thread = None
+        self._business_thread_id = threading.get_ident()
         self._started = self._step_started = monotonic()
         self._sequence = 0
+        self._operation_sequence = 0
+        self._operations = {}
+        self._recent_operations = deque(maxlen=12)
+        self._last_progress = None
+        self._watchdog_seconds = watchdog_seconds
+        self._finished = False
         self._warned = False
         self._listeners = []
         self._pages = set()
@@ -81,10 +90,152 @@ class PortalDiagnostics:
         self.emit("run.started", **metadata)
         if heartbeat_seconds > 0:
             def heartbeat():
-                while not self._stop.wait(heartbeat_seconds):
-                    self.emit("heartbeat", step_elapsed_ms=round((monotonic() - self._step_started) * 1000))
+                next_heartbeat = monotonic() + heartbeat_seconds
+                interval = min(heartbeat_seconds, 0.5)
+                if watchdog_seconds > 0:
+                    interval = min(interval, max(0.01, watchdog_seconds / 2))
+                while not self._stop.wait(interval):
+                    try:
+                        now = monotonic()
+                        self._check_blocked_operations(now)
+                        if now >= next_heartbeat:
+                            self.emit("heartbeat", step_elapsed_ms=round((now - self._step_started) * 1000))
+                            next_heartbeat = now + heartbeat_seconds
+                    except Exception:
+                        # Diagnostics must not interrupt the business thread or its monitor.
+                        pass
             self._thread = threading.Thread(target=heartbeat, name="portal-diagnostics", daemon=True)
             self._thread.start()
+
+    @staticmethod
+    def _safe_operation_metadata(metadata):
+        """Accept identifiers only, never UI values or object representations."""
+        safe = {}
+        for key in ("pid", "element_id", "attribute", "action", "node_count", "phase",
+                    "scan_id", "depth", "path", "role", "return_code"):
+            value = metadata.get(key)
+            if key in {"pid", "node_count", "depth"}:
+                if type(value) is int and value >= 0:
+                    safe[key] = value
+            elif key == "return_code" and type(value) is int:
+                safe[key] = value
+            elif key == "element_id" and type(value) is int:
+                safe[key] = value
+            elif key == "path":
+                if isinstance(value, str) and re.fullmatch(r"(?:root)?[0-9./:-]{0,256}", value):
+                    safe[key] = value
+            elif key == "role":
+                if isinstance(value, str) and re.fullmatch(r"AX[A-Za-z0-9_]{1,64}", value):
+                    safe[key] = value
+            elif isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value):
+                safe[key] = value
+        return safe
+
+    @staticmethod
+    def _operation_snapshot(operation, now):
+        return {key: value for key, value in operation.items() if not key.startswith("_")} | {
+            "duration_ms": round((now - operation["_started"]) * 1000),
+        }
+
+    def _operation_progress(self, now):
+        active = [stack[-1] for stack in self._operations.values() if stack]
+        current = max(active, key=lambda operation: operation["operation_id"], default=None)
+        return {
+            "current_operation": self._operation_snapshot(current, now) if current else None,
+            "recent_operations": list(self._recent_operations),
+            "last_progress": self._last_progress,
+        }
+
+    @staticmethod
+    def _thread_stack(thread_id):
+        """Capture locations only; formatted tracebacks can expose source/values."""
+        frames = []
+        frame = sys._current_frames().get(thread_id)
+        try:
+            while frame is not None and len(frames) < 64:
+                frames.append({"file": frame.f_code.co_filename,
+                               "function": frame.f_code.co_name, "line": frame.f_lineno})
+                frame = frame.f_back
+        finally:
+            del frame
+        return list(reversed(frames))
+
+    def _check_blocked_operations(self, now):
+        if self._watchdog_seconds <= 0:
+            return
+        with self._lock:
+            if self._finished:
+                return
+            for operations in self._operations.values():
+                if not operations:
+                    continue
+                operation = operations[-1]
+                if now - operation["_started"] < self._watchdog_seconds:
+                    continue
+                last_reported = operation.get("_last_reported")
+                if last_reported is not None and now - last_reported < max(5.0, self._watchdog_seconds * 5):
+                    continue
+                operation["_last_reported"] = now
+                self.emit("operation.blocked", operation=self._operation_snapshot(operation, now),
+                          stack=self._thread_stack(operation["thread_id"]))
+
+    @contextmanager
+    def operation(self, name: str, **metadata):
+        """Track a native call in memory; persist slow calls, failures and heartbeats.
+
+        Names and metadata must be static labels/identifiers, never field values.
+        This context does not cancel calls, read UI state or capture screenshots.
+        """
+        operation = None
+        try:
+            with self._lock:
+                if not self._finished:
+                    self._operation_sequence += 1
+                    operation = {
+                        "operation_id": self._operation_sequence,
+                        "name": name if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", name)
+                        else "invalid-operation-name",
+                        "thread_id": threading.get_ident(), "step": self.state["step"],
+                        "started_at": datetime.now(timezone.utc).isoformat(),
+                        "metadata": self._safe_operation_metadata(metadata), "_started": monotonic(),
+                    }
+                    self._operations.setdefault(operation["thread_id"], []).append(operation)
+        except Exception:
+            operation = None
+        try:
+            yield
+        except BaseException as exc:
+            self._complete_operation_safely(operation, error_type=type(exc).__name__)
+            raise
+        else:
+            self._complete_operation_safely(operation)
+
+    def _complete_operation_safely(self, operation, *, error_type=None):
+        if operation is None:
+            return
+        try:
+            with self._lock:
+                if self._finished:
+                    return
+                stack = self._operations.get(operation["thread_id"], [])
+                if operation in stack:
+                    stack.remove(operation)
+                if not stack:
+                    self._operations.pop(operation["thread_id"], None)
+                now = monotonic()
+                completed = self._operation_snapshot(operation, now)
+                completed.update(status="failed" if error_type else "finished",
+                                 finished_at=datetime.now(timezone.utc).isoformat())
+                if error_type:
+                    completed["error_type"] = error_type
+                self._recent_operations.append(completed)
+                self._last_progress = completed
+                self.state.update(self._operation_progress(now))
+                slow = self._watchdog_seconds > 0 and now - operation["_started"] >= self._watchdog_seconds
+                if error_type or slow or operation.get("_last_reported") is not None:
+                    self.emit("operation.failed" if error_type else "operation.finished", operation=completed)
+        except Exception:
+            pass
 
     def redact(self, value):
         if isinstance(value, dict):
@@ -108,6 +259,17 @@ class PortalDiagnostics:
     def emit(self, event: str, **fields):
         with self._lock:
             try:
+                now = monotonic()
+                progress = self._operation_progress(now)
+                self.state.update(progress)
+                if event in {"heartbeat", "operation.blocked", "operation.failed", "operation.finished", "run.finished"}:
+                    fields = {**progress, **fields}
+                if event == "heartbeat":
+                    fields["step_elapsed_ms"] = round((now - self._step_started) * 1000)
+                    if now - self._step_started >= 30.0:
+                        # Include non-AX waits too; observing a long step is not a failure.
+                        fields["business_thread_id"] = self._business_thread_id
+                        fields["step_stack"] = self._thread_stack(self._business_thread_id)
                 self._sequence += 1
                 record = self.redact({
                     "timestamp": datetime.now(timezone.utc).isoformat(), "seq": self._sequence,
@@ -248,7 +410,7 @@ class PortalDiagnostics:
 
     def finish(self, status: str, **fields):
         self._stop.set()
-        if self._thread is not None:
+        if self._thread is not None and self._thread is not threading.current_thread():
             self._thread.join(timeout=1)
         for source, event, callback in self._listeners:
             try:
@@ -256,5 +418,8 @@ class PortalDiagnostics:
             except Exception:
                 pass
         self._listeners.clear()
-        self.state.update(status=status, **fields)
-        self.emit("run.finished", status=status, **fields)
+        with self._lock:
+            self._finished = True
+            self._operations.clear()
+            self.state.update(status=status, **fields)
+            self.emit("run.finished", status=status, **fields)

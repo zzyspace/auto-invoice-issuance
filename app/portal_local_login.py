@@ -7,7 +7,9 @@ import plistlib
 import re
 import subprocess
 import sys
-from dataclasses import dataclass
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, field
+from functools import wraps
 from pathlib import Path
 from tempfile import mkdtemp
 from time import monotonic, sleep, time_ns
@@ -126,6 +128,64 @@ KEY_DELETE = 51
 AX_VALUE_CGPOINT = 1
 AX_VALUE_CGSIZE = 2
 CG_EVENT_FLAG_MASK_COMMAND = 0x00100000
+AX_MESSAGE_TIMEOUT_SECONDS = 1.0
+AX_SCAN_TIMEOUT_SECONDS = 5.0
+AX_SCAN_MAX_NODES = 800
+AX_SCAN_MAX_DEPTH = 64
+AX_ERROR_CANNOT_COMPLETE = -25204
+
+
+class PortalLocalLoginError(RuntimeError):
+    pass
+
+
+class PortalAccessibilityError(PortalLocalLoginError):
+    """The UI could not be inspected safely; do not retry a click or fall back to waiting."""
+
+
+def ax_bounded(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        bounded = getattr(getattr(self, "_ax", None), "bounded", None)
+        scope = bounded(kwargs.get("timeout_seconds", UI_ACTION_TIMEOUT_SECONDS)) if callable(bounded) else nullcontext()
+        with scope:
+            return method(self, *args, **kwargs)
+    return wrapped
+
+
+class _AXLease:
+    """Keep retained native references alive exactly as long as the returned nodes."""
+
+    def __init__(self, core):
+        self.core = core
+        self.references: list[int] = []
+
+    def own(self, value: int) -> int:
+        if value:
+            self.references.append(value)
+        return value
+
+    def __del__(self):
+        for value in self.references:
+            try:
+                self.core.CFRelease(value)
+            except Exception:
+                pass
+
+
+@dataclass
+class _AXScan:
+    pid: int | None
+    scan_id: str
+    started: float
+    deadline: float
+    lease: _AXLease
+    node_count: int = 0
+    duplicate_count: int = 0
+    depth: int = 0
+    path: str = "root"
+    role: str = ""
+    last_progress_at: float = 0.0
 
 
 @dataclass
@@ -136,6 +196,7 @@ class AXNode:
     texts: tuple[str, ...]
     position: tuple[float, float] | None
     size: tuple[float, float] | None
+    _owner: object | None = field(default=None, repr=False, compare=False)
 
     @property
     def center(self) -> tuple[float, float] | None:
@@ -169,6 +230,8 @@ class MacAccessibilityClient:
         self.app.AXUIElementSetAttributeValue.restype = ctypes.c_uint32
         self.app.AXUIElementPerformAction.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         self.app.AXUIElementPerformAction.restype = ctypes.c_uint32
+        self.app.AXUIElementSetMessagingTimeout.argtypes = [ctypes.c_void_p, ctypes.c_float]
+        self.app.AXUIElementSetMessagingTimeout.restype = ctypes.c_int32
         self.app.AXValueGetValue.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
         self.app.AXValueGetValue.restype = ctypes.c_bool
         self.core.CFGetTypeID.argtypes = [ctypes.c_void_p]
@@ -190,6 +253,10 @@ class MacAccessibilityClient:
         self.core.CFNumberGetValue.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
         self.core.CFNumberGetValue.restype = ctypes.c_bool
         self.core.CFRelease.argtypes = [ctypes.c_void_p]
+        self.core.CFEqual.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self.core.CFEqual.restype = ctypes.c_bool
+        self.core.CFHash.argtypes = [ctypes.c_void_p]
+        self.core.CFHash.restype = ctypes.c_ulong
         self.app.CGEventCreateMouseEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint32, CGPoint, ctypes.c_uint32]
         self.app.CGEventCreateMouseEvent.restype = ctypes.c_void_p
         self.app.CGEventCreateKeyboardEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint16, ctypes.c_bool]
@@ -204,6 +271,93 @@ class MacAccessibilityClient:
         self.quartz.CGWindowListCopyWindowInfo.restype = ctypes.c_void_p
         self._cf_string_type = self.core.CFStringGetTypeID()
         self._cf_array_type = self.core.CFArrayGetTypeID()
+        self._diagnostics = None
+        self._active_scan: _AXScan | None = None
+        self._deadline: float | None = None
+        self._scan_sequence = 0
+        self._last_scan: dict[str, object] = {}
+        self._last_pid: int | None = None
+
+    @contextmanager
+    def bounded(self, seconds: float):
+        previous = self._deadline
+        deadline = monotonic() + max(0.0, seconds)
+        self._deadline = min(deadline, previous) if previous is not None else deadline
+        try:
+            yield
+        finally:
+            self._deadline = previous
+
+    def diagnostic_state(self) -> dict[str, object]:
+        # Never make AX calls from a failure handler or watchdog.
+        return dict(self._last_scan)
+
+    def _scan_metadata(self, scan: _AXScan) -> dict[str, object]:
+        return dict(pid=scan.pid, scan_id=scan.scan_id, node_count=scan.node_count,
+                    duplicate_count=scan.duplicate_count, depth=scan.depth, path=scan.path,
+                    role=scan.role, elapsed_ms=round((monotonic() - scan.started) * 1000))
+
+    def _emit_scan(self, event: str, scan: _AXScan, **fields) -> None:
+        self._last_scan = {**self._last_scan, **self._scan_metadata(scan), **fields}
+        if self._diagnostics is not None:
+            self._diagnostics.emit(event, **self._last_scan)
+
+    @contextmanager
+    def _scan(self, pid: int | None):
+        started = monotonic()
+        deadline = min(started + AX_SCAN_TIMEOUT_SECONDS, self._deadline or float("inf"))
+        self._scan_sequence += 1
+        scan = _AXScan(pid, str(self._scan_sequence), started, deadline, _AXLease(self.core), last_progress_at=started)
+        previous = self._active_scan
+        self._active_scan = scan
+        self._last_pid = pid
+        self._last_scan = {}
+        self._emit_scan("ax.scan.started", scan, timeout_ms=round((deadline - started) * 1000))
+        try:
+            self._check_ax_deadline()
+            yield scan
+        except BaseException as exc:
+            self._emit_scan("ax.scan.failed", scan, error_type=type(exc).__name__)
+            raise
+        else:
+            self._emit_scan("ax.scan.finished", scan)
+        finally:
+            self._active_scan = previous
+
+    def _check_ax_deadline(self) -> float:
+        scan = self._active_scan
+        deadline = scan.deadline if scan is not None else self._deadline
+        remaining = deadline - monotonic() if deadline is not None else AX_MESSAGE_TIMEOUT_SECONDS
+        if remaining <= 0:
+            raise PortalAccessibilityError("AX scan/action time budget exceeded; see ax.scan and operation diagnostics.")
+        return min(AX_MESSAGE_TIMEOUT_SECONDS, remaining)
+
+    def _call_ax(self, name: str, element: int, attribute: str, function, *args) -> int:
+        timeout = self._check_ax_deadline()
+        scan = self._active_scan
+        metadata = dict(pid=scan.pid if scan else self._last_pid, element_id=f"0x{element:x}",
+                        attribute=attribute, phase="scan" if scan else "action")
+        if scan is not None:
+            metadata.update(scan_id=scan.scan_id, node_count=scan.node_count, depth=scan.depth,
+                            path=scan.path, role=scan.role)
+            self._last_scan = {**self._scan_metadata(scan), "attribute": attribute, "element_id": metadata["element_id"]}
+        scope = self._diagnostics.operation(name, **metadata) if self._diagnostics is not None else nullcontext()
+        with scope:
+            timeout_result = int(self.app.AXUIElementSetMessagingTimeout(element, timeout))
+            if timeout_result != 0:
+                raise PortalAccessibilityError(f"Cannot set AX messaging timeout code={timeout_result}.")
+            # AXError is signed; older bindings returned uint32.
+            result = ctypes.c_int32(int(function(element, *args))).value
+            if result != 0 and self._diagnostics is not None and result not in {-25205, -25212}:
+                self._diagnostics.emit("ax.call.failed", **metadata, return_code=result)
+            if result == AX_ERROR_CANNOT_COMPLETE:
+                raise PortalAccessibilityError(
+                    f"AX messaging did not complete operation={name} attribute={attribute} code={result}; outcome unconfirmed."
+                )
+            self._check_ax_deadline()
+            if result not in {0, -25205, -25212, -25206, -25208}:
+                raise PortalAccessibilityError(f"AX call failed operation={name} attribute={attribute} code={result}.")
+            return result
 
     def is_process_trusted(self) -> bool:
         return bool(self.app.AXIsProcessTrusted())
@@ -240,44 +394,39 @@ class MacAccessibilityClient:
         return None
 
     def find_nodes(self, pid: int) -> list[AXNode]:
-        root = self.app_element(pid)
-        if not root:
-            return []
-        window_elements = self._children_from_attribute(root, "AXWindows")
-        if not window_elements:
-            focused = self._attribute_value(root, "AXFocusedWindow")
-            if focused:
-                window_elements = [focused]
-        nodes: list[AXNode] = []
-        seen: set[int] = set()
-        for window in window_elements:
-            self._collect_nodes(window, nodes, seen)
-        return nodes
+        with self._scan(pid) as scan:
+            root = scan.lease.own(self.app_element(pid))
+            if not root:
+                return []
+            return self._window_nodes(root, scan)
 
     def find_focused_nodes(self) -> list[AXNode]:
-        systemwide = self.systemwide_element()
-        if not systemwide:
-            return []
-        focused_app = self._attribute_value(systemwide, "AXFocusedApplication")
-        if not focused_app:
-            return []
-        try:
-            window_elements = self._children_from_attribute(focused_app, "AXWindows")
-            if not window_elements:
-                focused_window = self._attribute_value(focused_app, "AXFocusedWindow")
-                if focused_window:
-                    window_elements = [focused_window]
-            nodes: list[AXNode] = []
-            seen: set[int] = set()
-            for window in window_elements:
-                self._collect_nodes(window, nodes, seen)
-            return nodes
-        finally:
-            self.core.CFRelease(focused_app)
+        with self._scan(None) as scan:
+            systemwide = scan.lease.own(self.systemwide_element())
+            if not systemwide:
+                return []
+            focused_app = scan.lease.own(self._attribute_value(systemwide, "AXFocusedApplication") or 0)
+            if not focused_app:
+                return []
+            return self._window_nodes(focused_app, scan)
+
+    def _window_nodes(self, root: int, scan: _AXScan) -> list[AXNode]:
+        windows = self._children_from_attribute(root, "AXWindows")
+        if not windows:
+            focused = scan.lease.own(self._attribute_value(root, "AXFocusedWindow") or 0)
+            windows = [focused] if focused else []
+        nodes: list[AXNode] = []
+        seen: dict[int, list[int]] = {}
+        for index, window in enumerate(windows):
+            self._collect_nodes(window, nodes, seen, path=str(index))
+        return nodes
 
     def click_node(self, node: AXNode) -> bool:
-        if self._perform_action(node.element, "AXPress") == 0:
+        result = self._perform_action(node.element, "AXPress")
+        if result == 0:
             return True
+        if result not in {-25206, -25208}:
+            raise PortalAccessibilityError(f"AXPress outcome unconfirmed code={result}; not repeating the click.")
         return self.click_at_node_center(node)
 
     def click_at_node_center(self, node: AXNode) -> bool:
@@ -345,32 +494,51 @@ class MacAccessibilityClient:
         cf_value = self._cf_string(value)
         cf_attr = self._cf_string("AXValue")
         try:
-            return self.app.AXUIElementSetAttributeValue(node.element, cf_attr, cf_value) == 0
+            return self._call_ax("ax.write", node.element, "AXValue", self.app.AXUIElementSetAttributeValue, cf_attr, cf_value) == 0
         finally:
             if cf_attr:
                 self.core.CFRelease(cf_attr)
             if cf_value:
                 self.core.CFRelease(cf_value)
 
-    def _collect_nodes(self, element: int, output: list[AXNode], seen: set[int]) -> None:
-        stack = [element]
+    def _collect_nodes(self, element: int, output: list[AXNode], seen: dict[int, list[int]], *, path: str) -> None:
+        scan = self._active_scan
+        assert scan is not None
+        stack = [(element, 0, path)]
         while stack:
-            current = stack.pop()
-            if not current or current in seen:
+            self._check_ax_deadline()
+            current, depth, current_path = stack.pop()
+            if not current:
                 continue
-            seen.add(current)
+            scan.depth, scan.path, scan.role = depth, current_path, ""
+            # Distinct CF references may represent the same UI element.
+            bucket = seen.setdefault(int(self.core.CFHash(current)), [])
+            if any(self.core.CFEqual(current, existing) for existing in bucket):
+                scan.duplicate_count += 1
+                continue
+            if scan.node_count >= AX_SCAN_MAX_NODES or depth > AX_SCAN_MAX_DEPTH:
+                raise PortalAccessibilityError(
+                    f"AX tree budget exceeded nodes={scan.node_count} depth={depth} path={current_path}."
+                )
+            bucket.append(current)
+            scan.node_count += 1
+            scan.role = self._attribute_text(current, "AXRole")
             output.append(
                 AXNode(
                     element=current,
-                    role=self._attribute_text(current, "AXRole"),
+                    role=scan.role,
                     subrole=self._attribute_text(current, "AXSubrole"),
                     texts=self._texts_for_element(current),
                     position=self._point_attribute(current, "AXPosition"),
                     size=self._size_attribute(current, "AXSize"),
+                    _owner=scan.lease,
                 )
             )
             children = self._children_from_attribute(current, "AXChildren")
-            stack.extend(reversed(children))
+            stack.extend((child, depth + 1, f"{current_path}.{index}") for index, child in reversed(list(enumerate(children))))
+            if monotonic() - scan.last_progress_at >= 1.0:
+                self._emit_scan("ax.scan.progress", scan, pending_nodes=len(stack))
+                scan.last_progress_at = monotonic()
 
     def _texts_for_element(self, element: int) -> tuple[str, ...]:
         values: list[str] = []
@@ -382,18 +550,29 @@ class MacAccessibilityClient:
 
     def _children_from_attribute(self, element: int, attr: str) -> list[int]:
         value = self._attribute_value(element, attr)
-        if not value or self.core.CFGetTypeID(value) != self._cf_array_type:
+        if not value:
             return []
-        count = self.core.CFArrayGetCount(value)
-        items: list[int] = []
-        for index in range(count):
-            child = int(self.core.CFArrayGetValueAtIndex(value, index) or 0)
-            if child:
-                retained = int(self.core.CFRetain(child) or 0)
-                items.append(retained or child)
-        if value:
+        try:
+            if self.core.CFGetTypeID(value) != self._cf_array_type:
+                return []
+            count = self.core.CFArrayGetCount(value)
+            if count > AX_SCAN_MAX_NODES:
+                raise PortalAccessibilityError(f"AX child list exceeds node budget count={count} attribute={attr}.")
+            if self._active_scan is not None and len(self._active_scan.lease.references) + count > AX_SCAN_MAX_NODES * 4:
+                raise PortalAccessibilityError(f"AX retained reference budget exceeded attribute={attr} count={count}.")
+            items: list[int] = []
+            for index in range(count):
+                self._check_ax_deadline()
+                child = int(self.core.CFArrayGetValueAtIndex(value, index) or 0)
+                if child:
+                    retained = int(self.core.CFRetain(child) or 0)
+                    if retained:
+                        if self._active_scan is not None:
+                            self._active_scan.lease.own(retained)
+                        items.append(retained)
+            return items
+        finally:
             self.core.CFRelease(value)
-        return [item for item in items if item]
 
     def _attribute_text(self, element: int, attr: str) -> str:
         value = self._attribute_value(element, attr)
@@ -433,7 +612,7 @@ class MacAccessibilityClient:
     def _perform_action(self, element: int, action: str) -> int:
         cf_action = self._cf_string(action)
         try:
-            return int(self.app.AXUIElementPerformAction(element, cf_action))
+            return self._call_ax("ax.action", element, action, self.app.AXUIElementPerformAction, cf_action)
         finally:
             if cf_action:
                 self.core.CFRelease(cf_action)
@@ -441,10 +620,18 @@ class MacAccessibilityClient:
     def _attribute_value(self, element: int, attr: str) -> int | None:
         cf_attr = self._cf_string(attr)
         value = ctypes.c_void_p()
-        result = self.app.AXUIElementCopyAttributeValue(element, cf_attr, ctypes.byref(value))
-        if cf_attr:
-            self.core.CFRelease(cf_attr)
+        try:
+            result = self._call_ax("ax.read", element, attr, self.app.AXUIElementCopyAttributeValue, cf_attr, ctypes.byref(value))
+        except BaseException:
+            if value.value:
+                self.core.CFRelease(value.value)
+            raise
+        finally:
+            if cf_attr:
+                self.core.CFRelease(cf_attr)
         if result != 0 or not value.value:
+            if value.value:
+                self.core.CFRelease(value.value)
             return None
         return int(value.value)
 
@@ -496,10 +683,6 @@ class MacAccessibilityClient:
         return int(self.core.CFStringCreateWithCString(None, value.encode("utf-8"), self.STRING_ENCODING_UTF8) or 0)
 
 
-class PortalLocalLoginError(RuntimeError):
-    pass
-
-
 class PortalMacLoginAutomator:
     def __init__(
         self,
@@ -534,6 +717,7 @@ class PortalMacLoginAutomator:
         )
 
     def automate(self, page: object, artifacts_dir: Path | None) -> ImportedPhotosQr:
+        self._ax._diagnostics = self._diagnostics
         self._require_supported_environment()
         self._verify_gui_automation_prerequisites()
         qr_path = self._capture_qr_code(page, artifacts_dir)
@@ -648,6 +832,8 @@ class PortalMacLoginAutomator:
                 ],
                 timeout_seconds=UI_ACTION_TIMEOUT_SECONDS,
             )
+        except PortalAccessibilityError:
+            raise
         except PortalLocalLoginError as exc:
             raise PortalLocalLoginError(
                 "Failed to import tax portal QR image into Photos in the background. "
@@ -673,6 +859,8 @@ class PortalMacLoginAutomator:
                 ["osascript", "-e", PHOTOS_HIDE_SCRIPT],
                 timeout_seconds=5.0,
             )
+        except PortalAccessibilityError:
+            raise
         except PortalLocalLoginError:
             pass
 
@@ -691,6 +879,7 @@ class PortalMacLoginAutomator:
         self._run_command(["open", "-a", str(self._etax_app_path)], timeout_seconds=10.0)
 
     @diagnostic_step("wait_etax_app")
+    @ax_bounded
     def _wait_for_process(self, bundle_id: str, *, timeout_seconds: float) -> None:
         self._log("waiting for 电子税务局 app process")
         deadline = monotonic() + timeout_seconds
@@ -740,7 +929,7 @@ class PortalMacLoginAutomator:
             self._log("电子税务局 我的页入口动作 action=login_button")
             self._set_login_account_value(bundle_id, self.config.portal_etax_app_username or "")
             self._set_login_password_value(bundle_id, self.config.portal_etax_app_password or "")
-            self._click_named_element(bundle_id, ("登录",), timeout_seconds=UI_ACTION_TIMEOUT_SECONDS)
+            self._submit_app_credentials(bundle_id)
             self._request_sms_code(bundle_id)
             self._focus_sms_code_input(bundle_id)
             if self._try_fill_otp_from_system_prompt(bundle_id):
@@ -750,7 +939,7 @@ class PortalMacLoginAutomator:
                 code = self._read_latest_sms_code_from_messages()
                 self._set_sms_code_value(bundle_id, code)
                 self._log("filled SMS verification code from Messages app fallback")
-            self._click_named_element(bundle_id, ("登录",), timeout_seconds=UI_ACTION_TIMEOUT_SECONDS)
+            self._submit_app_sms_login(bundle_id)
             state = self._wait_for_post_login_state(bundle_id, timeout_seconds=POST_LOGIN_STATE_TIMEOUT_SECONDS)
             self._handle_post_sms_login_state(bundle_id, state)
             return
@@ -785,6 +974,14 @@ class PortalMacLoginAutomator:
         raise PortalLocalLoginError(
             "电子税务局 app did not show login button, role entry, or logged-in home after opening 我的."
         )
+
+    @diagnostic_step("app_submit_credentials")
+    def _submit_app_credentials(self, bundle_id: str) -> None:
+        self._click_named_element(bundle_id, ("登录",), timeout_seconds=UI_ACTION_TIMEOUT_SECONDS)
+
+    @diagnostic_step("app_submit_sms_login")
+    def _submit_app_sms_login(self, bundle_id: str) -> None:
+        self._click_named_element(bundle_id, ("登录",), timeout_seconds=UI_ACTION_TIMEOUT_SECONDS)
 
     def _handle_post_sms_login_state(self, bundle_id: str, state: str) -> None:
         if state == "role_dialog":
@@ -828,6 +1025,7 @@ class PortalMacLoginAutomator:
             f"电子税务局 app did not reach role selection after SMS login state={state}"
         )
 
+    @ax_bounded
     def _wait_for_etax_session_entry_state(self, bundle_id: str, *, timeout_seconds: float) -> str:
         deadline = monotonic() + timeout_seconds
         while monotonic() < deadline:
@@ -871,6 +1069,8 @@ class PortalMacLoginAutomator:
     def _startup_reminder_visible_from_ax_text(self, bundle_id: str) -> bool:
         try:
             texts = self._collect_visible_texts(bundle_id, timeout_seconds=1.0)
+        except PortalAccessibilityError:
+            raise
         except PortalLocalLoginError:
             return False
         return any(STARTUP_REMINDER_TITLE in text for text in texts)
@@ -899,6 +1099,8 @@ class PortalMacLoginAutomator:
     def _ocr_startup_reminder_visible(self, bundle_id: str) -> bool | None:
         try:
             image_path = self._capture_startup_reminder_screenshot(bundle_id)
+        except PortalAccessibilityError:
+            raise
         except PortalLocalLoginError as exc:
             self._log(f"could not capture startup reminder screenshot error={exc}")
             return None
@@ -1049,6 +1251,8 @@ class PortalMacLoginAutomator:
     def _ocr_home_portal_area_text(self, bundle_id: str) -> str | None:
         try:
             image_path = self._capture_home_portal_area_screenshot(bundle_id)
+        except PortalAccessibilityError:
+            raise
         except PortalLocalLoginError as exc:
             self._log(f"could not capture tax app home area screenshot error={exc}")
             return None
@@ -1218,6 +1422,8 @@ class PortalMacLoginAutomator:
         try:
             self._select_latest_qr_in_internal_picker(bundle_id)
             return
+        except PortalAccessibilityError:
+            raise
         except PortalLocalLoginError:
             pass
         if self._is_photos_picker_visible():
@@ -1265,6 +1471,8 @@ class PortalMacLoginAutomator:
     def _is_scan_page_visible(self, bundle_id: str) -> bool:
         try:
             texts = self._collect_visible_texts(bundle_id, timeout_seconds=1.0)
+        except PortalAccessibilityError:
+            raise
         except PortalLocalLoginError:
             return False
         return "识别二维码" in texts and "相册" in texts and "扫一扫" in texts
@@ -1272,6 +1480,8 @@ class PortalMacLoginAutomator:
     def _is_internal_photo_picker_visible(self, bundle_id: str) -> bool:
         try:
             texts = self._collect_visible_texts(bundle_id, timeout_seconds=1.0)
+        except PortalAccessibilityError:
+            raise
         except PortalLocalLoginError:
             return False
         required = ("取消", "照片", "精选集", "搜索你的图库")
@@ -1280,6 +1490,8 @@ class PortalMacLoginAutomator:
     def _is_photos_picker_visible(self) -> bool:
         try:
             texts = self._collect_visible_texts(PHOTOS_BUNDLE_ID, timeout_seconds=1.0)
+        except PortalAccessibilityError:
+            raise
         except PortalLocalLoginError:
             return False
         markers = ("所有照片", "图库", "相簿", "照片")
@@ -1332,6 +1544,8 @@ class PortalMacLoginAutomator:
     def _is_login_confirmation_visible(self, bundle_id: str) -> bool:
         try:
             texts = self._collect_visible_texts(bundle_id, timeout_seconds=1.0)
+        except PortalAccessibilityError:
+            raise
         except PortalLocalLoginError:
             return False
         has_login = any(text == "登录" or text.endswith("登录") for text in texts)
@@ -1380,6 +1594,8 @@ class PortalMacLoginAutomator:
         try:
             self._click_named_element(bundle_id, (self.role_label,), timeout_seconds=3.0)
             return
+        except PortalAccessibilityError:
+            raise
         except PortalLocalLoginError:
             pass
         self._click_role_dialog_relative(bundle_id, x_ratio=0.32, y_ratio=0.47)
@@ -1388,6 +1604,8 @@ class PortalMacLoginAutomator:
         try:
             self._click_named_element(bundle_id, ("确认",), timeout_seconds=3.0)
             return
+        except PortalAccessibilityError:
+            raise
         except PortalLocalLoginError:
             pass
         self._click_role_dialog_relative(bundle_id, x_ratio=0.50, y_ratio=0.64)
@@ -1415,6 +1633,8 @@ class PortalMacLoginAutomator:
         try:
             self._click_named_element(bundle_id, ("暂不设置",), timeout_seconds=3.0)
             return
+        except PortalAccessibilityError:
+            raise
         except PortalLocalLoginError:
             pass
         bounds = self._window_bounds_for_bundle(bundle_id)
@@ -1439,6 +1659,8 @@ class PortalMacLoginAutomator:
         while monotonic() < deadline:
             try:
                 texts = self._collect_visible_texts(bundle_id, timeout_seconds=1.0)
+            except PortalAccessibilityError:
+                raise
             except PortalLocalLoginError:
                 return
             if not self._texts_show_switch_success_dialog(texts):
@@ -1467,6 +1689,8 @@ class PortalMacLoginAutomator:
             top + height * SWITCH_SUCCESS_DIALOG_CONFIRM_Y_RATIO,
         )
 
+    @diagnostic_step("app_wait_login_result")
+    @ax_bounded
     def _wait_for_post_login_state(self, bundle_id: str, *, timeout_seconds: float) -> str:
         deadline = monotonic() + timeout_seconds
         while monotonic() < deadline:
@@ -1542,6 +1766,7 @@ class PortalMacLoginAutomator:
         value = self._read_text_input_value(bundle_id, labels=("短信验证码",), field_index=2)
         return bool(re.fullmatch(r"\d{6}", value))
 
+    @ax_bounded
     def _collect_visible_texts(self, bundle_id: str, *, timeout_seconds: float) -> list[str]:
         self._activate_application(bundle_id)
         deadline = monotonic() + timeout_seconds
@@ -1584,6 +1809,7 @@ class PortalMacLoginAutomator:
                 return match.group(1)
         return None
 
+    @ax_bounded
     def _click_named_element(
         self,
         bundle_id: str,
@@ -1611,10 +1837,13 @@ class PortalMacLoginAutomator:
     ) -> bool:
         try:
             self._click_named_element(bundle_id, names, timeout_seconds=timeout_seconds, contains=contains)
+        except PortalAccessibilityError:
+            raise
         except PortalLocalLoginError:
             return False
         return True
 
+    @ax_bounded
     def _wait_for_named_text(
         self,
         bundle_id: str,
@@ -1769,6 +1998,8 @@ class PortalMacLoginAutomator:
             pattern = ETAX_PROCESS_PATTERN
         try:
             output = self._run_command(["pgrep", "-f", pattern], timeout_seconds=3.0)
+        except PortalAccessibilityError:
+            raise
         except PortalLocalLoginError:
             return []
         pids: list[int] = []
@@ -2039,6 +2270,8 @@ class PortalMacLoginAutomator:
     ) -> bool:
         try:
             self._set_text_input_value(bundle_id, value, field_index=field_index, labels=labels, secure=secure)
+        except PortalAccessibilityError:
+            raise
         except PortalLocalLoginError:
             return False
         return True
@@ -2072,6 +2305,8 @@ class PortalMacLoginAutomator:
             command = ["open", "-a", str(self._etax_app_path)]
         try:
             self._run_command(command, timeout_seconds=5.0)
+        except PortalAccessibilityError:
+            raise
         except PortalLocalLoginError:
             return
 
@@ -2102,13 +2337,7 @@ class PortalMacLoginAutomator:
         diagnostics = self._diagnostics
         if diagnostics is None:
             return
-        # Read only this app's AX tree; do not collect text fields or Messages content.
-        bundle_id = self._resolve_app_bundle_identifier()
-        pids = self._find_process_pids(bundle_id)
-        nodes = []
-        for pid in pids:
-            nodes.extend(self._ax.find_nodes(pid))
-        texts = [text for node in nodes if node.role == "AXStaticText" for text in node.texts]
-        markers = ("登录", "验证码", "身份切换", "扫一扫", "登录确认", "选择身份", "暂不设置", "首页", "我的")
-        diagnostics.emit("app.snapshot", error_type=type(exc).__name__, pids=pids, node_count=len(nodes),
-                         markers=[marker for marker in markers if any(marker in text for text in texts)])
+        # A failing AX scan must not be invoked a second time while collecting evidence.
+        snapshot = getattr(self._ax, "diagnostic_state", None)
+        diagnostics.emit("app.snapshot", error_type=type(exc).__name__, source="cached_ax_scan",
+                         scan=snapshot() if callable(snapshot) else None)

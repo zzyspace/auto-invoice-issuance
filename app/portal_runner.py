@@ -23,7 +23,7 @@ from app.photos_qr_cleanup import (
     PhotosQrCleanupError,
     delete_imported_qr_from_photos,
 )
-from app.portal_local_login import PortalLocalLoginError, PortalMacLoginAutomator
+from app.portal_local_login import PortalAccessibilityError, PortalLocalLoginError, PortalMacLoginAutomator
 from app.portal_diagnostics import PAGE_SNAPSHOT_JS, PortalDiagnostics, diagnostic_step
 from app.portal_sync import PortalWorkbookSyncer
 from app.portal_workbook import load_portal_issue_rows, sha256_file, summarize_portal_issue_rows
@@ -916,6 +916,9 @@ class TaxPortalRunner:
         automator._diagnostic_step_changed = self._diagnostic_step_changed
         try:
             imported_qr = automator.automate(page, result.artifacts_dir)
+        except PortalAccessibilityError:
+            # UI state/action outcome is unknown; stop this store instead of rescanning or clicking again.
+            raise
         except PortalLocalLoginError as exc:
             self._log(
                 result.store_key,

@@ -96,6 +96,183 @@ class PortalDiagnosticsTests(unittest.TestCase):
                 diagnostics.finish("failed")
             self.assertEqual(1, output.call_count)
 
+    def test_long_phase_without_operation_includes_business_thread_stack_in_heartbeat(self):
+        with tempfile.TemporaryDirectory() as temp:
+            diagnostics = PortalDiagnostics(Path(temp), heartbeat_seconds=0.01)
+            observed = threading.Event()
+            original_emit = diagnostics.emit
+
+            def emit(event, **fields):
+                original_emit(event, **fields)
+                if event == "heartbeat":
+                    observed.set()
+
+            with patch.object(diagnostics, "emit", side_effect=emit):
+                with diagnostics.phase("wait_external_login"):
+                    with diagnostics._lock:
+                        diagnostics._step_started -= 31.0
+                    self.assertTrue(observed.wait(2))
+            diagnostics.finish("success")
+            events = records(diagnostics.directory)
+            heartbeat = next(row for row in events if row["event"] == "heartbeat" and "step_stack" in row)
+            self.assertEqual("wait_external_login", heartbeat["step"])
+            self.assertEqual(threading.get_ident(), heartbeat["business_thread_id"])
+            self.assertGreaterEqual(heartbeat["step_elapsed_ms"], 31000)
+            self.assertIsNone(heartbeat["current_operation"])
+            self.assertTrue(any(frame["function"] ==
+                                "test_long_phase_without_operation_includes_business_thread_stack_in_heartbeat"
+                                for frame in heartbeat["step_stack"]))
+            self.assertTrue(all(set(frame) == {"file", "function", "line"} for frame in heartbeat["step_stack"]))
+            self.assertFalse(any(row["event"].endswith(".failed") for row in events))
+            self.assertFalse(diagnostics._thread.is_alive())
+
+    def test_watchdog_records_real_blocked_thread_and_target_without_values(self):
+        with tempfile.TemporaryDirectory() as temp:
+            diagnostics = PortalDiagnostics(Path(temp), heartbeat_seconds=0.01, watchdog_seconds=0.04)
+            blocked = threading.Event()
+            release = threading.Event()
+            entered = threading.Event()
+            original_emit = diagnostics.emit
+
+            def emit(event, **fields):
+                original_emit(event, **fields)
+                if event == "operation.blocked":
+                    blocked.set()
+
+            def blocked_native_read():
+                private_local = "private-value-only-in-local-variable"
+                with diagnostics.phase("app_login"):
+                    with diagnostics.operation("ax.read", pid=123, element_id="0xabc", attribute="AXValue",
+                                               node_count=7, phase="scan", scan_id="scan-1", depth=2,
+                                               path="root/0/3", role="AXTextField", return_code=-25204,
+                                               value=private_local, password="never-log-this"):
+                        entered.set()
+                        release.wait(2)
+
+            with patch.object(diagnostics, "emit", side_effect=emit):
+                worker = threading.Thread(target=blocked_native_read)
+                worker.start()
+                try:
+                    self.assertTrue(entered.wait(2))
+                    self.assertTrue(blocked.wait(2))
+                    events = records(diagnostics.directory)
+                    stalled = next(row for row in events if row["event"] == "operation.blocked")
+                    operation = stalled["operation"]
+                    self.assertEqual(worker.ident, operation["thread_id"])
+                    self.assertEqual("AXValue", operation["metadata"]["attribute"])
+                    self.assertEqual("root/0/3", operation["metadata"]["path"])
+                    self.assertEqual("AXTextField", operation["metadata"]["role"])
+                    self.assertEqual(-25204, operation["metadata"]["return_code"])
+                    self.assertEqual("app_login", operation["step"])
+                    self.assertGreaterEqual(operation["duration_ms"], 40)
+                    self.assertTrue(any(frame["function"] == "blocked_native_read" for frame in stalled["stack"]))
+                    self.assertTrue(any(frame["function"] == "wait" for frame in stalled["stack"]))
+                    self.assertTrue(all(set(frame) == {"file", "function", "line"} for frame in stalled["stack"]))
+                    heartbeat = next(row for row in events if row["event"] == "heartbeat" and row["current_operation"])
+                    self.assertEqual("AXValue", heartbeat["current_operation"]["metadata"]["attribute"])
+                    status = json.loads((diagnostics.directory / "status.json").read_text())
+                    self.assertEqual("ax.read", status["current_operation"]["name"])
+                    # The same call is reported once, although many monitor ticks run.
+                    self.assertFalse(release.wait(0.08))
+                    self.assertEqual(1, sum(row["event"] == "operation.blocked" for row in records(diagnostics.directory)))
+                finally:
+                    release.set()
+                    worker.join(2)
+                    diagnostics.finish("success")
+            self.assertFalse(worker.is_alive())
+            self.assertFalse(diagnostics._thread.is_alive())
+            status = json.loads((diagnostics.directory / "status.json").read_text())
+            self.assertIsNone(status["current_operation"])
+            self.assertEqual("finished", status["last_progress"]["status"])
+            self.assertEqual({}, diagnostics._operations)
+            content = "\n".join(path.read_text() for path in diagnostics.directory.glob("*.json*"))
+            self.assertNotIn("private-value-only-in-local-variable", content)
+            self.assertNotIn("never-log-this", content)
+            self.assertNotIn("watchdog_seconds", content)
+
+    def test_fast_operations_remain_in_bounded_memory_until_heartbeat(self):
+        with tempfile.TemporaryDirectory() as temp:
+            diagnostics = PortalDiagnostics(Path(temp), heartbeat_seconds=0)
+            initial_events = records(diagnostics.directory)
+            for index in range(30):
+                with diagnostics.operation("ax.read", node_count=index, attribute="AXChildren"):
+                    pass
+            self.assertEqual(initial_events, records(diagnostics.directory))
+            self.assertEqual(12, len(diagnostics._recent_operations))
+            diagnostics.emit("heartbeat")
+            heartbeat = records(diagnostics.directory)[-1]
+            self.assertIsNone(heartbeat["current_operation"])
+            self.assertEqual(list(range(18, 30)), [row["metadata"]["node_count"] for row in heartbeat["recent_operations"]])
+            self.assertEqual(29, heartbeat["last_progress"]["metadata"]["node_count"])
+            self.assertIsNone(diagnostics._thread)
+            diagnostics.finish("success")
+
+    def test_nested_operation_restores_outer_call_and_failure_omits_exception_text(self):
+        with tempfile.TemporaryDirectory() as temp:
+            diagnostics = PortalDiagnostics(Path(temp), heartbeat_seconds=0)
+            original = RuntimeError("sensitive-value-that-is-not-a-configured-secret")
+            with diagnostics.operation("ax.scan", phase="scan"):
+                try:
+                    with diagnostics.operation("ax.read", attribute="AXValue", value="unknown-private-value",
+                                               role="private-role-text", path="password/private"):
+                        raise original
+                except RuntimeError as observed:
+                    self.assertIs(original, observed)
+                diagnostics.emit("heartbeat")
+                self.assertEqual("ax.scan", records(diagnostics.directory)[-1]["current_operation"]["name"])
+            diagnostics.finish("failed")
+            events = records(diagnostics.directory)
+            failure = next(row for row in events if row["event"] == "operation.failed")
+            self.assertEqual("RuntimeError", failure["operation"]["error_type"])
+            self.assertEqual({"attribute": "AXValue"}, failure["operation"]["metadata"])
+            content = "\n".join(path.read_text() for path in diagnostics.directory.glob("*.json*"))
+            for secret in (str(original), "unknown-private-value", "private-role-text", "password/private"):
+                self.assertNotIn(secret, content)
+
+    def test_operation_write_failure_preserves_business_exception_and_clears_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "not-a-directory"
+            root.write_text("occupied")
+            original = ValueError("original-business-error")
+            with patch("builtins.print") as output:
+                diagnostics = PortalDiagnostics(root, heartbeat_seconds=0)
+                with self.assertRaises(ValueError) as captured:
+                    with diagnostics.operation("ax.read", attribute="AXValue"):
+                        raise original
+                self.assertIs(original, captured.exception)
+                self.assertEqual({}, diagnostics._operations)
+                self.assertIsNone(diagnostics.state["current_operation"])
+                diagnostics.finish("failed")
+            self.assertEqual(1, output.call_count)
+
+    def test_finish_clears_inflight_call_and_late_completion_does_not_reopen_run(self):
+        with tempfile.TemporaryDirectory() as temp:
+            diagnostics = PortalDiagnostics(Path(temp), heartbeat_seconds=0.01, watchdog_seconds=0.03)
+            entered = threading.Event()
+            release = threading.Event()
+
+            def blocked_native_read():
+                with diagnostics.operation("ax.read", attribute="AXChildren"):
+                    entered.set()
+                    release.wait(2)
+
+            worker = threading.Thread(target=blocked_native_read)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                diagnostics.finish("interrupted")
+                finished_events = records(diagnostics.directory)
+            finally:
+                release.set()
+                worker.join(2)
+            self.assertFalse(worker.is_alive())
+            self.assertFalse(diagnostics._thread.is_alive())
+            self.assertEqual(finished_events, records(diagnostics.directory))
+            status = json.loads((diagnostics.directory / "status.json").read_text())
+            self.assertEqual("interrupted", status["status"])
+            self.assertIsNone(status["current_operation"])
+            self.assertEqual({}, diagnostics._operations)
+
     def test_new_pages_redirects_and_network_errors_are_recorded_once_and_detached(self):
         with tempfile.TemporaryDirectory() as temp:
             diagnostics = PortalDiagnostics(Path(temp), heartbeat_seconds=0)

@@ -13,6 +13,7 @@ from app.portal_local_login import (
     CG_EVENT_FLAG_MASK_COMMAND,
     KEY_A,
     KEY_DELETE,
+    MacAccessibilityClient,
     PortalLocalLoginError,
     PortalMacLoginAutomator,
     STARTUP_REMINDER_TITLE,
@@ -31,6 +32,16 @@ def build_png_data_url(width: int, height: int) -> tuple[bytes, str]:
 
 
 class PortalLocalLoginTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # These are workflow unit tests. Never inspect/activate the user's live tax app.
+        for name, result in (("find_nodes", []), ("find_focused_nodes", []), ("window_bounds", None)):
+            mocked = patch.object(MacAccessibilityClient, name, return_value=result)
+            mocked.start()
+            self.addCleanup(mocked.stop)
+        commands = patch.object(PortalMacLoginAutomator, "_run_command", return_value="")
+        commands.start()
+        self.addCleanup(commands.stop)
+
     def _build_config(self, tmp_path: Path, **overrides: object) -> AppConfig:
         base_kwargs = dict(
             timezone="Asia/Shanghai",
