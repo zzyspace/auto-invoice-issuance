@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from app.models import StoreConfig
 from app.portal_diagnostics import PortalDiagnostics, diagnostic_step
+from app.portal_local_login import PortalLocalLoginError
 from app.portal_runner import TaxPortalRunner
 from app.state import StateStore
 
@@ -297,7 +298,7 @@ class PortalDiagnosticsTests(unittest.TestCase):
             self.assertTrue(all(not handlers for handlers in page.handlers.values()))
             self.assertEqual([], context.handlers["page"])
 
-    def test_workbook_failure_before_result_creation_is_persisted(self):
+    def test_workbook_failure_is_logged_without_creating_business_state_or_history(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             runner, store = self.make_runner(root)
@@ -308,36 +309,57 @@ class PortalDiagnosticsTests(unittest.TestCase):
             directory = next((root / "artifacts/runs").iterdir())
             self.assertEqual("failed", json.loads((directory / "status.json").read_text())["status"])
             with sqlite3.connect(root / "state.db") as db:
-                status, step = db.execute("SELECT last_status, current_step FROM portal_issue_state").fetchone()
-            self.assertEqual(("failed", "prepare_workbook"), (status, step))
+                self.assertEqual(0, db.execute("SELECT COUNT(*) FROM portal_issue_state").fetchone()[0])
+                self.assertEqual(0, db.execute("SELECT COUNT(*) FROM portal_issue_history").fetchone()[0])
             self.assertTrue(any(row["event"] == "step.failed" and "FileNotFoundError" in row["traceback"]
                                 for row in records(directory)))
 
-    def test_interruption_records_precise_step_and_history_and_restores_handlers(self):
+    def test_keyboard_interrupt_is_logged_and_propagates_without_changing_handlers_or_business_history(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             runner, store = self.make_runner(root)
             page = SimpleNamespace(url="https://example.test/login")
             context = Emitter(pages=[])
-            previous = signal.getsignal(signal.SIGTERM)
+            previous_handlers = {signum: signal.getsignal(signum) for signum in (signal.SIGTERM, signal.SIGHUP)}
+            original = KeyboardInterrupt("user interrupted")
 
             @diagnostic_step("app_wait_sms")
             def interrupted(owner, *_args):
-                signal.raise_signal(signal.SIGTERM)
+                raise original
 
             summary = SimpleNamespace(row_count=1, total_amount_including_tax=Decimal("1"))
             with patch.object(runner, "_prepare_workbook", return_value=([object()], summary, "abc")), \
                  patch.object(runner, "_goto"), \
                  patch.object(runner, "_ensure_logged_in", side_effect=lambda *args: interrupted(runner, *args)), \
-                 patch.object(runner, "_run_browser", side_effect=lambda stores: [runner._run_store(context, page, stores[0])]):
-                with self.assertRaisesRegex(KeyboardInterrupt, "SIGTERM"):
+                 patch.object(runner, "_run_browser", side_effect=lambda stores: [runner._run_store(context, page, stores[0])]), \
+                 patch("signal.signal") as register_handler:
+                with self.assertRaises(KeyboardInterrupt) as captured:
                     runner.run([store])
-            self.assertIs(previous, signal.getsignal(signal.SIGTERM))
+            self.assertIs(original, captured.exception)
+            register_handler.assert_not_called()
+            for signum, previous in previous_handlers.items():
+                self.assertIs(previous, signal.getsignal(signum))
             directory = next((root / "artifacts/runs").iterdir())
-            self.assertEqual("interrupted", json.loads((directory / "status.json").read_text())["status"])
+            status = json.loads((directory / "status.json").read_text())
+            self.assertEqual("interrupted", status["status"])
+            self.assertEqual("app_wait_sms", status["step"])
             with sqlite3.connect(root / "state.db") as db:
-                row = db.execute("SELECT status, step, submitted_count FROM portal_issue_history").fetchone()
-            self.assertEqual(("failed", "app_wait_sms", 0), row)
+                self.assertEqual(0, db.execute("SELECT COUNT(*) FROM portal_issue_history").fetchone()[0])
+                row = db.execute("SELECT last_status, current_step FROM portal_issue_state").fetchone()
+            self.assertEqual(("running", "prepare_workbook"), row)
+            self.assertTrue(any(row["event"] == "store.failed" and row["failure_step"] == "app_wait_sms"
+                                for row in records(directory)))
+
+    def test_local_app_error_keeps_original_manual_login_wait_fallback(self):
+        with tempfile.TemporaryDirectory() as temp:
+            runner, _ = self.make_runner(Path(temp))
+            result = SimpleNamespace(store_key="test", portal_company_role="legal_representative", artifacts_dir=None)
+            with patch("app.portal_runner.PortalMacLoginAutomator") as constructor, patch.object(runner, "_log") as log:
+                constructor.return_value.automate.side_effect = PortalLocalLoginError("app login failed")
+                constructor.return_value.imported_qr = None
+                imported_qr = runner._attempt_local_app_login(object(), result)
+            self.assertIsNone(imported_qr)
+            self.assertTrue(any("falling back to manual login wait" in call.args[1] for call in log.call_args_list))
 
     def test_failure_snapshot_precedes_page_cleanup_and_retains_innermost_step(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -368,10 +390,14 @@ class PortalDiagnosticsTests(unittest.TestCase):
                  patch.object(runner, "_capture_artifact"), \
                  patch.object(runner, "_run_browser", side_effect=lambda stores: [runner._run_store(Emitter(pages=[]), page, stores[0])]):
                 result = runner.run([store])[0]
-            self.assertEqual("import_workbook", result.step)
+            self.assertEqual("prepare_workbook", result.step)
             self.assertEqual("failed", result.status)
             self.assertLess(order.index("screenshot"), order.index("close"))
             self.assertEqual(1, order.count("snapshot"))
+            directory = next((root / "artifacts/runs").iterdir())
+            self.assertEqual("import_workbook", json.loads((directory / "status.json").read_text())["step"])
+            self.assertTrue(any(row["event"] == "operation.failed" and row["failure_step"] == "import_workbook"
+                                for row in records(directory)))
 
 
 if __name__ == "__main__":

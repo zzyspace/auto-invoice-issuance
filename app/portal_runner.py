@@ -5,9 +5,7 @@ import json
 import os
 import re
 import shutil
-import signal
 import subprocess
-import threading
 import traceback
 from dataclasses import dataclass
 from decimal import Decimal
@@ -23,7 +21,7 @@ from app.photos_qr_cleanup import (
     PhotosQrCleanupError,
     delete_imported_qr_from_photos,
 )
-from app.portal_local_login import PortalAccessibilityError, PortalLocalLoginError, PortalMacLoginAutomator
+from app.portal_local_login import PortalLocalLoginError, PortalMacLoginAutomator
 from app.portal_diagnostics import PAGE_SNAPSHOT_JS, PortalDiagnostics, diagnostic_step
 from app.portal_sync import PortalWorkbookSyncer
 from app.portal_workbook import load_portal_issue_rows, sha256_file, summarize_portal_issue_rows
@@ -100,8 +98,6 @@ class TaxPortalRunner:
         self._dialog_inert_context_ids: set[int] = set()
         self._dialog_inert_page_ids: set[int] = set()
         self._diagnostics: PortalDiagnostics | None = None
-        self._diagnostic_store: StoreConfig | None = None
-        self._diagnostic_result: PortalIssueResult | None = None
         if config.portal_browser_backend not in {"playwright", "chrome_cdp"}:
             raise ValueError(
                 "TAX_PORTAL_BROWSER_BACKEND must be one of: playwright, chrome_cdp."
@@ -125,15 +121,7 @@ class TaxPortalRunner:
         )
         self._diagnostics = diagnostics
         self._log("runner", f"diagnostics directory={diagnostics.directory}")
-        previous_handlers = {}
-
-        def interrupted(signum, _frame):
-            raise KeyboardInterrupt(f"received {signal.Signals(signum).name}")
-
         try:
-            if threading.current_thread() is threading.main_thread():
-                for signum in (signal.SIGTERM, signal.SIGHUP):
-                    previous_handlers[signum] = signal.signal(signum, interrupted)
             results = self._run_browser(stores)
         except BaseException as exc:
             diagnostics.emit("run.failed", error_type=type(exc).__name__, error=str(exc),
@@ -148,13 +136,11 @@ class TaxPortalRunner:
         else:
             diagnostics.finish(
                 "failed" if any(result.status == "failed" for result in results) else "success",
-                step=results[-1].step if results else "complete",
+                step=diagnostics.state.get("failure_step", results[-1].step) if results else "complete",
                 store_key=results[-1].store_key if results else None,
             )
             return results
         finally:
-            for signum, previous in previous_handlers.items():
-                signal.signal(signum, previous)
             self._diagnostics = None
 
     @diagnostic_step("browser_session")
@@ -308,9 +294,8 @@ class TaxPortalRunner:
         diagnostics = getattr(self, "_diagnostics", None)
         if diagnostics is None:
             return self._run_store_impl(context, home_page, store)
-        self._diagnostic_store = store
-        self._diagnostic_result = None
         diagnostics.state["store_key"] = store.store_key
+        diagnostics.state.pop("failure_step", None)
         diagnostics.observe_context(context)
         diagnostics.emit("store.started", workbook=store.output_xlsx_path.name)
         try:
@@ -325,17 +310,8 @@ class TaxPortalRunner:
             step = getattr(exc, "portal_diagnostic_step", diagnostics.state["step"])
             diagnostics.emit("store.failed", failure_step=step, error_type=type(exc).__name__,
                              error=str(exc), traceback=traceback.format_exc())
-            result = self._diagnostic_result
-            if result is not None and result.finished_at is None:
-                result.status, result.step = "failed", step
-                result.error = f"{type(exc).__name__}: {exc}"
-                self._finalize_result(result)
-            else:
-                self._update_store_step(store.store_key, step, "failed", error=f"{type(exc).__name__}: {exc}")
             raise
         finally:
-            self._diagnostic_store = None
-            self._diagnostic_result = None
             diagnostics.state["store_key"] = None
 
     def _run_store_impl(self, context: object, home_page: object, store: StoreConfig) -> PortalIssueResult:
@@ -374,7 +350,6 @@ class TaxPortalRunner:
             step="prepare_workbook",
             artifacts_dir=self._prepare_artifacts_dir(store.store_key),
         )
-        self._diagnostic_result = result
         self._update_store_step(
             store.store_key,
             result.step,
@@ -637,8 +612,11 @@ class TaxPortalRunner:
                     pass
         except Exception as exc:  # noqa: BLE001
             result.status = "failed"
-            result.step = getattr(exc, "portal_diagnostic_step", result.step or "unknown")
+            result.step = result.step or "unknown"
             result.error = str(exc)
+            diagnostics = getattr(self, "_diagnostics", None)
+            if diagnostics is not None:
+                diagnostics.state["failure_step"] = getattr(exc, "portal_diagnostic_step", result.step)
             self._diagnostic_failure(exc, (active_page,))
             self._log(store.store_key, f"step={result.step} status=failed error={result.error}")
             self._capture_artifact(active_page, result.artifacts_dir, f"{store.store_key}-failure")
@@ -655,16 +633,6 @@ class TaxPortalRunner:
             block_on_empty_amount=self.config.portal_block_on_empty_amount,
         )
         return rows, summarize_portal_issue_rows(rows), sha256_file(store.output_xlsx_path)
-
-    def _diagnostic_step_changed(self, step: str) -> None:
-        store = getattr(self, "_diagnostic_store", None)
-        result = getattr(self, "_diagnostic_result", None)
-        if store is None or (result is not None and result.finished_at is not None):
-            return
-        self.state_store.update_portal_issue_state(
-            store.store_key, current_step=step, last_status="running",
-            workbook_sha256=result.workbook_sha256 if result is not None else None,
-        )
 
     def _diagnostic_failure(self, exc: BaseException, args: tuple) -> None:
         diagnostics = getattr(self, "_diagnostics", None)
@@ -913,12 +881,8 @@ class TaxPortalRunner:
             portal_company_switch_name=portal_company_switch_name,
         )
         automator._diagnostics = getattr(self, "_diagnostics", None)
-        automator._diagnostic_step_changed = self._diagnostic_step_changed
         try:
             imported_qr = automator.automate(page, result.artifacts_dir)
-        except PortalAccessibilityError:
-            # UI state/action outcome is unknown; stop this store instead of rescanning or clicking again.
-            raise
         except PortalLocalLoginError as exc:
             self._log(
                 result.store_key,
