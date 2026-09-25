@@ -4,7 +4,7 @@ import base64
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from app.models import AppConfig
 from app.photos_qr_cleanup import ImportedPhotosQr
@@ -1525,3 +1525,92 @@ class PortalLocalLoginTests(unittest.TestCase):
             ],
             events,
         )
+
+
+class PortalPostLoginRecheckTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Exercise state transitions without loading frameworks or touching a live app.
+        self.automator = object.__new__(PortalMacLoginAutomator)
+        self.automator.role_label = "法定代表人"
+        self.automator._diagnostics = None
+        self.automator._log = Mock()
+        self.now = 0.0
+        self.sleeps = []
+
+        def advance(seconds):
+            self.sleeps.append(seconds)
+            self.now += seconds
+
+        for mocked in (
+            patch("app.portal_local_login.monotonic", side_effect=lambda: self.now),
+            patch("app.portal_local_login.sleep", side_effect=advance),
+        ):
+            mocked.start()
+            self.addCleanup(mocked.stop)
+
+    def observe(self, states):
+        observations = iter(states)
+        mocked = patch.object(
+            self.automator, "_collect_visible_texts",
+            side_effect=lambda *_args, **_kwargs: next(observations, states[-1]),
+        )
+        self.addCleanup(mocked.stop)
+        return mocked.start()
+
+    def test_transient_guest_home_is_rechecked_until_logged_in_home_appears(self):
+        read = self.observe([["立即登录"], ["立即登录"], ["身份切换", "功能名称"]])
+        state = self.automator._wait_for_post_login_state("test.bundle", timeout_seconds=5)
+        self.assertEqual("home", state)
+        self.assertEqual(3, read.call_count)
+        self.assertLess(self.now, 5)
+        self.automator._log.assert_any_call("post-login recheck confirmed logged-in home")
+
+    def test_mixed_home_and_guest_labels_are_not_accepted_as_authenticated(self):
+        read = self.observe([["功能名称", "立即登录"], ["身份切换"]])
+        self.assertEqual("home", self.automator._wait_for_post_login_state("test.bundle", timeout_seconds=5))
+        self.assertEqual(2, read.call_count)
+        self.assertTrue(self.sleeps)
+
+    def test_fingerprint_prompt_can_follow_transient_login_label(self):
+        read = self.observe([["立即登录"], ["是否开启指纹快捷登录", "暂不设置"]])
+        self.assertEqual("fingerprint_prompt", self.automator._wait_for_post_login_state("test.bundle", timeout_seconds=5))
+        self.assertEqual(2, read.call_count)
+        self.assertLess(self.now, 5)
+
+    def test_persistent_login_page_uses_original_deadline_without_restarting_it(self):
+        read = self.observe([["立即登录"]])
+        self.assertEqual("login_page", self.automator._wait_for_post_login_state("test.bundle", timeout_seconds=5))
+        self.assertGreater(read.call_count, 1)
+        self.assertGreaterEqual(self.now, 5)
+        self.assertLess(self.now, 5.3)
+        self.automator._log.assert_any_call("post-login recheck ended with 立即登录 still present")
+
+    def test_disappeared_login_label_does_not_report_stale_login_page(self):
+        self.observe([["立即登录"], ["正在加载"]])
+        self.assertEqual("timeout", self.automator._wait_for_post_login_state("test.bundle", timeout_seconds=1))
+        self.assertGreaterEqual(self.now, 1)
+        self.assertLess(self.now, 1.3)
+
+    def test_definite_states_still_return_immediately(self):
+        for texts, expected in (
+            (["身份切换"], "home"),
+            (["暂不设置"], "fingerprint_prompt"),
+            (["法定代表人", "确认"], "role_dialog"),
+            (["切换成功", "法定代表人", "确认"], "switch_success_dialog"),
+        ):
+            with self.subTest(state=expected), patch.object(self.automator, "_collect_visible_texts", return_value=texts) as read:
+                self.assertEqual(expected, self.automator._wait_for_post_login_state("test.bundle", timeout_seconds=5))
+                read.assert_called_once()
+                self.assertEqual([], self.sleeps)
+
+    def test_role_confirmation_continues_after_home_finishes_loading_without_reclick(self):
+        read = self.observe([["立即登录"], ["身份切换", "功能名称"]])
+        with patch.object(self.automator, "_select_role_option") as select_role, patch.object(
+            self.automator, "_confirm_role_dialog"
+        ) as confirm_role, patch.object(self.automator, "_dismiss_fingerprint_prompt") as dismiss:
+            self.automator._handle_post_sms_login_state("test.bundle", "role_dialog")
+        self.assertEqual(2, read.call_count)
+        select_role.assert_called_once_with("test.bundle")
+        confirm_role.assert_called_once_with("test.bundle")
+        dismiss.assert_not_called()
+        self.automator._log.assert_any_call("identity role selection entered logged-in home directly without fingerprint prompt")

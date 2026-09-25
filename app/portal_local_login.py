@@ -1579,6 +1579,8 @@ class PortalMacLoginAutomator:
     @diagnostic_step("app_wait_login_result")
     def _wait_for_post_login_state(self, bundle_id: str, *, timeout_seconds: float) -> str:
         deadline = monotonic() + timeout_seconds
+        login_page_seen = False
+        login_page_pending = False
         while monotonic() < deadline:
             texts = self._collect_visible_texts(bundle_id, timeout_seconds=1.0)
             if self._texts_show_switch_success_dialog(texts):
@@ -1588,10 +1590,19 @@ class PortalMacLoginAutomator:
             if "暂不设置" in texts or any("指纹快捷登录" in text for text in texts):
                 return "fingerprint_prompt"
             if self._texts_show_logged_in_home(texts):
+                if login_page_seen:
+                    self._log("post-login recheck confirmed logged-in home")
                 return "home"
-            if any("立即登录" in text for text in texts):
-                return "login_page"
+            # The guest-home label can remain briefly while the authenticated home loads.
+            # Recheck within the caller's existing wait; do not reset its deadline.
+            login_page_pending = any("立即登录" in text for text in texts)
+            if login_page_pending and not login_page_seen:
+                self._log("post-login page still shows 立即登录; rechecking until the existing wait expires")
+                login_page_seen = True
             sleep(0.3)
+        if login_page_pending:
+            self._log("post-login recheck ended with 立即登录 still present")
+            return "login_page"
         return "timeout"
 
     def _texts_show_role_dialog(self, texts: list[str]) -> bool:
