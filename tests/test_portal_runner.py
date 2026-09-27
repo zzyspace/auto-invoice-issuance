@@ -44,7 +44,9 @@ class PortalRunnerUrlTests(unittest.TestCase):
             with patch.object(runner, "_log") as mocked_log:
                 runner._cleanup_imported_login_qrs([imported_qr], "fuzzy")  # noqa: SLF001
 
-        mocked_delete.assert_called_once_with(imported_qr)
+        mocked_delete.assert_called_once()
+        self.assertEqual((imported_qr,), mocked_delete.call_args.args)
+        self.assertTrue(callable(mocked_delete.call_args.kwargs["logger"]))
         self.assertIn("deleted verified imported login QR", mocked_log.call_args.args[1])
 
     def test_cleanup_imported_login_qr_is_nonfatal_when_identity_cannot_be_verified(self) -> None:

@@ -905,7 +905,9 @@ class TaxPortalRunner:
     ) -> None:
         for imported_qr in imported_qrs:
             try:
-                status = delete_imported_qr_from_photos(imported_qr)
+                status = delete_imported_qr_from_photos(
+                    imported_qr, logger=lambda message: self._log(store_key, message),
+                )
             except PhotosQrCleanupError as exc:
                 self._log(
                     store_key,

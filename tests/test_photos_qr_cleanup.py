@@ -6,6 +6,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -30,6 +31,95 @@ def png_bytes(width: int, height: int) -> bytes:
 
 
 class PhotosQrCleanupTests(unittest.TestCase):
+    def test_transcript_is_live_and_large_output_does_not_fill_a_pipe(self) -> None:
+        real_popen = subprocess.Popen
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "confirmation.log"
+
+            def harmless_child(command, **kwargs):
+                self.assertEqual("diagnostics", command[-1])
+                self.assertNotEqual(subprocess.PIPE, kwargs["stdout"])
+                self.assertEqual(subprocess.STDOUT, kwargs["stderr"])
+                return real_popen(
+                    [sys.executable, "-u", "-c",
+                     "import time; print('x' * 150000, flush=True); "
+                     "print('PHOTOS_DIAG event=begin operation=element.value element_index=42', flush=True); "
+                     "time.sleep(30)"], **kwargs,
+                )
+
+            with patch("app.photos_qr_cleanup.subprocess.Popen", side_effect=harmless_child):
+                watcher = _start_delete_confirmation_watcher(log_path=path)
+            try:
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    if "element_index=42" in path.read_text():
+                        break
+                    time.sleep(0.01)
+                self.assertIsNone(watcher.poll())
+                self.assertIn("element_index=42", path.read_text())
+            finally:
+                summary = _stop_delete_confirmation_watcher(watcher)
+            self.assertGreater(path.stat().st_size, 150000)
+            self.assertIn("event=watcher.start", path.read_text())
+            self.assertIn("stop_requested=True", path.read_text())
+            self.assertIn(str(path), summary)
+
+    def test_success_keeps_watcher_evidence_for_auto_manual_and_watcher_error(self) -> None:
+        for running, code, last_line in (
+            (False, 0, "dialog-dismissed attempts=1"),
+            (True, -15, "PHOTOS_DIAG event=begin operation=element.value element_index=42"),
+            (False, 1, "syntax error: simulated watcher failure"),
+        ):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as tmp_dir:
+                qr = ImportedPhotosQr(Path(tmp_dir) / "login-qr.png", "asset-id", "login-qr.png", "a" * 64, 240, 240)
+                path = qr.qr_path.with_suffix(".photos-confirm.log")
+                path.write_text("first-scan-evidence\n" + last_line + "\n")
+                watcher = Mock(pid=123, returncode=code)
+                watcher._photos_confirmation_log_path = path
+                watcher.poll.return_value = None if running else code
+                watcher.communicate.return_value = (None, None)
+                helper = Path("/tools/photos-qr-cleanup.app/Contents/MacOS/photos-qr-cleanup")
+                logger = Mock()
+                with (
+                    patch("app.photos_qr_cleanup._ensure_photos_cleanup_helper", return_value=helper),
+                    patch("app.photos_qr_cleanup._photos_asset_exists", side_effect=[True, False]),
+                    patch("app.photos_qr_cleanup._start_delete_confirmation_watcher", return_value=watcher) as start,
+                    patch("app.photos_qr_cleanup.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")),
+                ):
+                    self.assertEqual("deleted", delete_imported_qr_from_photos(qr, logger=logger))
+                start.assert_called_once_with(log_path=path)
+                self.assertIn("first-scan-evidence", path.read_text())
+                self.assertIn(last_line, path.read_text())
+                self.assertIn(f"returncode={code}", path.read_text())
+                self.assertTrue(any(last_line in call.args[0] for call in logger.call_args_list))
+                if running:
+                    watcher.terminate.assert_called_once()
+                else:
+                    watcher.terminate.assert_not_called()
+
+    def test_log_file_failure_disables_verbose_trace_without_preventing_watcher(self) -> None:
+        watcher = Mock()
+        watcher.poll.return_value = 0
+        watcher.communicate.return_value = ("timed-out status=not-found attempts=0", "watching")
+        with patch.object(Path, "open", side_effect=PermissionError("read only")), patch(
+            "app.photos_qr_cleanup.subprocess.Popen", return_value=watcher
+        ) as popen:
+            self.assertIs(watcher, _start_delete_confirmation_watcher(log_path=Path("denied.log")))
+        self.assertNotIn("diagnostics", popen.call_args.args[0])
+        self.assertEqual(subprocess.PIPE, popen.call_args.kwargs["stdout"])
+        self.assertIn("diagnostics_file_unavailable=PermissionError", _stop_delete_confirmation_watcher(watcher))
+
+    def test_reporting_failure_does_not_turn_verified_deletion_into_failure(self) -> None:
+        qr = ImportedPhotosQr(Path("/tmp/login-qr.png"), "asset-id", "login-qr.png", "a" * 64, 240, 240)
+        helper = Path("/tools/photos-qr-cleanup.app/Contents/MacOS/photos-qr-cleanup")
+        with (
+            patch("app.photos_qr_cleanup._ensure_photos_cleanup_helper", return_value=helper),
+            patch("app.photos_qr_cleanup._photos_asset_exists", side_effect=[True, False]),
+            patch("app.photos_qr_cleanup._start_delete_confirmation_watcher", return_value=None),
+            patch("app.photos_qr_cleanup.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")),
+        ):
+            self.assertEqual("deleted", delete_imported_qr_from_photos(qr, logger=Mock(side_effect=OSError("disk full"))))
+
     def test_describe_imported_qr_records_exact_identity_and_content(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             qr_path = Path(tmp_dir) / "login-qr-123.png"
@@ -252,7 +342,7 @@ class PhotosQrCleanupTests(unittest.TestCase):
 class PhotosConfirmationAppleScriptTests(unittest.TestCase):
     """Execute the actual polling logic with a simulated UI; never access Photos."""
 
-    def run_simulated_scans(self, statuses: list[str], timeout: str = "10") -> subprocess.CompletedProcess[str]:
+    def run_simulated_scans(self, statuses: list[str], timeout: str = "10", *, diagnostics: bool = False) -> subprocess.CompletedProcess[str]:
         # Remove the ONLY handler that talks to System Events before executing anything.
         controller = PHOTOS_DELETE_CONFIRM_SCRIPT.split("\non scanDeleteDialog(", 1)[0]
         self.assertNotIn('tell application', controller)
@@ -268,7 +358,7 @@ on scanDeleteDialog(clickMethod)
 end scanDeleteDialog
 '''
         completed = subprocess.run(
-            ["/usr/bin/osascript", "-e", controller + fake_scan, timeout],
+            ["/usr/bin/osascript", "-e", controller + fake_scan, timeout] + (["diagnostics"] if diagnostics else []),
             capture_output=True, text=True, timeout=15,
         )
         self.assertEqual(0, completed.returncode, completed.stderr)
@@ -281,6 +371,69 @@ end scanDeleteDialog
                 input=PHOTOS_DELETE_CONFIRM_SCRIPT, capture_output=True, text=True, timeout=15,
             )
         self.assertEqual(0, completed.returncode, completed.stderr)
+
+    def test_verbose_controller_records_scan_and_confirmation_outcome(self) -> None:
+        completed = self.run_simulated_scans(
+            ["not-found", "clicked", "not-found", "not-found", "not-found"], diagnostics=True,
+        )
+        self.assertEqual("dialog-dismissed attempts=1", completed.stdout.strip())
+        self.assertIn("PHOTOS_DIAG elapsed_s=", completed.stderr)
+        self.assertIn("scan=1", completed.stderr)
+        self.assertIn("event=scan.end status=not-found", completed.stderr)
+        self.assertIn("event=watcher.end reason=dialog-dismissed attempts=1", completed.stderr)
+
+    def test_osascript_trace_is_persisted_while_simulated_scan_is_still_waiting(self) -> None:
+        controller = PHOTOS_DELETE_CONFIRM_SCRIPT.split("\non scanDeleteDialog(", 1)[0]
+        simulated = controller + '''
+on scanDeleteDialog(clickMethod)
+    set diagnosticContext to "pid=123 window_index=1"
+    my traceBegin("window.entire_contents")
+    delay 30
+    return {"not-found", ""}
+end scanDeleteDialog
+'''
+        self.assertNotIn('tell application', simulated)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "scan.log"
+            with patch("app.photos_qr_cleanup.PHOTOS_DELETE_CONFIRM_SCRIPT", simulated):
+                watcher = _start_delete_confirmation_watcher(log_path=path)
+            try:
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    if "operation=window.entire_contents event=begin" in path.read_text():
+                        break
+                    time.sleep(0.01)
+                self.assertIsNone(watcher.poll())
+                self.assertIn("pid=123 window_index=1 operation=window.entire_contents event=begin", path.read_text())
+            finally:
+                _stop_delete_confirmation_watcher(watcher)
+
+    def test_trace_helpers_explain_mismatch_without_dumping_unrelated_text(self) -> None:
+        properties = PHOTOS_DELETE_CONFIRM_SCRIPT.split("\non run argv", 1)[0]
+        helpers = "on traceEvent(" + PHOTOS_DELETE_CONFIRM_SCRIPT.split("\non traceEvent(", 1)[1].split("\non scanDeleteDialog(", 1)[0]
+        script = properties + "\n" + helpers + '''
+on run argv
+    set diagnosticEnabled to true
+    set diagnosticStartedAt to current date
+    set diagnosticScan to 3
+    set diagnosticContext to "pid=123 window_index=2 element_index=7"
+    my traceBegin("element.name")
+    my traceValue("private unrelated album title")
+    my traceValue("取消")
+    my traceMatch("Tax Portal Photos QR Cleanup 想要删除1张照片", true)
+    my traceMatch("Tax Portal Photos QR Cleanup 想要删除这张照片", true)
+    return my traceText("line1" & linefeed & "line2")
+end run
+'''
+        self.assertNotIn('tell application', script)
+        completed = subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True, text=True, timeout=10)
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual("line1 line2", completed.stdout.strip())
+        self.assertIn("pid=123 window_index=2 element_index=7", completed.stderr)
+        self.assertNotIn("private unrelated album title", completed.stderr)
+        self.assertIn("text=[取消]", completed.stderr)
+        self.assertIn("delete_phrase=false matched=false", completed.stderr)
+        self.assertIn("delete_phrase=true matched=true", completed.stderr)
 
     def test_late_disabled_dialog_and_ineffective_first_click_are_retried(self) -> None:
         completed = self.run_simulated_scans([
