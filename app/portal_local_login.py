@@ -37,6 +37,7 @@ OTP_DIGITS_REGEX = re.compile(r"(?<!\d)(\d{6})(?!\d)")
 SMS_RESEND_COUNTDOWN_REGEX = re.compile(r"\d+秒重新获取")
 SMS_REQUEST_RETRY_ATTEMPTS = 3
 SMS_REQUEST_SETTLE_TIMEOUT_SECONDS = 3.0
+SMS_COUNTDOWN_RECHECK_DELAY_SECONDS = 3.0
 POST_LOGIN_STATE_TIMEOUT_SECONDS = 15.0
 ROLE_DIALOG_CONFIRM_ATTEMPTS = 3
 ROLE_DIALOG_BEFORE_SELECT_SECONDS = 1.0
@@ -1454,6 +1455,11 @@ class PortalMacLoginAutomator:
             self._click_named_element(bundle_id, ("获取验证码",), timeout_seconds=UI_ACTION_TIMEOUT_SECONDS)
             if self._wait_for_sms_countdown(bundle_id, timeout_seconds=SMS_REQUEST_SETTLE_TIMEOUT_SECONDS):
                 self._log(f"SMS verification code request accepted attempt={attempt}")
+                return
+            self._log(f"SMS countdown not detected; waiting 3s before rechecking attempt={attempt}")
+            sleep(SMS_COUNTDOWN_RECHECK_DELAY_SECONDS)
+            if self._wait_for_sms_countdown(bundle_id, timeout_seconds=SMS_REQUEST_SETTLE_TIMEOUT_SECONDS):
+                self._log(f"SMS verification code request accepted after countdown recheck attempt={attempt}")
                 return
             self._log(f"SMS verification code request did not enter countdown attempt={attempt}")
         raise PortalLocalLoginError("Timed out waiting for SMS verification countdown after requesting code.")

@@ -114,7 +114,7 @@ class PortalLocalLoginTests(unittest.TestCase):
             config = self._build_config(tmp_path)
             automator = PortalMacLoginAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
             events: list[str] = []
-            countdown_results = iter([False, False, True])
+            countdown_results = iter([False, False, False, False, True])
 
             with patch.object(automator, "_click_named_element", side_effect=lambda *args, **kwargs: events.append("click")):
                 with patch.object(
@@ -122,11 +122,41 @@ class PortalLocalLoginTests(unittest.TestCase):
                     "_wait_for_sms_countdown",
                     side_effect=lambda *args, **kwargs: next(countdown_results),
                 ):
-                    with patch.object(automator, "_log", side_effect=lambda message: events.append(message)):
+                    with patch.object(automator, "_log", side_effect=lambda message: events.append(message)), patch(
+                        "app.portal_local_login.sleep"
+                    ) as sleep_mock:
                         automator._request_sms_code("cn.gov.chinatax.gt4.app")  # noqa: SLF001
 
         self.assertEqual(3, events.count("click"))
         self.assertIn("SMS verification code request accepted attempt=3", events)
+        self.assertEqual([((3.0,), {}), ((3.0,), {})], sleep_mock.call_args_list)
+
+    def test_request_sms_code_rechecks_before_requesting_again(self) -> None:
+        for results, expected_events in (
+            ([True], ["click", "check"]),
+            ([False, True], ["click", "check", "sleep:3.0", "check"]),
+            ([False, False, True], ["click", "check", "sleep:3.0", "check", "click", "check"]),
+        ):
+            with self.subTest(results=results), tempfile.TemporaryDirectory() as tmp_dir:
+                config = self._build_config(Path(tmp_dir))
+                automator = PortalMacLoginAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
+                events: list[str] = []
+                countdown_results = iter(results)
+
+                def check_countdown(*args, **kwargs):
+                    events.append("check")
+                    return next(countdown_results)
+
+                with patch.object(
+                    automator, "_click_named_element", side_effect=lambda *args, **kwargs: events.append("click")
+                ), patch.object(
+                    automator, "_wait_for_sms_countdown", side_effect=check_countdown
+                ), patch(
+                    "app.portal_local_login.sleep", side_effect=lambda seconds: events.append(f"sleep:{seconds}")
+                ):
+                    automator._request_sms_code("cn.gov.chinatax.gt4.app")  # noqa: SLF001
+
+                self.assertEqual(expected_events, events)
 
     def test_request_sms_code_raises_after_retry_exhausted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -135,7 +165,9 @@ class PortalLocalLoginTests(unittest.TestCase):
             automator = PortalMacLoginAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
 
             with patch.object(automator, "_click_named_element", return_value="获取验证码"):
-                with patch.object(automator, "_wait_for_sms_countdown", return_value=False):
+                with patch.object(automator, "_wait_for_sms_countdown", return_value=False), patch(
+                    "app.portal_local_login.sleep"
+                ):
                     with self.assertRaises(PortalLocalLoginError) as ctx:
                         automator._request_sms_code("cn.gov.chinatax.gt4.app")  # noqa: SLF001
 
