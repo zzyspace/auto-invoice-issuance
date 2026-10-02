@@ -47,6 +47,23 @@ def make_node():
 
 
 class PortalAXDiagnosticsTests(unittest.TestCase):
+    def test_enabled_control_uses_boolean_value_not_pointer_truthiness(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                client = make_client()
+                client._cf_boolean_type = 7
+                client._attribute_value = Mock(return_value=123)
+                client.core.CFGetTypeID.return_value = 7
+                client.core.CFBooleanGetValue.return_value = enabled
+                self.assertEqual(enabled, client.node_enabled(make_node()))
+                client.core.CFRelease.assert_called_once_with(123)
+
+    def test_unreadable_enabled_state_is_not_clickable(self):
+        client = make_client()
+        client._attribute_value = Mock(return_value=None)
+        self.assertFalse(client.node_enabled(make_node()))
+        client.app.AXUIElementPerformAction.assert_not_called()
+
     def test_scan_retains_parent_and_sibling_order_without_extra_native_reads(self):
         client = make_client()
         children = {1: [2, 3], 2: [4], 3: [], 4: []}

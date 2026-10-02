@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import ctypes
+import hashlib
 import plistlib
 import re
 import subprocess
@@ -10,13 +11,14 @@ import sys
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
-from tempfile import mkdtemp
+from tempfile import TemporaryDirectory, mkdtemp
 from time import monotonic, sleep, time_ns
 from typing import Callable, Iterable
 
 from app.models import AppConfig
 from app.portal_diagnostics import diagnostic_step
 from app.photos_qr_cleanup import ImportedPhotosQr, PhotosQrCleanupError, describe_imported_qr
+from app.portal_qr_match import PortalQrMatchError, ensure_qr_match_helper, match_qr_image
 from app.utils import ensure_parent_dir
 from app.vision_client import OpenAICompatibleVisionClient
 
@@ -48,13 +50,6 @@ SCAN_PAGE_READY_TIMEOUT_SECONDS = 8.0
 SCAN_ALBUM_OPEN_ATTEMPTS = 2
 SCAN_ALBUM_OPEN_SETTLE_SECONDS = 1.0
 PHOTO_PICKER_SELECT_TIMEOUT_SECONDS = 20.0
-PHOTOS_FIRST_ITEM_CLICK_X_RATIO = 0.30
-PHOTOS_FIRST_ITEM_CLICK_Y_RATIO = 0.19
-IN_APP_PHOTO_PICKER_CLICK_TARGETS = (
-    (0.16, 0.29),
-    (0.19, 0.29),
-    (0.16, 0.33),
-)
 LOGIN_CONFIRMATION_TIMEOUT_SECONDS = 8.0
 HOME_PORTAL_AREA_TIMEOUT_SECONDS = 8.0
 HOME_PORTAL_AREA_X_MAX_RATIO = 0.45
@@ -206,6 +201,9 @@ class MacAccessibilityClient:
         self.core.CFStringGetCString.restype = ctypes.c_bool
         self.core.CFStringGetTypeID.restype = ctypes.c_ulong
         self.core.CFArrayGetTypeID.restype = ctypes.c_ulong
+        self.core.CFBooleanGetTypeID.restype = ctypes.c_ulong
+        self.core.CFBooleanGetValue.argtypes = [ctypes.c_void_p]
+        self.core.CFBooleanGetValue.restype = ctypes.c_bool
         self.core.CFArrayGetCount.argtypes = [ctypes.c_void_p]
         self.core.CFArrayGetCount.restype = ctypes.c_long
         self.core.CFArrayGetValueAtIndex.argtypes = [ctypes.c_void_p, ctypes.c_long]
@@ -231,6 +229,7 @@ class MacAccessibilityClient:
         self.quartz.CGWindowListCopyWindowInfo.restype = ctypes.c_void_p
         self._cf_string_type = self.core.CFStringGetTypeID()
         self._cf_array_type = self.core.CFArrayGetTypeID()
+        self._cf_boolean_type = self.core.CFBooleanGetTypeID()
         self._diagnostics = None
         self._diagnostic_scan = None
         self._diagnostic_scan_sequence = 0
@@ -336,6 +335,32 @@ class MacAccessibilityClient:
             self.core.CFRelease(window_list)
         return None
 
+    def window_capture_target(self, pid: int) -> tuple[int, tuple[float, float, float, float]] | None:
+        window_list = self.quartz.CGWindowListCopyWindowInfo(1 | 16, 0)
+        if not window_list:
+            return None
+        try:
+            if self.core.CFGetTypeID(window_list) != self._cf_array_type:
+                return None
+            count = self.core.CFArrayGetCount(window_list)
+            for index in range(count):
+                item = int(self.core.CFArrayGetValueAtIndex(window_list, index) or 0)
+                if not item:
+                    continue
+                owner_pid = self._dictionary_number(item, "kCGWindowOwnerPID")
+                if owner_pid != pid:
+                    continue
+                layer = self._dictionary_number(item, "kCGWindowLayer")
+                if layer not in (None, 0):
+                    continue
+                bounds = self._dictionary_bounds(item, "kCGWindowBounds")
+                window_id = self._dictionary_number(item, "kCGWindowNumber")
+                if bounds is not None and window_id is not None:
+                    return int(window_id), bounds
+        finally:
+            self.core.CFRelease(window_list)
+        return None
+
     @observe_ax_scan
     def find_nodes(self, pid: int) -> list[AXNode]:
         root = self.app_element(pid)
@@ -378,6 +403,16 @@ class MacAccessibilityClient:
         if self._perform_action(node.element, "AXPress") == 0:
             return True
         return self.click_at_node_center(node)
+
+    def node_enabled(self, node: AXNode) -> bool:
+        value = self._attribute_value(node.element, "AXEnabled")
+        if not value:
+            return False
+        try:
+            return (self.core.CFGetTypeID(value) == self._cf_boolean_type
+                    and bool(self.core.CFBooleanGetValue(value)))
+        finally:
+            self.core.CFRelease(value)
 
     def click_at_node_center(self, node: AXNode) -> bool:
         center = node.center
@@ -1324,25 +1359,8 @@ class PortalMacLoginAutomator:
 
     @diagnostic_step("app_select_qr")
     def _select_latest_qr_from_album(self, bundle_id: str) -> None:
-        self._log("selecting latest imported QR image from album")
-        try:
-            self._select_latest_qr_in_internal_picker(bundle_id)
-            return
-        except PortalLocalLoginError:
-            pass
-        if self._is_photos_picker_visible():
-            self._select_latest_qr_in_photos_picker()
-            return
-        deadline = monotonic() + PHOTO_PICKER_SELECT_TIMEOUT_SECONDS
-        while monotonic() < deadline:
-            nodes = self._nodes_for_bundle(bundle_id)
-            image_nodes = [node for node in nodes if node.role in {"AXImage", "AXButton"} and node.center is not None]
-            image_nodes.sort(key=lambda node: (node.position[1] if node.position else 10**9, node.position[0] if node.position else 10**9))
-            for node in image_nodes:
-                if self._click_node_for_bundle(bundle_id, node):
-                    return
-            sleep(VISIBLE_ELEMENT_POLL_SECONDS)
-        self._click_etax_latest_photo(bundle_id)
+        # This action must not fall through to a different image after a timeout.
+        self._select_latest_qr_in_internal_picker(bundle_id)
 
     @diagnostic_step("app_confirm_scan_login")
     def _confirm_scan_login(self, bundle_id: str) -> None:
@@ -1387,49 +1405,82 @@ class PortalMacLoginAutomator:
         required = ("取消", "照片", "精选集", "搜索你的图库")
         return all(any(required_item in text for text in texts) for required_item in required)
 
-    def _is_photos_picker_visible(self) -> bool:
-        try:
-            texts = self._collect_visible_texts(PHOTOS_BUNDLE_ID, timeout_seconds=1.0)
-        except PortalLocalLoginError:
-            return False
-        markers = ("所有照片", "图库", "相簿", "照片")
-        return any(marker in text for text in texts for marker in markers)
+    @staticmethod
+    def _qr_picker_visible(nodes: list[AXNode]) -> bool:
+        texts = [text for node in nodes for text in node.texts]
+        return any("照片" in text for text in texts) and any("精选集" in text for text in texts)
 
-    def _select_latest_qr_in_photos_picker(self) -> None:
-        self._log("photo picker detected via Photos app")
-        self._activate_application(PHOTOS_BUNDLE_ID)
-        deadline = monotonic() + PHOTO_PICKER_SELECT_TIMEOUT_SECONDS
-        while monotonic() < deadline:
-            nodes = self._nodes_for_bundle(PHOTOS_BUNDLE_ID)
-            photo_nodes = [
-                node
-                for node in nodes
-                if node.center is not None
-                and any(re.search(r"20\d{2}年\d+月\d+日", text) for text in node.texts)
-            ]
-            photo_nodes.sort(
-                key=lambda node: (
-                    node.position[1] if node.position else 10**9,
-                    node.position[0] if node.position else 10**9,
-                )
-            )
-            if photo_nodes and self._ax.click_node(photo_nodes[0]):
-                return
-            self._click_photos_first_item()
-            sleep(0.5)
-            return
-        raise PortalLocalLoginError("Timed out selecting QR image from Photos picker.")
+    @staticmethod
+    def _qr_image_node(
+        nodes: list[AXNode], match: dict[str, float], bounds: tuple[float, float, float, float],
+    ) -> AXNode | None:
+        left, top, width, height = bounds
+        center_x = left + width * (match["x"] + match["width"] / 2)
+        center_y = top + height * (match["y"] + match["height"] / 2)
+        candidates = []
+        for node in nodes:
+            if node.role != "AXImage" or node.position is None or node.size is None:
+                continue
+            x, y = node.position
+            w, h = node.size
+            if w > 0 and h > 0 and x <= center_x <= x + w and y <= center_y <= y + h:
+                candidates.append(node)
+        return candidates[0] if len(candidates) == 1 else None
 
     def _select_latest_qr_in_internal_picker(self, bundle_id: str) -> None:
-        self._log("internal photo picker detected in 电子税务局 app")
-        for attempt, (x_ratio, y_ratio) in enumerate(IN_APP_PHOTO_PICKER_CLICK_TARGETS, start=1):
-            self._activate_application(bundle_id)
-            self._click_internal_picker_item(bundle_id, x_ratio=x_ratio, y_ratio=y_ratio)
-            sleep(1.0)
-            if self._is_login_confirmation_visible(bundle_id):
-                self._log(f"internal photo picker selected QR image attempt={attempt}")
-                return
-        raise PortalLocalLoginError("Timed out selecting QR image from internal photo picker.")
+        imported = self.imported_qr
+        if imported is None:
+            raise PortalLocalLoginError("No recorded imported QR is available for image selection.")
+        try:
+            source = imported.qr_path.read_bytes()
+            if hashlib.sha256(source).hexdigest() != imported.sha256:
+                raise PortalLocalLoginError("Recorded QR image changed after Photos import.")
+            helper = ensure_qr_match_helper()
+        except (OSError, PortalQrMatchError) as exc:
+            raise PortalLocalLoginError("Unable to prepare local QR image matching.") from exc
+        self._activate_application(bundle_id)
+        self._wait_before_bundle_click(bundle_id)
+        deadline = monotonic() + PHOTO_PICKER_SELECT_TIMEOUT_SECONDS
+        with TemporaryDirectory(prefix="tax-portal-qr-match-") as temporary:
+            reference = Path(temporary) / "source.png"
+            screenshot = Path(temporary) / "picker.png"
+            reference.write_bytes(source)
+            while monotonic() < deadline:
+                pids = self._find_process_pids(bundle_id)
+                if len(pids) != 1:
+                    sleep(VISIBLE_ELEMENT_POLL_SECONDS)
+                    continue
+                pid = pids[0]
+                capture_target = self._ax.window_capture_target(pid)
+                if capture_target is None:
+                    sleep(VISIBLE_ELEMENT_POLL_SECONDS)
+                    continue
+                window_id, bounds = capture_target
+                self._run_command(
+                    ["/usr/sbin/screencapture", "-x", "-o", "-l", str(window_id), str(screenshot)],
+                    timeout_seconds=5.0,
+                )
+                try:
+                    matches = match_qr_image(helper, reference, screenshot)
+                except PortalQrMatchError as exc:
+                    raise PortalLocalLoginError("Unable to verify the QR image in the picker.") from exc
+                if len(matches) > 1:
+                    raise PortalLocalLoginError("Multiple visible images match the imported QR; refusing to guess.")
+                nodes = self._ax.find_nodes(pid)
+                if (
+                    matches and self._qr_picker_visible(nodes)
+                    and self._ax.window_capture_target(pid) == capture_target
+                    and monotonic() < deadline
+                ):
+                    node = self._qr_image_node(nodes, matches[0], bounds)
+                    if node is not None and self._ax.node_enabled(node):
+                        self._press_ax_node_only(node, "verified imported QR")
+                        # A successful AX call alone is not proof that the app read the QR.
+                        self._wait_for_login_confirmation_ready(bundle_id)
+                        self._log("selected verified imported QR via AXPress; login confirmation visible")
+                        return
+                sleep(VISIBLE_ELEMENT_POLL_SECONDS)
+        raise PortalLocalLoginError("Timed out locating the verified imported QR image control.")
 
     def _wait_for_login_confirmation_ready(self, bundle_id: str) -> None:
         deadline = monotonic() + LOGIN_CONFIRMATION_TIMEOUT_SECONDS
@@ -1500,12 +1551,10 @@ class PortalMacLoginAutomator:
         self._click_role_dialog_relative(bundle_id, x_ratio=0.32, y_ratio=0.47)
 
     def _confirm_role_dialog(self, bundle_id: str) -> None:
-        try:
-            self._click_named_element(bundle_id, ("确认",), timeout_seconds=3.0)
-            return
-        except PortalLocalLoginError:
-            pass
-        self._click_role_dialog_relative(bundle_id, x_ratio=0.50, y_ratio=0.64)
+        self._press_dialog_control(
+            bundle_id, "请选择身份类型", "确认", {"AXStaticText", "AXButton"},
+            blockers=("切换成功", "指纹快捷登录"),
+        )
 
     def _click_role_dialog_relative(self, bundle_id: str, *, x_ratio: float, y_ratio: float) -> None:
         self._activate_application(bundle_id)
@@ -1526,26 +1575,49 @@ class PortalMacLoginAutomator:
 
     @diagnostic_step("app_dismiss_fingerprint_prompt")
     def _dismiss_fingerprint_prompt(self, bundle_id: str) -> None:
+        self._press_dialog_control(bundle_id, "指纹快捷登录", "暂不设置", {"AXButton"})
+        deadline = monotonic() + POST_LOGIN_STATE_TIMEOUT_SECONDS
+        while monotonic() < deadline:
+            nodes = self._target_app_nodes(bundle_id)
+            texts = [self._normalized_text(text) for node in nodes for text in node.texts]
+            if not any("指纹快捷登录" in text or text == "暂不设置" for text in texts):
+                if self._texts_show_switch_success_dialog(texts) or (
+                    self._texts_show_logged_in_home(texts)
+                    and any("功能名称" in text or "申报期截止至" in text for text in texts)
+                ):
+                    return
+            sleep(VISIBLE_ELEMENT_POLL_SECONDS)
+        raise PortalLocalLoginError("Timed out verifying fingerprint prompt dismissal.")
+
+    def _press_ax_node_only(self, node: AXNode, label: str) -> None:
+        code = self._ax._perform_action(node.element, "AXPress")
+        self._log(f"{label} AXPress role={node.role} return_code={code}")
+        if code != 0:
+            raise PortalLocalLoginError(f"Unable to press {label} with AXPress (code={code}).")
+
+    def _press_dialog_control(
+        self, bundle_id: str, marker: str, label: str, roles: set[str], *, blockers: tuple[str, ...] = (),
+    ) -> None:
         self._activate_application(bundle_id)
-        try:
-            self._click_named_element(bundle_id, ("暂不设置",), timeout_seconds=3.0)
-            return
-        except PortalLocalLoginError:
-            pass
-        bounds = self._window_bounds_for_bundle(bundle_id)
-        if bounds is None:
-            window = self._window_node(bundle_id)
-            if window is None or window.position is None or window.size is None:
-                raise PortalLocalLoginError("Unable to determine fingerprint quick-login prompt position.")
-            left, top, width, height = (
-                window.position[0],
-                window.position[1],
-                window.size[0],
-                window.size[1],
-            )
-        else:
-            left, top, width, height = bounds
-        self._click_at_for_bundle(bundle_id, left + width * 0.33, top + height * 0.69)
+        self._wait_before_bundle_click(bundle_id)
+        deadline = monotonic() + UI_ACTION_TIMEOUT_SECONDS
+        while monotonic() < deadline:
+            nodes = self._target_app_nodes(bundle_id)
+            texts = [self._normalized_text(text) for node in nodes for text in node.texts]
+            if any(blocker in text for blocker in blockers for text in texts):
+                # The next dialog is already visible. Never press its background confirmation.
+                return
+            markers = [(i, n) for i, n in enumerate(nodes) if any(marker in text for text in n.texts)]
+            if len(markers) == 1:
+                index, heading = markers[0]
+                candidates = [n for n in nodes[index + 1:]
+                              if heading.parent_element is not None and n.parent_element == heading.parent_element
+                              and n.role in roles and any(self._normalized_text(text) == label for text in n.texts)]
+                if len(candidates) == 1 and self._ax.node_enabled(candidates[0]):
+                    self._press_ax_node_only(candidates[0], label)
+                    return
+            sleep(VISIBLE_ELEMENT_POLL_SECONDS)
+        raise PortalLocalLoginError(f"Timed out locating unique enabled {marker}/{label} control.")
 
     def _confirm_switch_success_dialog(self, bundle_id: str) -> None:
         self._activate_application(bundle_id)
@@ -1555,7 +1627,7 @@ class PortalMacLoginAutomator:
         while monotonic() < deadline:
             try:
                 # Never adopt an unrelated foreground app when the target is unreadable.
-                nodes = self._switch_success_dialog_nodes(bundle_id)
+                nodes = self._target_app_nodes(bundle_id)
             except PortalLocalLoginError:
                 nodes = []
             texts = [self._normalized_text(text) for node in nodes for text in node.texts]
@@ -1584,7 +1656,7 @@ class PortalMacLoginAutomator:
             sleep(VISIBLE_ELEMENT_POLL_SECONDS)
         raise PortalLocalLoginError("Timed out dismissing area/company switch success dialog.")
 
-    def _switch_success_dialog_nodes(self, bundle_id: str) -> list[AXNode]:
+    def _target_app_nodes(self, bundle_id: str) -> list[AXNode]:
         for pid in self._find_process_pids(bundle_id):
             nodes = self._ax.find_nodes(pid)
             if nodes:
@@ -2089,54 +2161,6 @@ class PortalMacLoginAutomator:
         x = window.position[0] + window.size[0] - 26.0
         y = window.position[1] + window.size[1] - 24.0
         self._click_at_for_bundle(bundle_id, x, y)
-
-    def _click_etax_latest_photo(self, bundle_id: str) -> None:
-        self._activate_application(bundle_id)
-        window = self._window_node(bundle_id)
-        if window is None or window.position is None or window.size is None:
-            bounds = self._window_bounds_for_bundle(bundle_id)
-            if bounds is not None:
-                x, y, width, height = bounds
-                self._click_at_for_bundle(bundle_id, x + width * 0.18, y + height * 0.23)
-                return
-            raise PortalLocalLoginError("Unable to determine 电子税务局 window frame for latest photo click.")
-        x = window.position[0] + window.size[0] * 0.18
-        y = window.position[1] + window.size[1] * 0.23
-        self._click_at_for_bundle(bundle_id, x, y)
-
-    def _click_photos_first_item(self) -> None:
-        self._activate_application(PHOTOS_BUNDLE_ID)
-        bounds = self._window_bounds_for_bundle(PHOTOS_BUNDLE_ID)
-        if bounds is None:
-            window = self._window_node(PHOTOS_BUNDLE_ID)
-            if window is None or window.position is None or window.size is None:
-                raise PortalLocalLoginError("Unable to determine Photos picker item position.")
-            left, top, width, height = (
-                window.position[0],
-                window.position[1],
-                window.size[0],
-                window.size[1],
-            )
-        else:
-            left, top, width, height = bounds
-        self._ax.click_at(left + width * PHOTOS_FIRST_ITEM_CLICK_X_RATIO, top + height * PHOTOS_FIRST_ITEM_CLICK_Y_RATIO)
-
-    def _click_internal_picker_item(self, bundle_id: str, *, x_ratio: float, y_ratio: float) -> None:
-        self._activate_application(bundle_id)
-        bounds = self._window_bounds_for_bundle(bundle_id)
-        if bounds is None:
-            window = self._window_node(bundle_id)
-            if window is None or window.position is None or window.size is None:
-                raise PortalLocalLoginError("Unable to determine internal photo picker item position.")
-            left, top, width, height = (
-                window.position[0],
-                window.position[1],
-                window.size[0],
-                window.size[1],
-            )
-        else:
-            left, top, width, height = bounds
-        self._click_at_for_bundle(bundle_id, left + width * x_ratio, top + height * y_ratio)
 
     def _click_scan_album_region(self, bundle_id: str, attempt: int) -> None:
         self._activate_application(bundle_id)

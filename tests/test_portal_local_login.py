@@ -174,29 +174,6 @@ class PortalLocalLoginTests(unittest.TestCase):
 
         self.assertIn("countdown", str(ctx.exception))
 
-    def test_dismiss_fingerprint_prompt_falls_back_to_relative_click(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_path = Path(tmp_dir)
-            config = self._build_config(tmp_path)
-            automator = PortalMacLoginAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
-            clicks: list[tuple[float, float]] = []
-
-            class FakeAX:
-                def click_at(self, x: float, y: float) -> None:
-                    clicks.append((x, y))
-
-            automator._ax = FakeAX()  # type: ignore[assignment]
-
-            with patch.object(
-                automator,
-                "_click_named_element",
-                side_effect=PortalLocalLoginError("missing 暂不设置"),
-            ):
-                with patch.object(automator, "_window_bounds_for_bundle", return_value=(10.0, 20.0, 300.0, 500.0)):
-                    automator._dismiss_fingerprint_prompt("cn.gov.chinatax.gt4.app")  # noqa: SLF001
-
-        self.assertEqual([(109.0, 365.0)], clicks)
-
     def test_dismiss_startup_reminder_falls_back_to_relative_click(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
@@ -364,22 +341,12 @@ class PortalLocalLoginTests(unittest.TestCase):
 
         self.assertEqual([(94.0, 168.0), (102.0, 168.0)], clicks)
 
-    def test_select_latest_qr_from_album_prefers_photos_picker_branch(self) -> None:
+    def test_select_qr_does_not_fall_through_after_verified_picker_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_path = Path(tmp_dir)
-            config = self._build_config(tmp_path)
-            automator = PortalMacLoginAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
-            events: list[str] = []
-
-            with patch.object(automator, "_is_photos_picker_visible", return_value=True):
-                with patch.object(
-                    automator,
-                    "_select_latest_qr_in_photos_picker",
-                    side_effect=lambda: events.append("photos_picker"),
-                ):
-                    automator._select_latest_qr_from_album("cn.gov.chinatax.gt4.app")  # noqa: SLF001
-
-        self.assertEqual(["photos_picker"], events)
+            automator = PortalMacLoginAutomator(self._build_config(Path(tmp_dir)), "fuzzy", "法定代表人", lambda *_: None)
+            with patch.object(automator, "_select_latest_qr_in_internal_picker", side_effect=PortalLocalLoginError("no verified image")):
+                with self.assertRaisesRegex(PortalLocalLoginError, "no verified image"):
+                    automator._select_latest_qr_from_album("cn.gov.chinatax.gt4.app")
 
     def test_select_latest_qr_from_album_prefers_internal_picker_branch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1265,6 +1232,13 @@ class PortalLocalLoginTests(unittest.TestCase):
         class FakeAutomator(PortalMacLoginAutomator):
             post_login_states = iter(["role_dialog", "fingerprint_prompt", "home"])
 
+            # This test exercises login orchestration; real dialog actions have their own tests.
+            def _confirm_role_dialog(self, bundle_id: str) -> None:
+                events.append("click:确认")
+
+            def _dismiss_fingerprint_prompt(self, bundle_id: str) -> None:
+                events.append("click:暂不设置")
+
             def _click_etax_tabbar_item(self, bundle_id: str, index: int) -> None:
                 events.append(f"tab:{index}")
 
@@ -1449,6 +1423,13 @@ class PortalLocalLoginTests(unittest.TestCase):
 
         class FakeAutomator(PortalMacLoginAutomator):
             post_login_states = iter(["role_dialog", "fingerprint_prompt", "home"])
+
+            # This test exercises login orchestration; real dialog actions have their own tests.
+            def _confirm_role_dialog(self, bundle_id: str) -> None:
+                events.append("click:确认")
+
+            def _dismiss_fingerprint_prompt(self, bundle_id: str) -> None:
+                events.append("click:暂不设置")
 
             def _click_etax_tabbar_item(self, bundle_id: str, index: int) -> None:
                 events.append(f"tab:{index}")
