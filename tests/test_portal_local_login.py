@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import tempfile
 import unittest
+from itertools import count
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -1074,28 +1075,133 @@ class PortalLocalLoginTests(unittest.TestCase):
 
         self.assertEqual("switch_success_dialog", state)
 
-    def test_confirm_switch_success_dialog_uses_relative_click(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_path = Path(tmp_dir)
-            config = self._build_config(tmp_path)
-            automator = PortalMacLoginAutomator(config, "fuzzy_qz", "法定代表人", lambda *_: None)
-            events: list[str] = []
-            visible_texts = iter([["切换成功"], []])
+    @staticmethod
+    def _switch_dialog_node(element: int, text: str, parent: int | None = 10) -> AXNode:
+        # Sanitized topology observed on the real app: both confirmations are
+        # AXStaticText siblings; the background one precedes the success marker.
+        return AXNode(element, "AXStaticText", "", (text,), None, None, parent)
 
-            with patch.object(
-                automator,
-                "_click_switch_success_dialog_confirm_relative",
-                side_effect=lambda bundle_id: events.append("relative_click"),
-            ):
-                with patch.object(
-                    automator,
-                    "_collect_visible_texts",
-                    side_effect=lambda bundle_id, *, timeout_seconds: next(visible_texts),
-                ):
-                    with patch("app.portal_local_login.sleep", return_value=None):
-                        automator._confirm_switch_success_dialog("cn.gov.chinatax.gt4.app")  # noqa: SLF001
+    def _switch_dialog_nodes(self) -> list[AXNode]:
+        return [
+            self._switch_dialog_node(11, "请选择身份类型"),
+            self._switch_dialog_node(12, "确认"),
+            self._switch_dialog_node(13, "切换成功"),
+            self._switch_dialog_node(14, "确认"),
+        ]
 
-        self.assertEqual(["relative_click"], events)
+    def _switch_dialog_automator(self) -> PortalMacLoginAutomator:
+        config = self._build_config(Path("unused-test-state"))
+        automator = PortalMacLoginAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
+        automator._ax = Mock(spec=MacAccessibilityClient)
+        automator._ax._perform_action.return_value = 0
+        automator._find_process_pids = Mock(return_value=[42])
+        automator._activate_application = Mock()
+        automator._wait_before_bundle_click = Mock()
+        for mocked in (
+            patch("app.portal_local_login.sleep"),
+            patch("app.portal_local_login.monotonic", side_effect=count(0, 0.25).__next__),
+        ):
+            mocked.start()
+            self.addCleanup(mocked.stop)
+        return automator
+
+    def test_switch_success_presses_foreground_static_text_once_and_verifies_home(self) -> None:
+        automator = self._switch_dialog_automator()
+        dialog = self._switch_dialog_nodes()
+        home = [self._switch_dialog_node(20, "功能名称"), self._switch_dialog_node(21, "身份切换")]
+        automator._ax.find_nodes.side_effect = [dialog, dialog, home]
+
+        automator._confirm_switch_success_dialog("cn.gov.chinatax.gt4.app")
+
+        automator._ax._perform_action.assert_called_once_with(14, "AXPress")
+        self.assertEqual(3, automator._ax.find_nodes.call_count)
+        automator._ax.click_node.assert_not_called()
+        automator._ax.click_at.assert_not_called()
+        automator._ax.find_focused_nodes.assert_not_called()
+
+    def test_switch_success_waits_for_control_and_recovers_from_unknown_reads(self) -> None:
+        automator = self._switch_dialog_automator()
+        dialog = self._switch_dialog_nodes()
+        automator._ax.find_nodes.side_effect = [
+            [], dialog[:-1], dialog,
+            PortalLocalLoginError("temporary AX read failure"), [],
+            [self._switch_dialog_node(20, "功能名称")],
+        ]
+
+        automator._confirm_switch_success_dialog("cn.gov.chinatax.gt4.app")
+
+        automator._ax._perform_action.assert_called_once_with(14, "AXPress")
+        self.assertEqual(6, automator._ax.find_nodes.call_count)
+        automator._ax.click_at.assert_not_called()
+
+    def test_switch_success_rejects_missing_or_ambiguous_confirmation(self) -> None:
+        automator = self._switch_dialog_automator()
+        dialog = self._switch_dialog_nodes()
+        cases = {
+            "only background confirmation": dialog[:-1],
+            "confirmation belongs to other parent": dialog[:-1] + [self._switch_dialog_node(14, "确认", 99)],
+            "multiple following confirmations": dialog + [self._switch_dialog_node(15, "确认")],
+            "multiple success markers": dialog + [self._switch_dialog_node(15, "切换成功")],
+            "missing parent": [self._switch_dialog_node(13, "切换成功", None), self._switch_dialog_node(14, "确认", None)],
+        }
+        for label, nodes in cases.items():
+            with self.subTest(label=label):
+                automator._ax.find_nodes.return_value = nodes
+                with self.assertRaisesRegex(PortalLocalLoginError, "Timed out dismissing"):
+                    automator._confirm_switch_success_dialog("cn.gov.chinatax.gt4.app")
+        automator._ax._perform_action.assert_not_called()
+        automator._ax.click_at.assert_not_called()
+
+    def test_switch_success_axpress_failure_never_falls_back_to_coordinates(self) -> None:
+        automator = self._switch_dialog_automator()
+        automator._ax.find_nodes.return_value = self._switch_dialog_nodes()
+        automator._ax._perform_action.return_value = -25204
+
+        with self.assertRaisesRegex(PortalLocalLoginError, "AXPress.*-25204"):
+            automator._confirm_switch_success_dialog("cn.gov.chinatax.gt4.app")
+
+        automator._ax._perform_action.assert_called_once_with(14, "AXPress")
+        automator._ax.click_node.assert_not_called()
+        automator._ax.click_at.assert_not_called()
+
+    def test_switch_success_requires_home_after_press(self) -> None:
+        automator = self._switch_dialog_automator()
+        cases = {
+            "empty read": [],
+            "success dialog still present": self._switch_dialog_nodes(),
+            "background identity page": [self._switch_dialog_node(21, "身份切换")],
+            "background role dialog": [self._switch_dialog_node(20, "功能名称"), self._switch_dialog_node(21, "请选择身份类型")],
+            "guest home": [self._switch_dialog_node(20, "功能名称"), self._switch_dialog_node(21, "立即登录")],
+        }
+        for label, observation in cases.items():
+            with self.subTest(label=label):
+                automator._ax.reset_mock()
+                snapshots = iter([self._switch_dialog_nodes()])
+                automator._ax.find_nodes.side_effect = lambda pid: next(snapshots, observation)
+                with self.assertRaisesRegex(PortalLocalLoginError, "Timed out dismissing"):
+                    automator._confirm_switch_success_dialog("cn.gov.chinatax.gt4.app")
+                automator._ax._perform_action.assert_called_once_with(14, "AXPress")
+                automator._ax.click_at.assert_not_called()
+
+    def test_switch_success_already_dismissed_home_does_not_click(self) -> None:
+        automator = self._switch_dialog_automator()
+        automator._ax.find_nodes.return_value = [self._switch_dialog_node(20, "功能名称")]
+
+        automator._confirm_switch_success_dialog("cn.gov.chinatax.gt4.app")
+
+        automator._ax._perform_action.assert_not_called()
+
+    def test_switch_success_unavailable_target_does_not_adopt_foreground_app(self) -> None:
+        automator = self._switch_dialog_automator()
+        automator._find_process_pids.return_value = []
+        automator._ax.find_focused_nodes.return_value = self._switch_dialog_nodes()
+
+        with self.assertRaisesRegex(PortalLocalLoginError, "Timed out dismissing"):
+            automator._confirm_switch_success_dialog("cn.gov.chinatax.gt4.app")
+
+        automator._ax.find_nodes.assert_not_called()
+        automator._ax.find_focused_nodes.assert_not_called()
+        automator._ax._perform_action.assert_not_called()
 
     def test_wait_for_process_waits_for_accessibility_nodes_after_pid_detected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

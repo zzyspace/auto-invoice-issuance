@@ -47,6 +47,25 @@ def make_node():
 
 
 class PortalAXDiagnosticsTests(unittest.TestCase):
+    def test_scan_retains_parent_and_sibling_order_without_extra_native_reads(self):
+        client = make_client()
+        children = {1: [2, 3], 2: [4], 3: [], 4: []}
+        client._children_from_attribute = Mock(side_effect=lambda element, attr: children[element])
+        client._attribute_text = Mock(return_value="AXStaticText")
+        client._texts_for_element = Mock(return_value=("确认",))
+        client._point_attribute = Mock(return_value=None)
+        client._size_attribute = Mock(return_value=None)
+        nodes = []
+
+        client._collect_nodes(1, nodes, set())
+
+        self.assertEqual([(1, None), (2, 1), (4, 2), (3, 1)],
+                         [(node.element, node.parent_element) for node in nodes])
+        self.assertEqual(4, client._children_from_attribute.call_count)
+        self.assertTrue(all(call.args[1] == "AXChildren"
+                            for call in client._children_from_attribute.call_args_list))
+        client.app.AXUIElementCopyAttributeValue.assert_not_called()
+
     def test_nonzero_native_read_still_returns_none(self):
         for code in (1, -25204, ctypes.c_uint32(-25204).value, -25205, -25212):
             with self.subTest(code=code):

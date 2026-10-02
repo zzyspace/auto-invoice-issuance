@@ -65,8 +65,6 @@ HOME_PORTAL_AREA_SCREENSHOT_WIDTH_RATIO = 0.20
 HOME_PORTAL_AREA_SCREENSHOT_HEIGHT_RATIO = 0.11
 PORTAL_AREA_SWITCH_PAGE_TIMEOUT_SECONDS = 10.0
 PORTAL_AREA_SWITCH_SETTLE_SECONDS = 1.0
-SWITCH_SUCCESS_DIALOG_CONFIRM_X_RATIO = 0.50
-SWITCH_SUCCESS_DIALOG_CONFIRM_Y_RATIO = 0.62
 STARTUP_REMINDER_TITLE = "关于电子税务局上线申报智能自检的提醒"
 STARTUP_REMINDER_CLOSE_X_RATIO = 0.50
 STARTUP_REMINDER_CLOSE_Y_RATIO = 0.88
@@ -138,6 +136,7 @@ class AXNode:
     texts: tuple[str, ...]
     position: tuple[float, float] | None
     size: tuple[float, float] | None
+    parent_element: int | None = None
 
     @property
     def center(self) -> tuple[float, float] | None:
@@ -453,9 +452,9 @@ class MacAccessibilityClient:
                 self.core.CFRelease(cf_value)
 
     def _collect_nodes(self, element: int, output: list[AXNode], seen: set[int]) -> None:
-        stack = [element]
+        stack = [(element, None)]
         while stack:
-            current = stack.pop()
+            current, parent = stack.pop()
             if not current or current in seen:
                 continue
             seen.add(current)
@@ -468,10 +467,11 @@ class MacAccessibilityClient:
                     texts=self._texts_for_element(current),
                     position=self._point_attribute(current, "AXPosition"),
                     size=self._size_attribute(current, "AXSize"),
+                    parent_element=parent,
                 )
             )
             children = self._children_from_attribute(current, "AXChildren")
-            stack.extend(reversed(children))
+            stack.extend((child, current) for child in reversed(children))
 
     def _texts_for_element(self, element: int) -> tuple[str, ...]:
         values: list[str] = []
@@ -1549,38 +1549,67 @@ class PortalMacLoginAutomator:
 
     def _confirm_switch_success_dialog(self, bundle_id: str) -> None:
         self._activate_application(bundle_id)
-        self._click_switch_success_dialog_confirm_relative(bundle_id)
-        deadline = monotonic() + 5.0
+        self._wait_before_bundle_click(bundle_id)
+        deadline = monotonic() + UI_ACTION_TIMEOUT_SECONDS
+        pressed = False
         while monotonic() < deadline:
             try:
-                texts = self._collect_visible_texts(bundle_id, timeout_seconds=1.0)
+                # Never adopt an unrelated foreground app when the target is unreadable.
+                nodes = self._switch_success_dialog_nodes(bundle_id)
             except PortalLocalLoginError:
-                return
+                nodes = []
+            texts = [self._normalized_text(text) for node in nodes for text in node.texts]
             if not self._texts_show_switch_success_dialog(texts):
-                return
+                # An empty/partial AX read is not proof of dismissal. The background
+                # identity-selection page also contains "身份切换", so require home content.
+                if (
+                    self._texts_show_logged_in_home(texts)
+                    and any("功能名称" in text or "申报期截止至" in text for text in texts)
+                    and not any("请选择身份类型" in text for text in texts)
+                ):
+                    return
+            elif not pressed:
+                confirm = self._switch_success_dialog_confirm_node(nodes)
+                if confirm is not None:
+                    # This control is AXStaticText in the real app. Use AXPress only:
+                    # click_node() would silently fall back to a coordinate click.
+                    code = self._ax._perform_action(confirm.element, "AXPress")
+                    self._log(f"switch success confirmation AXPress role={confirm.role} return_code={code}")
+                    if code != 0:
+                        raise PortalLocalLoginError(
+                            f"Unable to confirm switch success dialog with AXPress (code={code})."
+                        )
+                    pressed = True
+                    deadline = monotonic() + 5.0
             sleep(VISIBLE_ELEMENT_POLL_SECONDS)
         raise PortalLocalLoginError("Timed out dismissing area/company switch success dialog.")
 
-    def _click_switch_success_dialog_confirm_relative(self, bundle_id: str) -> None:
-        self._activate_application(bundle_id)
-        bounds = self._window_bounds_for_bundle(bundle_id)
-        if bounds is None:
-            window = self._window_node(bundle_id)
-            if window is None or window.position is None or window.size is None:
-                raise PortalLocalLoginError("Unable to determine switch success dialog position.")
-            left, top, width, height = (
-                window.position[0],
-                window.position[1],
-                window.size[0],
-                window.size[1],
-            )
-        else:
-            left, top, width, height = bounds
-        self._click_at_for_bundle(
-            bundle_id,
-            left + width * SWITCH_SUCCESS_DIALOG_CONFIRM_X_RATIO,
-            top + height * SWITCH_SUCCESS_DIALOG_CONFIRM_Y_RATIO,
-        )
+    def _switch_success_dialog_nodes(self, bundle_id: str) -> list[AXNode]:
+        for pid in self._find_process_pids(bundle_id):
+            nodes = self._ax.find_nodes(pid)
+            if nodes:
+                return nodes
+        return []
+
+    def _switch_success_dialog_confirm_node(self, nodes: list[AXNode]) -> AXNode | None:
+        markers = [
+            (index, node) for index, node in enumerate(nodes)
+            if any(self._normalized_text(text) == "切换成功" for text in node.texts)
+        ]
+        if len(markers) != 1:
+            return None
+        index, marker = markers[0]
+        if marker.parent_element is None:
+            return None
+        # UIKit exposes both stacked dialogs as siblings. The background role
+        # confirmation precedes the success message; its own confirmation follows it.
+        candidates = [
+            node for node in nodes[index + 1:]
+            if node.parent_element == marker.parent_element
+            and node.role in {"AXStaticText", "AXButton"}
+            and any(self._normalized_text(text) == "确认" for text in node.texts)
+        ]
+        return candidates[0] if len(candidates) == 1 else None
 
     @diagnostic_step("app_wait_login_result")
     def _wait_for_post_login_state(self, bundle_id: str, *, timeout_seconds: float) -> str:
