@@ -196,6 +196,8 @@ class MacAccessibilityClient:
         self.app.AXValueGetValue.restype = ctypes.c_bool
         self.core.CFGetTypeID.argtypes = [ctypes.c_void_p]
         self.core.CFGetTypeID.restype = ctypes.c_ulong
+        self.core.CFEqual.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self.core.CFEqual.restype = ctypes.c_bool
         self.core.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
         self.core.CFStringCreateWithCString.restype = ctypes.c_void_p
         self.core.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
@@ -414,6 +416,12 @@ class MacAccessibilityClient:
                     and bool(self.core.CFBooleanGetValue(value)))
         finally:
             self.core.CFRelease(value)
+
+    def same_element(self, left: AXNode, right: AXNode) -> bool:
+        # AX may return different CF references for the same underlying UI element.
+        if not left.element or not right.element:
+            return False
+        return left.element == right.element or bool(self.core.CFEqual(left.element, right.element))
 
     def click_at_node_center(self, node: AXNode) -> bool:
         center = node.center
@@ -1425,22 +1433,41 @@ class PortalMacLoginAutomator:
         texts = [text for node in nodes for text in node.texts]
         return any("照片" in text for text in texts) and any("精选集" in text for text in texts)
 
-    @staticmethod
     def _qr_image_node(
-        nodes: list[AXNode], match: dict[str, float], bounds: tuple[float, float, float, float],
+        self, nodes: list[AXNode], match: dict[str, float], bounds: tuple[float, float, float, float],
+        *, counts: dict[str, int] | None = None,
     ) -> AXNode | None:
         left, top, width, height = bounds
         center_x = left + width * (match["x"] + match["width"] / 2)
         center_y = top + height * (match["y"] + match["height"] / 2)
         candidates = []
         for node in nodes:
-            if node.role != "AXImage" or node.position is None or node.size is None:
+            if not node.element or node.role != "AXImage" or node.position is None or node.size is None:
                 continue
             x, y = node.position
             w, h = node.size
             if w > 0 and h > 0 and x <= center_x <= x + w and y <= center_y <= y + h:
                 candidates.append(node)
-        return candidates[0] if len(candidates) == 1 else None
+        unique: list[AXNode] = []
+        for candidate in candidates:
+            if not any(self._ax.same_element(candidate, existing) for existing in unique):
+                unique.append(candidate)
+        if counts is not None:
+            counts.update(raw_candidate_count=len(candidates), unique_candidate_count=len(unique))
+        return unique[0] if len(unique) == 1 else None
+
+    def _record_qr_selection(self, state: dict[str, object]) -> None:
+        # Counts and gate results only: never QR payloads, field values or node texts.
+        diagnostics = getattr(self, "_diagnostics", None)
+        if diagnostics is not None:
+            try:
+                diagnostics.emit("qr.selection", **state)
+            except Exception:
+                pass
+        try:
+            self._log("QR image selection " + " ".join(f"{key}={value}" for key, value in state.items()))
+        except Exception:
+            pass
 
     def _select_latest_qr_in_internal_picker(self, bundle_id: str) -> None:
         imported = self.imported_qr
@@ -1456,6 +1483,18 @@ class PortalMacLoginAutomator:
         self._activate_application(bundle_id)
         self._wait_before_bundle_click(bundle_id)
         deadline = monotonic() + PHOTO_PICKER_SELECT_TIMEOUT_SECONDS
+        last_state: dict[str, object] | None = None
+        last_checked_state: dict[str, object] | None = None
+
+        def report(reason: str, **fields: object) -> None:
+            nonlocal last_state, last_checked_state
+            state = dict(reason=reason, **fields)
+            if reason != "deadline_before_selection":
+                last_checked_state = state
+            if state != last_state:
+                self._record_qr_selection(state)
+                last_state = state
+
         with TemporaryDirectory(prefix="tax-portal-qr-match-") as temporary:
             reference = Path(temporary) / "source.png"
             screenshot = Path(temporary) / "picker.png"
@@ -1463,11 +1502,13 @@ class PortalMacLoginAutomator:
             while monotonic() < deadline:
                 pids = self._find_process_pids(bundle_id)
                 if len(pids) != 1:
+                    report("app_process_count", pid_count=len(pids))
                     sleep(VISIBLE_ELEMENT_POLL_SECONDS)
                     continue
                 pid = pids[0]
                 capture_target = self._ax.window_capture_target(pid)
                 if capture_target is None:
+                    report("window_unavailable", pid_count=1)
                     sleep(VISIBLE_ELEMENT_POLL_SECONDS)
                     continue
                 window_id, bounds = capture_target
@@ -1478,24 +1519,47 @@ class PortalMacLoginAutomator:
                 try:
                     matches = match_qr_image(helper, reference, screenshot)
                 except PortalQrMatchError as exc:
+                    report("visual_match_error", pid_count=1)
                     raise PortalLocalLoginError("Unable to verify the QR image in the picker.") from exc
                 if len(matches) > 1:
+                    report("ambiguous_visual_matches", pid_count=1, match_count=len(matches))
                     raise PortalLocalLoginError("Multiple visible images match the imported QR; refusing to guess.")
                 nodes = self._ax.find_nodes(pid)
-                if (
-                    matches and self._qr_picker_visible(nodes)
-                    and self._ax.window_capture_target(pid) == capture_target
-                    and monotonic() < deadline
-                ):
-                    node = self._qr_image_node(nodes, matches[0], bounds)
-                    if node is not None and self._ax.node_enabled(node):
+                fields: dict[str, object] = dict(pid_count=1, match_count=len(matches))
+                if not matches:
+                    report("no_visual_match", **fields)
+                elif not self._qr_picker_visible(nodes):
+                    report("picker_not_ready", **fields)
+                elif self._ax.window_capture_target(pid) != capture_target:
+                    report("window_changed", **fields)
+                elif monotonic() >= deadline:
+                    report("deadline_before_selection", **fields)
+                else:
+                    counts: dict[str, int] = {}
+                    node = self._qr_image_node(nodes, matches[0], bounds, counts=counts)
+                    fields.update(counts)
+                    if node is None:
+                        report("no_ax_image" if counts["unique_candidate_count"] == 0 else "ambiguous_ax_images", **fields)
+                    elif not self._ax.node_enabled(node):
+                        report("control_not_enabled", enabled=False, **fields)
+                    else:
+                        report("candidate_ready", enabled=True, **fields)
                         self._press_ax_node_only(node, "verified imported QR")
                         # A successful AX call alone is not proof that the app read the QR.
                         self._wait_for_login_confirmation_ready(bundle_id)
                         self._log("selected verified imported QR via AXPress; login confirmation visible")
                         return
                 sleep(VISIBLE_ELEMENT_POLL_SECONDS)
-        raise PortalLocalLoginError("Timed out locating the verified imported QR image control.")
+        # Preserve the last actual rejection, rather than replacing it with the
+        # unsurprising fact that the final scan used up the remaining budget.
+        final_state = dict(last_checked_state or last_state or {})
+        final_state["last_reason"] = final_state.get("reason", "not_observed")
+        final_state["reason"] = "timeout"
+        self._record_qr_selection(final_state)
+        raise PortalLocalLoginError(
+            "Timed out locating the verified imported QR image control. "
+            f"Last check: {final_state['last_reason']}."
+        )
 
     def _wait_for_login_confirmation_ready(self, bundle_id: str) -> None:
         deadline = monotonic() + LOGIN_CONFIRMATION_TIMEOUT_SECONDS

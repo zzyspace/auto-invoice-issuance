@@ -23,6 +23,7 @@ class PortalControlActionsTests(unittest.TestCase):
         self.a._ax = Mock(spec=MacAccessibilityClient)
         self.a._ax.node_enabled.return_value = True
         self.a._ax._perform_action.return_value = 0
+        self.a._ax.same_element.side_effect = lambda left, right: left.element == right.element
         self.a._activate_application = Mock()
         self.a._wait_before_bundle_click = Mock()
         self.a._find_process_pids = Mock(return_value=[42])
@@ -200,6 +201,107 @@ class PortalControlActionsTests(unittest.TestCase):
         self.match_image.return_value = [self.match, self.match]
         with self.assertRaisesRegex(PortalLocalLoginError, "Multiple visible"):
             self.a._select_latest_qr_from_album("test.bundle")
+        self.a._ax._perform_action.assert_not_called()
+
+    def test_qr_repeated_same_reference_selects_once(self):
+        self.prepare_qr()
+        self.a._ax.find_nodes.return_value = self.images + [self.images[-1]]
+        self.a._select_latest_qr_from_album("test.bundle")
+        self.a._ax._perform_action.assert_called_once_with(4, "AXPress")
+
+    def test_qr_native_aliases_with_different_parents_select_once(self):
+        self.prepare_qr()
+        alias = node(40, "PXGGridLayout-Info", role="AXImage", parent=99,
+                     position=(350, 150), size=(100, 100))
+        self.a._ax.find_nodes.return_value = self.images + [alias]
+        self.a._ax.same_element.side_effect = lambda left, right: {left.element, right.element} <= {4, 40}
+        self.a._select_latest_qr_from_album("test.bundle")
+        self.a._ax._perform_action.assert_called_once_with(4, "AXPress")
+        self.a._wait_for_login_confirmation_ready.assert_called_once_with("test.bundle")
+        messages = "\n".join(call.args[0] for call in self.a._log.call_args_list)
+        self.assertIn("reason=candidate_ready", messages)
+        self.assertIn("raw_candidate_count=2", messages)
+        self.assertIn("unique_candidate_count=1", messages)
+
+    def test_qr_aliases_do_not_hide_a_second_real_control(self):
+        self.prepare_qr()
+        self.a._ax.find_nodes.return_value = self.images + [
+            node(40, "PXGGridLayout-Info", role="AXImage", parent=99, position=(350, 150), size=(100, 100)),
+            node(41, "PXGGridLayout-Info", role="AXImage", parent=99, position=(350, 150), size=(100, 100)),
+        ]
+        self.a._ax.same_element.side_effect = lambda left, right: (
+            left.element == right.element or {left.element, right.element} <= {4, 40}
+        )
+        with self.assertRaisesRegex(PortalLocalLoginError, "ambiguous_ax_images"):
+            self.a._select_latest_qr_from_album("test.bundle")
+        self.a._ax._perform_action.assert_not_called()
+        messages = "\n".join(call.args[0] for call in self.a._log.call_args_list)
+        self.assertIn("raw_candidate_count=3", messages)
+        self.assertIn("unique_candidate_count=2", messages)
+
+    def test_qr_null_reference_is_never_selected_or_compared(self):
+        self.prepare_qr()
+        counts = {}
+        invalid = node(0, "PXGGridLayout-Info", role="AXImage", position=(350, 150), size=(100, 100))
+        self.assertIsNone(self.a._qr_image_node([invalid], self.match, self.bounds, counts=counts))
+        self.assertEqual({"raw_candidate_count": 0, "unique_candidate_count": 0}, counts)
+        self.a._ax.same_element.assert_not_called()
+
+    def test_qr_alias_dedup_does_not_bypass_enabled_check(self):
+        self.prepare_qr()
+        self.a._ax.find_nodes.return_value = self.images + [
+            node(40, "PXGGridLayout-Info", role="AXImage", parent=99, position=(350, 150), size=(100, 100)),
+        ]
+        self.a._ax.same_element.side_effect = lambda left, right: {left.element, right.element} <= {4, 40}
+        self.a._ax.node_enabled.return_value = False
+        with self.assertRaisesRegex(PortalLocalLoginError, "control_not_enabled"):
+            self.a._select_latest_qr_from_album("test.bundle")
+        self.a._ax._perform_action.assert_not_called()
+
+    def test_qr_rejection_logging_is_bounded_and_explains_timeout(self):
+        self.prepare_qr()
+        self.match_image.return_value = []
+        with self.assertRaisesRegex(PortalLocalLoginError, "no_visual_match"):
+            self.a._select_latest_qr_from_album("test.bundle")
+        messages = [call.args[0] for call in self.a._log.call_args_list
+                    if call.args[0].startswith("QR image selection")]
+        self.assertEqual(2, len(messages))
+        self.assertIn("reason=no_visual_match", messages[0])
+        self.assertIn("reason=timeout", messages[1])
+        self.assertIn("last_reason=no_visual_match", messages[1])
+        self.assertNotIn("isolated QR fixture", "\n".join(messages))
+
+    def test_qr_diagnostic_failures_do_not_escape(self):
+        self.a._diagnostics = Mock()
+        self.a._diagnostics.emit.side_effect = RuntimeError("diagnostics unavailable")
+        self.a._log.side_effect = RuntimeError("logger unavailable")
+        self.a._record_qr_selection({"reason": "no_visual_match", "match_count": 0})
+        self.a._diagnostics.emit.assert_called_once_with("qr.selection", reason="no_visual_match", match_count=0)
+
+    def test_qr_final_slow_scan_preserves_prior_rejection_and_counts(self):
+        self.prepare_qr()
+        self.a._ax.find_nodes.return_value = self.images + [
+            node(40, "PXGGridLayout-Info", role="AXImage", position=(350, 150), size=(100, 100)),
+        ]
+        now, attempts = [0.0], [0]
+        def match(*args):
+            attempts[0] += 1
+            if attempts[0] == 2:
+                now[0] = 21.0
+            return [self.match]
+        self.match_image.side_effect = match
+        with patch("app.portal_local_login.monotonic", side_effect=lambda: now[0]), patch(
+            "app.portal_local_login.sleep", side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds)
+        ):
+            with self.assertRaisesRegex(PortalLocalLoginError, "ambiguous_ax_images"):
+                self.a._select_latest_qr_from_album("test.bundle")
+        messages = [call.args[0] for call in self.a._log.call_args_list
+                    if call.args[0].startswith("QR image selection")]
+        self.assertEqual(3, len(messages))
+        self.assertIn("reason=deadline_before_selection", messages[-2])
+        self.assertIn("last_reason=ambiguous_ax_images", messages[-1])
+        self.assertIn("raw_candidate_count=2", messages[-1])
+        self.assertIn("unique_candidate_count=2", messages[-1])
         self.a._ax._perform_action.assert_not_called()
 
     def test_qr_missing_matches_or_ambiguous_ax_images_never_guess(self):

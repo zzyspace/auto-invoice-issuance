@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import ctypes
 import json
+import os
+import sys
 import tempfile
 import threading
 import unittest
@@ -47,6 +49,44 @@ def make_node():
 
 
 class PortalAXDiagnosticsTests(unittest.TestCase):
+    def test_same_nonzero_reference_needs_no_native_comparison(self):
+        client = make_client()
+        self.assertTrue(client.same_element(make_node(), make_node()))
+        client.core.CFEqual.assert_not_called()
+
+    def test_null_references_are_not_equal_accessibility_elements(self):
+        client = make_client()
+        null = AXNode(0, "AXImage", "", (), None, None)
+        self.assertFalse(client.same_element(null, null))
+        self.assertFalse(client.same_element(null, make_node()))
+        self.assertFalse(client.same_element(make_node(), null))
+        client.core.CFEqual.assert_not_called()
+
+    def test_different_references_use_native_identity_not_matching_metadata(self):
+        client = make_client()
+        left = AXNode(0x106E4D0D0, "AXImage", "", ("PXGGridLayout-Info",), (10, 20), (80, 80))
+        right = AXNode(0x106E4E340, "AXImage", "", ("PXGGridLayout-Info",), (10, 20), (80, 80))
+        for equal in (False, True):
+            client.core.CFEqual.return_value = equal
+            self.assertEqual(equal, client.same_element(left, right))
+            client.core.CFEqual.assert_called_with(left.element, right.element)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires CoreFoundation and AX reference creation")
+    def test_native_ax_alias_identity_bridge_without_reading_ui(self):
+        client = MacAccessibilityClient()
+        # Creating two references to this test process performs no UI reads or actions.
+        left, right = client.app_element(os.getpid()), client.app_element(os.getpid())
+        try:
+            self.assertTrue(left and right)
+            self.assertTrue(client.core.CFEqual(left, right))
+            self.assertTrue(client.same_element(AXNode(left, "AXApplication", "", (), None, None),
+                                                AXNode(right, "AXApplication", "", (), None, None)))
+        finally:
+            if left:
+                client.core.CFRelease(left)
+            if right:
+                client.core.CFRelease(right)
+
     def test_enabled_control_uses_boolean_value_not_pointer_truthiness(self):
         for enabled in (False, True):
             with self.subTest(enabled=enabled):
