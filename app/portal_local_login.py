@@ -44,11 +44,12 @@ POST_LOGIN_STATE_TIMEOUT_SECONDS = 15.0
 ROLE_DIALOG_CONFIRM_ATTEMPTS = 3
 ROLE_DIALOG_BEFORE_SELECT_SECONDS = 1.0
 ROLE_DIALOG_SELECTION_SETTLE_SECONDS = 0.5
-SCAN_ICON_X_RATIO = 0.91
-SCAN_ICON_Y_RATIO = 0.11
 SCAN_PAGE_READY_TIMEOUT_SECONDS = 8.0
-SCAN_ALBUM_OPEN_ATTEMPTS = 2
-SCAN_ALBUM_OPEN_SETTLE_SECONDS = 1.0
+SCAN_ALBUM_OPEN_TIMEOUT_SECONDS = 10.0
+# Center of the image icon in the verified, settled 576 x 1090 window capture.
+# The "相册" text below it exposes AXPress but does not open the picker.
+SCAN_ALBUM_ICON_X_RATIO = 500.0 / 576.0
+SCAN_ALBUM_ICON_Y_RATIO = 835.0 / 1090.0
 PHOTO_PICKER_SELECT_TIMEOUT_SECONDS = 20.0
 LOGIN_CONFIRMATION_TIMEOUT_SECONDS = 8.0
 HOME_PORTAL_AREA_TIMEOUT_SECONDS = 8.0
@@ -1115,8 +1116,7 @@ class PortalMacLoginAutomator:
     def _open_scan_flow(self, bundle_id: str) -> None:
         self._log("opening scan flow in 电子税务局 app")
         self._open_home_tab(bundle_id)
-        if not self._maybe_click_named_element(bundle_id, ("扫一扫", "扫码"), timeout_seconds=3.0):
-            self._click_etax_scan_icon(bundle_id)
+        self._click_etax_scan_icon(bundle_id)
         self._wait_for_scan_page_ready(bundle_id)
         self._open_album_from_scan_page(bundle_id)
 
@@ -1380,15 +1380,26 @@ class PortalMacLoginAutomator:
     @diagnostic_step("app_open_album")
     def _open_album_from_scan_page(self, bundle_id: str) -> None:
         self._log("opening album from scan page")
-        for attempt in range(1, SCAN_ALBUM_OPEN_ATTEMPTS + 1):
-            self._activate_application(bundle_id)
-            self._click_scan_album_region(bundle_id, attempt)
-            sleep(SCAN_ALBUM_OPEN_SETTLE_SECONDS)
-            if self._is_internal_photo_picker_visible(bundle_id) or not self._is_scan_page_visible(bundle_id):
-                self._log(f"scan-page album entry opened attempt={attempt}")
+        self._activate_application(bundle_id)
+        if self._is_internal_photo_picker_visible(bundle_id):
+            self._log("photo picker is already ready; skipping album icon click")
+            return
+        self._click_scan_album_region(bundle_id)
+        started = monotonic()
+        deadline = started + SCAN_ALBUM_OPEN_TIMEOUT_SECONDS
+        self._log(f"clicked album image icon once; waiting up to {SCAN_ALBUM_OPEN_TIMEOUT_SECONDS:.0f}s for picker grid")
+        while monotonic() < deadline:
+            ready = self._is_internal_photo_picker_visible(bundle_id)
+            now = monotonic()
+            if ready and now <= deadline:
+                self._log(f"photo picker grid ready after one icon click elapsed_seconds={now - started:.2f}")
                 return
-            self._log(f"scan-page album entry did not open attempt={attempt}")
-        raise PortalLocalLoginError("Timed out opening album from 电子税务局 scan page.")
+            # Loading, an empty AX read, or the old scanner disappearing is not success.
+            # A second click during the 3–4 second transition can hit the new picker.
+            remaining = deadline - now
+            if remaining > 0:
+                sleep(min(VISIBLE_ELEMENT_POLL_SECONDS, remaining))
+        raise PortalLocalLoginError("Timed out waiting for photo picker after one album icon click.")
 
     def _is_scan_page_visible(self, bundle_id: str) -> bool:
         try:
@@ -1399,11 +1410,15 @@ class PortalMacLoginAutomator:
 
     def _is_internal_photo_picker_visible(self, bundle_id: str) -> bool:
         try:
-            texts = self._collect_visible_texts(bundle_id, timeout_seconds=1.0)
+            nodes = self._target_app_nodes(bundle_id)
         except PortalLocalLoginError:
             return False
-        required = ("取消", "照片", "精选集", "搜索你的图库")
-        return all(any(required_item in text for text in texts) for required_item in required)
+        return self._qr_picker_visible(nodes) and any(
+            node.role == "AXImage" and "PXGGridLayout-Info" in node.texts
+            and node.position is not None and node.size is not None
+            and node.size[0] > 0 and node.size[1] > 0
+            for node in nodes
+        )
 
     @staticmethod
     def _qr_picker_visible(nodes: list[AXNode]) -> bool:
@@ -2136,17 +2151,48 @@ class PortalMacLoginAutomator:
 
     def _click_etax_scan_icon(self, bundle_id: str) -> None:
         self._activate_application(bundle_id)
-        window = self._window_node(bundle_id)
-        if window is None or window.position is None or window.size is None:
-            bounds = self._window_bounds_for_bundle(bundle_id)
-            if bounds is not None:
-                x, y, width, height = bounds
-                self._click_at_for_bundle(bundle_id, x + width * SCAN_ICON_X_RATIO, y + height * SCAN_ICON_Y_RATIO)
+        self._wait_before_bundle_click(bundle_id)
+        deadline = monotonic() + UI_ACTION_TIMEOUT_SECONDS
+        while monotonic() < deadline:
+            try:
+                nodes = self._target_app_nodes(bundle_id)
+            except PortalLocalLoginError:
+                nodes = []
+            button = self._home_scan_icon_node(nodes)
+            if button is not None and self._ax.node_enabled(button):
+                self._press_ax_node_only(button, "home scan icon")
                 return
-            raise PortalLocalLoginError("Unable to determine 电子税务局 window frame for scan icon click.")
-        x = window.position[0] + window.size[0] * SCAN_ICON_X_RATIO
-        y = window.position[1] + window.size[1] * SCAN_ICON_Y_RATIO
-        self._click_at_for_bundle(bundle_id, x, y)
+            sleep(VISIBLE_ELEMENT_POLL_SECONDS)
+        raise PortalLocalLoginError("Timed out locating unique enabled home scan button.")
+
+    @staticmethod
+    def _home_scan_icon_node(nodes: list[AXNode]) -> AXNode | None:
+        anchors = [node for node in nodes if any(
+            PortalMacLoginAutomator._normalized_text(text) == "功能名称" for text in node.texts
+        )]
+        if len(anchors) != 1:
+            return None
+        anchor = anchors[0]
+        if anchor.parent_element is None or anchor.position is None or anchor.size is None:
+            return None
+        x, y = anchor.position
+        width, height = anchor.size
+        if width <= 0 or height <= 0:
+            return None
+        candidates = []
+        for node in nodes:
+            if (node.role != "AXButton" or node.subrole or node.parent_element != anchor.parent_element
+                    or node.position is None or node.size is None):
+                continue
+            bx, by = node.position
+            bw, bh = node.size
+            # The real button has no label. Identify the small sibling to the right
+            # of search, in the same row; exclude the large background AXButton.
+            # Geometry selects an AX element only; no pointer coordinates are sent.
+            if (bx >= x + width and abs(by + bh / 2 - (y + height / 2)) <= height
+                    and 0 < bw <= 4 * height and 0 < bh <= 4 * height):
+                candidates.append(node)
+        return candidates[0] if len(candidates) == 1 else None
 
     def _click_etax_album_button(self, bundle_id: str) -> None:
         self._activate_application(bundle_id)
@@ -2162,7 +2208,7 @@ class PortalMacLoginAutomator:
         y = window.position[1] + window.size[1] - 24.0
         self._click_at_for_bundle(bundle_id, x, y)
 
-    def _click_scan_album_region(self, bundle_id: str, attempt: int) -> None:
+    def _click_scan_album_region(self, bundle_id: str) -> None:
         self._activate_application(bundle_id)
         bounds = self._window_bounds_for_bundle(bundle_id)
         if bounds is None:
@@ -2177,12 +2223,11 @@ class PortalMacLoginAutomator:
             )
         else:
             left, top, width, height = bounds
-        targets = (
-            (0.84, 0.74),
-            (0.92, 0.74),
+        self._click_at_for_bundle(
+            bundle_id,
+            left + width * SCAN_ALBUM_ICON_X_RATIO,
+            top + height * SCAN_ALBUM_ICON_Y_RATIO,
         )
-        x_ratio, y_ratio = targets[min(attempt - 1, len(targets) - 1)]
-        self._click_at_for_bundle(bundle_id, left + width * x_ratio, top + height * y_ratio)
 
     def _set_login_account_value(self, bundle_id: str, value: str) -> None:
         if self._try_set_field_value(bundle_id, value, field_index=1, secure=False):

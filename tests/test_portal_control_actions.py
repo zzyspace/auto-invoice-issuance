@@ -87,6 +87,83 @@ class PortalControlActionsTests(unittest.TestCase):
             self.a._dismiss_fingerprint_prompt("test.bundle")
         self.a._ax._perform_action.assert_called_once_with(2, "AXPress")
 
+    @staticmethod
+    def home_scan_nodes(offset=(0, 0), scale=1):
+        def geometry(x, y):
+            return (offset[0] + scale * x, offset[1] + scale * y)
+        anchor = node(1, "功能名称", position=geometry(100, 100), size=(40 * scale, 12 * scale))
+        scan = node(2, "", role="AXButton", position=geometry(200, 90), size=(36 * scale, 32 * scale))
+        left = node(3, "", role="AXButton", position=geometry(20, 90), size=(36 * scale, 32 * scale))
+        background = node(4, "", role="AXButton", position=geometry(200, 20), size=(300 * scale, 200 * scale))
+        other_parent = node(5, "", role="AXButton", parent=99, position=scan.position, size=scan.size)
+        window_button = node(6, "", role="AXButton", position=scan.position, size=scan.size)
+        window_button.subrole = "AXCloseButton"
+        return [anchor, scan, left, background, other_parent, window_button]
+
+    def test_home_scanner_uses_small_sibling_control_when_moved_or_scaled(self):
+        for offset, scale in [((0, 0), 1), ((1152, 169), 1), ((300, 200), 2)]:
+            with self.subTest(offset=offset, scale=scale):
+                self.a._ax._perform_action.reset_mock()
+                self.a._ax.find_nodes.return_value = self.home_scan_nodes(offset, scale)
+                self.a._click_etax_scan_icon("test.bundle")
+                self.a._ax._perform_action.assert_called_once_with(2, "AXPress")
+
+    def test_home_scanner_waits_for_delayed_enabled_control(self):
+        self.a._ax.find_nodes.side_effect = [[], self.home_scan_nodes(), self.home_scan_nodes()]
+        self.a._ax.node_enabled.side_effect = [False, True]
+        self.a._click_etax_scan_icon("test.bundle")
+        self.a._ax._perform_action.assert_called_once_with(2, "AXPress")
+
+    def test_home_scanner_refuses_missing_or_ambiguous_control(self):
+        base = self.home_scan_nodes()
+        for nodes in [[], base[1:], base + [node(7, "", role="AXButton", position=(250, 90), size=(36, 32))],
+                      base + [node(8, "功能名称", position=(100, 100), size=(40, 12))]]:
+            with self.subTest(nodes=len(nodes)):
+                self.a._ax.find_nodes.return_value = nodes
+                with self.assertRaisesRegex(PortalLocalLoginError, "unique enabled home scan button"):
+                    self.a._click_etax_scan_icon("test.bundle")
+        self.a._ax._perform_action.assert_not_called()
+
+    def test_home_scanner_requires_anchor_parent_and_same_row(self):
+        for variant in ("no parent", "wrong row", "no geometry"):
+            with self.subTest(variant=variant):
+                nodes = self.home_scan_nodes()[:2]
+                if variant == "no parent":
+                    nodes[0].parent_element = None
+                elif variant == "wrong row":
+                    nodes[1].position = (200, 300)
+                else:
+                    nodes[0].size = None
+                self.assertIsNone(self.a._home_scan_icon_node(nodes))
+
+    def test_home_scanner_native_error_never_uses_mouse_fallback(self):
+        self.a._ax.find_nodes.return_value = self.home_scan_nodes()
+        self.a._ax._perform_action.return_value = -25206
+        with self.assertRaisesRegex(PortalLocalLoginError, "AXPress.*-25206"):
+            self.a._click_etax_scan_icon("test.bundle")
+        self.a._ax._perform_action.assert_called_once_with(2, "AXPress")
+
+    def test_scan_flow_verifies_page_before_opening_album(self):
+        events = []
+        self.a._open_home_tab = Mock(side_effect=lambda b: events.append("home"))
+        self.a._click_etax_scan_icon = Mock(side_effect=lambda b: events.append("AXPress"))
+        self.a._wait_for_scan_page_ready = Mock(side_effect=lambda b: events.append("scanner ready"))
+        self.a._open_album_from_scan_page = Mock(side_effect=lambda b: events.append("album"))
+        self.a._maybe_click_named_element = Mock(side_effect=AssertionError("Old name-only route must not run"))
+        self.a._open_scan_flow("test.bundle")
+        self.assertEqual(["home", "AXPress", "scanner ready", "album"], events)
+
+    def test_scan_flow_stops_if_action_or_page_verification_fails(self):
+        for failed_stage in ("action", "page"):
+            with self.subTest(stage=failed_stage):
+                self.a._open_home_tab = Mock()
+                self.a._click_etax_scan_icon = Mock(side_effect=PortalLocalLoginError("action failed") if failed_stage == "action" else None)
+                self.a._wait_for_scan_page_ready = Mock(side_effect=PortalLocalLoginError("page missing") if failed_stage == "page" else None)
+                self.a._open_album_from_scan_page = Mock()
+                with self.assertRaises(PortalLocalLoginError):
+                    self.a._open_scan_flow("test.bundle")
+                self.a._open_album_from_scan_page.assert_not_called()
+
     def prepare_qr(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)

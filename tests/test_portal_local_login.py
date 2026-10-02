@@ -306,40 +306,16 @@ class PortalLocalLoginTests(unittest.TestCase):
         self.assertFalse(visible)
         self.assertEqual("NONE", raw_response)
 
-    def test_open_album_from_scan_page_retries_until_scan_page_disappears(self) -> None:
+    def test_click_scan_album_region_uses_verified_icon_center_after_window_move(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_path = Path(tmp_dir)
-            config = self._build_config(tmp_path)
-            automator = PortalMacLoginAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
-            events: list[str] = []
-            visibility = iter([True, False])
-
-        with patch.object(automator, "_click_scan_album_region", side_effect=lambda *args: events.append("click_region")):
-            with patch.object(automator, "_is_scan_page_visible", side_effect=lambda *args: next(visibility)):
-                with patch.object(automator, "_log", side_effect=lambda message: events.append(message)):
-                    automator._open_album_from_scan_page("cn.gov.chinatax.gt4.app")  # noqa: SLF001
-
-        self.assertIn("opening album from scan page", events)
-        self.assertIn("scan-page album entry opened attempt=2", events)
-
-    def test_click_scan_album_region_uses_only_remaining_targets(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_path = Path(tmp_dir)
-            config = self._build_config(tmp_path)
-            automator = PortalMacLoginAutomator(config, "fuzzy", "法定代表人", lambda *_: None)
-            clicks: list[tuple[float, float]] = []
-
-            with patch.object(automator, "_activate_application"):
-                with patch.object(automator, "_window_bounds_for_bundle", return_value=(10.0, 20.0, 100.0, 200.0)):
-                    with patch.object(
-                        automator,
-                        "_click_at_for_bundle",
-                        side_effect=lambda _bundle_id, x, y: clicks.append((x, y)),
-                    ):
-                        automator._click_scan_album_region("cn.gov.chinatax.gt4.app", 1)  # noqa: SLF001
-                        automator._click_scan_album_region("cn.gov.chinatax.gt4.app", 2)  # noqa: SLF001
-
-        self.assertEqual([(94.0, 168.0), (102.0, 168.0)], clicks)
+            automator = PortalMacLoginAutomator(self._build_config(Path(tmp_dir)), "fuzzy", "法定代表人", lambda *_: None)
+            for bounds, expected in [((1152.0, 169.0, 288.0, 545.0), (1402.0, 586.5)),
+                                     ((200.0, 50.0, 288.0, 545.0), (450.0, 467.5))]:
+                with self.subTest(bounds=bounds):
+                    with patch.object(automator, "_window_bounds_for_bundle", return_value=bounds):
+                        with patch.object(automator, "_click_at_for_bundle") as click:
+                            automator._click_scan_album_region("cn.gov.chinatax.gt4.app")
+                    click.assert_called_once_with("cn.gov.chinatax.gt4.app", *expected)
 
     def test_select_qr_does_not_fall_through_after_verified_picker_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
